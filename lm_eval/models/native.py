@@ -15,7 +15,12 @@ from config import DistributedArgs
 from data.tokenizer import Tokenizer
 from distributed import apply_tp
 from torch.distributed.device_mesh import init_device_mesh
-from data.ae_loader import BEGIN_OF_MEMORY_INDEX, END_OF_MEMORY_INDEX
+from data.ae_loader import (
+    BEGIN_OF_MEMORY_INDEX,
+    END_OF_MEMORY_INDEX,
+    BEGIN_OF_RECONSTRUCTION_INDEX,
+    END_OF_RECONSTRUCTION_INDEX,
+)
 
 
 def _str_to_dtype(name: Optional[str]) -> torch.dtype:
@@ -37,7 +42,7 @@ def _parse_mode(name: Optional[str]) -> str:
     if name is None:
         return "decoder"
     name = name.lower()
-    if name not in {"decoder", "compress_answer"}:
+    if name not in {"decoder", "compress_answer", "reconstruct_then_ppl"}:
         raise ValueError(f"Unsupported native model mode: {name}")
     return name
 
@@ -84,12 +89,14 @@ class NativeCausalLM(TemplateLM):
         tokenizer_path: Optional[str] = None,
         dtype: str = "bfloat16",
         mode: str = "decoder",
+        max_mem_span_len: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
         self._device = torch.device("cuda")
         self._batch_size = int(batch_size) if isinstance(batch_size, (int, float)) or str(batch_size).isdigit() else 1
         self._mode = _parse_mode(mode)
+        self._max_mem_span_len_override = max_mem_span_len
 
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
@@ -114,6 +121,9 @@ class NativeCausalLM(TemplateLM):
         self._model_parallel_group = device_mesh.get_group(1) if device_mesh is not None else None
 
         self._max_seq_length = max_seq_length or self.model.args.max_seq_len
+        if self._max_mem_span_len_override is not None:
+            # Respect override for compression-aware paths
+            self.model.args.max_mem_span_len = self._max_mem_span_len_override
 
     # ---- Required TemplateLM properties ----
     @property
@@ -332,6 +342,8 @@ class NativeCausalLM(TemplateLM):
         # Optional mode: compress the context into memory first, then score the answer.
         if self._mode == "compress_answer" and hasattr(self.model, "compression_embeddings"):
             return self._loglikelihood_tokens_compress_answer(requests, disable_tqdm, override_bs)
+        if self._mode == "reconstruct_then_ppl" and hasattr(self.model, "compression_embeddings"):
+            return self._loglikelihood_tokens_reconstruct_then_ppl(requests, disable_tqdm)
         res: List[Tuple[float, bool]] = []
         bs = override_bs or self.batch_size
         try:
@@ -559,6 +571,111 @@ class NativeCausalLM(TemplateLM):
                 logprob = float(token_lp.sum().item())
                 greedy = bool((lp.argmax(dim=-1) == tgt).all().item())
                 res.append((logprob, greedy))
+        return res
+
+    @torch.no_grad()
+    def _loglikelihood_tokens_reconstruct_then_ppl(
+        self,
+        requests: List[Tuple[Tuple[str, str], List[int], List[int]]],
+        disable_tqdm: bool = False,
+    ) -> List[Tuple[float, bool]]:
+        """
+        Greedy reconstruct the context via AE-style decoding, then score the continuation tokens.
+        Reconstruction is not scored; only continuation logprob is returned.
+        """
+        num_comp = getattr(self.model.args, "num_compression_tokens", 0)
+        max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
+        placeholder_id = 0
+        res: List[Tuple[float, bool]] = []
+        iterator = enumerate(requests)
+        pbar = tqdm(iterator, disable=disable_tqdm or self.rank != 0, desc="native loglikelihood (reconstruct_then_ppl)")
+        for _, (_, context_enc, continuation_enc) in pbar:
+            # Trim context to max_mem_span_len
+            ctx_tokens = context_enc[-max_mem_span_len:]
+            # Encoder tokens + mask
+            enc_tokens = ctx_tokens + [placeholder_id] * num_comp
+            enc_mem_mask = [False] * len(ctx_tokens) + [True] * num_comp
+            enc_cu = torch.tensor([0, len(enc_tokens)], device=self.device, dtype=torch.int32)
+            enc_ctx = {
+                "cu_seqlens_q": enc_cu,
+                "cu_seqlens_k": enc_cu,
+                "max_seqlen_q": len(enc_tokens),
+                "max_seqlen_k": len(enc_tokens),
+                "positions": torch.arange(len(enc_tokens), device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": torch.tensor(enc_mem_mask, device=self.device, dtype=torch.bool),
+            }
+            enc_tokens_t = torch.tensor(enc_tokens, device=self.device, dtype=torch.long)
+
+            # Decoder prefix BOM + slots + EOM + BOR
+            dec_prefix = [BEGIN_OF_MEMORY_INDEX] + [placeholder_id] * num_comp + [END_OF_MEMORY_INDEX] + [BEGIN_OF_RECONSTRUCTION_INDEX]
+            comp_mask_prefix = [False] + [True] * num_comp + [False] + [False]
+
+            # Greedy reconstruction (up to ctx length and budget)
+            max_recon = min(len(ctx_tokens), self.max_length - len(dec_prefix) - len(continuation_enc))
+            recon_tokens: List[int] = []
+            dec_tokens = torch.tensor(dec_prefix, device=self.device, dtype=torch.long)
+            comp_mask = torch.tensor(comp_mask_prefix, device=self.device, dtype=torch.bool)
+            for _ in range(max_recon):
+                dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
+                dec_ctx = {
+                    "cu_seqlens_q": dec_cu,
+                    "cu_seqlens_k": dec_cu,
+                    "max_seqlen_q": dec_tokens.numel(),
+                    "max_seqlen_k": dec_tokens.numel(),
+                    "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
+                    "compression_token_mask": comp_mask,
+                }
+                logits = self.model(
+                    encoder_tokens=enc_tokens_t,
+                    encoder_context=enc_ctx,
+                    decoder_tokens=dec_tokens,
+                    decoder_context=dec_ctx,
+                    last_hidden_only=False,
+                )
+                next_token = int(torch.argmax(logits[-1]))
+                if next_token == END_OF_RECONSTRUCTION_INDEX:
+                    break
+                recon_tokens.append(next_token)
+                dec_tokens = torch.cat([dec_tokens, torch.tensor([next_token], device=self.device, dtype=torch.long)], dim=0)
+                comp_mask = torch.cat([comp_mask, torch.tensor([False], device=self.device, dtype=torch.bool)], dim=0)
+
+            # Now append continuation and score it
+            continuation_trim = continuation_enc[: max(0, self.max_length - dec_tokens.numel() - 1)]
+            cont_tensor = torch.tensor(continuation_trim, device=self.device, dtype=torch.long)
+            dec_tokens = torch.cat([dec_tokens, cont_tensor], dim=0)
+            comp_mask = torch.cat([comp_mask, torch.zeros(len(continuation_trim), device=self.device, dtype=torch.bool)], dim=0)
+            # targets: shift by one, append eos
+            targets = torch.cat([dec_tokens[1:], torch.tensor([self.eot_token_id], device=self.device, dtype=torch.long)], dim=0)
+
+            dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
+            dec_ctx = {
+                "cu_seqlens_q": dec_cu,
+                "cu_seqlens_k": dec_cu,
+                "max_seqlen_q": dec_tokens.numel(),
+                "max_seqlen_k": dec_tokens.numel(),
+                "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
+                "compression_token_mask": comp_mask,
+            }
+            logits = self.model(
+                encoder_tokens=enc_tokens_t,
+                encoder_context=enc_ctx,
+                decoder_tokens=dec_tokens,
+                decoder_context=dec_ctx,
+                last_hidden_only=False,
+            )
+            logprobs = F.log_softmax(logits.float(), dim=-1)
+            # continuation starts after prefix + recon
+            cont_start = len(dec_prefix) + len(recon_tokens)
+            if cont_start < targets.numel():
+                lp_slice = logprobs[cont_start - 1 : cont_start - 1 + len(continuation_trim)]
+                tgt_slice = targets[cont_start - 1 : cont_start - 1 + len(continuation_trim)]
+                token_lp = lp_slice.gather(-1, tgt_slice.unsqueeze(-1)).squeeze(-1)
+                logprob = float(token_lp.sum().item())
+                greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
+            else:
+                logprob = float("-inf")
+                greedy = False
+            res.append((logprob, greedy))
         return res
 
     # ---- helpers ----
