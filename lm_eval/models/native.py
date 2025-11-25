@@ -21,6 +21,9 @@ from data.ae_loader import (
     BEGIN_OF_RECONSTRUCTION_INDEX,
     END_OF_RECONSTRUCTION_INDEX,
 )
+from eval_func.model2safetensors import convert_checkpoint
+from eval_func.vllm_runner import VLLMEngineWrapper, VLLMEngineConfig, VLLMDecoderManager
+import sys
 
 
 def _str_to_dtype(name: Optional[str]) -> torch.dtype:
@@ -90,6 +93,14 @@ class NativeCausalLM(TemplateLM):
         dtype: str = "bfloat16",
         mode: str = "decoder",
         max_mem_span_len: Optional[int] = None,
+        use_vllm_reconstruct: bool = False,
+        vllm_model_path: Optional[str] = None,
+        vllm_max_model_len: Optional[int] = None,
+        vllm_tensor_parallel: int = 1,
+        vllm_gpu_memory_utilization: float = 0.6,
+        vllm_output_root: Optional[str] = None,
+        vllm_reconstruct_batch_size: int = 4000,
+        ppl_batch_size: Optional[int] = 16,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
@@ -97,6 +108,11 @@ class NativeCausalLM(TemplateLM):
         self._batch_size = int(batch_size) if isinstance(batch_size, (int, float)) or str(batch_size).isdigit() else 1
         self._mode = _parse_mode(mode)
         self._max_mem_span_len_override = max_mem_span_len
+        self._use_vllm_reconstruct = use_vllm_reconstruct
+        self._vllm_manager = None
+        self._vllm_output_root = vllm_output_root
+        self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
+        self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
 
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
@@ -124,6 +140,45 @@ class NativeCausalLM(TemplateLM):
         if self._max_mem_span_len_override is not None:
             # Respect override for compression-aware paths
             self.model.args.max_mem_span_len = self._max_mem_span_len_override
+
+        # Optional vLLM init for reconstruction speedup (decoder-only, prompt_embeds)
+        if self._use_vllm_reconstruct:
+            # Prepare decoder-only safetensors if path not provided
+            model_path = vllm_model_path
+            if model_path is None:
+                base_dir = self._vllm_output_root or checkpoint_dir
+                if base_dir is None:
+                    raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
+                safedir = os.path.join(base_dir, "safemodel")
+                model_path = safedir
+                need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
+                    os.path.join(safedir, "config.json")
+                )
+                if need_convert:
+                    os.makedirs(safedir, exist_ok=True)
+                    convert_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        output_dir=safedir,
+                        tokenizer_path=tokenizer_path,
+                        dtype=str(self._dtype).replace("torch.", ""),
+                    )
+            try:
+                cfg = VLLMEngineConfig(
+                    model_path=model_path,
+                    tensor_parallel_size=vllm_tensor_parallel,
+                    dtype=str(self._dtype).replace("torch.", ""),
+                    max_model_len=vllm_max_model_len or self._max_seq_length,
+                    enable_prompt_embeds=True,
+                    tokenizer=tokenizer_path or getattr(self.model.args, "pretrain_model_dir", None),
+                    additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
+                )
+                self._vllm_manager = VLLMDecoderManager(
+                    engine_wrapper=VLLMEngineWrapper(cfg),
+                    tokenizer=self._tokenizer,
+                )
+            except Exception as e:
+                print(f"WARNING: Failed to init vLLM for reconstruction, falling back to greedy. Error: {e}", file=sys.stderr)
+                self._vllm_manager = None
 
     # ---- Required TemplateLM properties ----
     @property
@@ -178,6 +233,24 @@ class NativeCausalLM(TemplateLM):
         padded = [t + [self.pad_token_id] * (max_len - len(t)) for t in tokens]
         tensor = torch.tensor(padded, device=self.device, dtype=torch.long)
         return tensor, tensor  # attention mask not used
+
+    def _build_prompt_embeds(
+        self,
+        encoder_tokens: torch.Tensor,
+        encoder_context: dict,
+        decoder_prefix: torch.Tensor,
+        compression_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode compression slots and return embeddings with slots filled."""
+        with torch.inference_mode():
+            compression_vectors = self.model.compress(
+                encoder_tokens=encoder_tokens,
+                encoder_context=encoder_context,
+            )
+        prompt_embeds = self.model.tok_embeddings(decoder_prefix.to(self.device))
+        prompt_embeds = prompt_embeds.to(compression_vectors.dtype)
+        prompt_embeds[compression_mask] = compression_vectors
+        return prompt_embeds
 
     # ---- Core model calls ----
     @torch.no_grad()
@@ -501,8 +574,10 @@ class NativeCausalLM(TemplateLM):
 
                 # Decoder: one BOM, then all compression slots, then EOM + answer.
                 total_comp_slots = num_comp * len(ctx_spans) if num_comp > 0 else 0
-                dec_tokens = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + continuation_enc
-                comp_mask = [False] + ([True] * total_comp_slots) + [False] + ([False] * len(continuation_enc))
+                max_cont_len = max(0, self.max_length - (total_comp_slots + 2))
+                cont_trim = continuation_enc[:max_cont_len]
+                dec_tokens = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + cont_trim
+                comp_mask = [False] + ([True] * total_comp_slots) + [False] + ([False] * len(cont_trim))
 
                 targets = dec_tokens[1:] + [self.eot_token_id]
                 answer_start = total_comp_slots + 2  # skip BOM + all slots + EOM
@@ -513,7 +588,7 @@ class NativeCausalLM(TemplateLM):
                 comp_masks.append(comp_mask)
                 targets_list.append(targets)
                 ans_offsets.append(answer_start)
-                cont_lengths.append(len(continuation_enc))
+                cont_lengths.append(len(cont_trim))
 
             # pack encoder sequences
             enc_lens = [len(t) for t in enc_tokens_list]
@@ -565,12 +640,22 @@ class NativeCausalLM(TemplateLM):
                 sample_logprobs = logprobs[start : end - 1, :]  # drop final padding target
                 sample_targets = targets_flat[start : end - 1]
                 answer_slice = slice(ans_off, ans_off + cont_len)
+                if cont_len <= 0 or sample_logprobs.numel() == 0 or sample_targets.numel() == 0:
+                    res.append((float("-inf"), False))
+                    continue
                 lp = sample_logprobs[answer_slice]
                 tgt = sample_targets[answer_slice]
+                if lp.numel() == 0 or tgt.numel() == 0:
+                    res.append((float("-inf"), False))
+                    continue
                 token_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-                logprob = float(token_lp.sum().item())
-                greedy = bool((lp.argmax(dim=-1) == tgt).all().item())
+                logprob = float(token_lp.sum().item()) if token_lp.numel() > 0 else float("-inf")
+                greedy = bool((lp.argmax(dim=-1) == tgt).all().item()) if token_lp.numel() > 0 else False
                 res.append((logprob, greedy))
+        # Safety: if we somehow produced fewer responses than requests, pad with -inf.
+        if len(res) < len(requests):
+            missing = len(requests) - len(res)
+            res.extend([(float("-inf"), False)] * missing)
         return res
 
     @torch.no_grad()
@@ -580,102 +665,232 @@ class NativeCausalLM(TemplateLM):
         disable_tqdm: bool = False,
     ) -> List[Tuple[float, bool]]:
         """
-        Greedy reconstruct the context via AE-style decoding, then score the continuation tokens.
-        Reconstruction is not scored; only continuation logprob is returned.
+        Reconstruct context via AE-style decoding (optionally batched vLLM prompt_embeds),
+        then score the continuation tokens. Reconstruction is not scored; only continuation
+        logprob is returned.
         """
         num_comp = getattr(self.model.args, "num_compression_tokens", 0)
         max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
         placeholder_id = 0
+
         res: List[Tuple[float, bool]] = []
-        iterator = enumerate(requests)
+        bs = self._vllm_reconstruct_batch_size if self._vllm_manager is not None else self.batch_size
+        iterator = range(0, len(requests), bs)
         pbar = tqdm(iterator, disable=disable_tqdm or self.rank != 0, desc="native loglikelihood (reconstruct_then_ppl)")
-        for _, (_, context_enc, continuation_enc) in pbar:
-            # Trim context to max_mem_span_len
-            ctx_tokens = context_enc[-max_mem_span_len:]
-            # Encoder tokens + mask
-            enc_tokens = ctx_tokens + [placeholder_id] * num_comp
-            enc_mem_mask = [False] * len(ctx_tokens) + [True] * num_comp
-            enc_cu = torch.tensor([0, len(enc_tokens)], device=self.device, dtype=torch.int32)
+        for batch_start in pbar:
+            chunk = requests[batch_start : batch_start + bs]
+
+            # Build encoder/decoder prefixes per sample
+            enc_tokens_list: List[List[int]] = []
+            enc_mem_masks: List[List[bool]] = []
+            dec_prefix_list: List[List[int]] = []
+            comp_mask_list: List[List[bool]] = []
+            cont_list: List[List[int]] = []
+            dec_prefix_lens: List[int] = []
+            max_recon_lens: List[int] = []
+
+            for (_, context_enc, continuation_enc) in chunk:
+                ctx_tokens = context_enc[-max_mem_span_len:]
+                enc_tokens = ctx_tokens + [placeholder_id] * num_comp
+                enc_mem_mask = [False] * len(ctx_tokens) + [True] * num_comp
+
+                dec_prefix = [BEGIN_OF_MEMORY_INDEX] + [placeholder_id] * num_comp + [END_OF_MEMORY_INDEX] + [BEGIN_OF_RECONSTRUCTION_INDEX]
+                comp_prefix = [False] + [True] * num_comp + [False] + [False]
+                max_recon = min(len(ctx_tokens), self.max_length - len(dec_prefix) - len(continuation_enc))
+
+                # Trim continuation to fit after recon
+                cont_trim = continuation_enc[: max(0, self.max_length - len(dec_prefix) - max_recon)]
+
+                enc_tokens_list.append(enc_tokens)
+                enc_mem_masks.append(enc_mem_mask)
+                dec_prefix_list.append(dec_prefix)
+                comp_mask_list.append(comp_prefix)
+                cont_list.append(cont_trim)
+                dec_prefix_lens.append(len(dec_prefix))
+                max_recon_lens.append(max_recon)
+
+            # Pack encoder
+            enc_lens = [len(t) for t in enc_tokens_list]
+            enc_cu = torch.tensor([0] + list(torch.tensor(enc_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+            max_enc = max(enc_lens)
+            enc_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens], dim=0)
+            enc_tokens_flat = torch.tensor(sum(enc_tokens_list, []), device=self.device, dtype=torch.long)
+            enc_mem_mask_flat = torch.tensor(sum(enc_mem_masks, []), device=self.device, dtype=torch.bool)
             enc_ctx = {
                 "cu_seqlens_q": enc_cu,
                 "cu_seqlens_k": enc_cu,
-                "max_seqlen_q": len(enc_tokens),
-                "max_seqlen_k": len(enc_tokens),
-                "positions": torch.arange(len(enc_tokens), device=self.device, dtype=torch.int32),
-                "encoder_mem_mask": torch.tensor(enc_mem_mask, device=self.device, dtype=torch.bool),
+                "max_seqlen_q": max_enc,
+                "max_seqlen_k": max_enc,
+                "positions": enc_positions,
+                "encoder_mem_mask": enc_mem_mask_flat,
             }
-            enc_tokens_t = torch.tensor(enc_tokens, device=self.device, dtype=torch.long)
 
-            # Decoder prefix BOM + slots + EOM + BOR
-            dec_prefix = [BEGIN_OF_MEMORY_INDEX] + [placeholder_id] * num_comp + [END_OF_MEMORY_INDEX] + [BEGIN_OF_RECONSTRUCTION_INDEX]
-            comp_mask_prefix = [False] + [True] * num_comp + [False] + [False]
+            # Prepare per-sample tensors
+            dec_prefix_tensors = [torch.tensor(d, device=self.device, dtype=torch.long) for d in dec_prefix_list]
+            comp_mask_tensors = [torch.tensor(c, device=self.device, dtype=torch.bool) for c in comp_mask_list]
 
-            # Greedy reconstruction (up to ctx length and budget)
-            max_recon = min(len(ctx_tokens), self.max_length - len(dec_prefix) - len(continuation_enc))
-            recon_tokens: List[int] = []
-            dec_tokens = torch.tensor(dec_prefix, device=self.device, dtype=torch.long)
-            comp_mask = torch.tensor(comp_mask_prefix, device=self.device, dtype=torch.bool)
-            for _ in range(max_recon):
-                dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
-                dec_ctx = {
-                    "cu_seqlens_q": dec_cu,
-                    "cu_seqlens_k": dec_cu,
-                    "max_seqlen_q": dec_tokens.numel(),
-                    "max_seqlen_k": dec_tokens.numel(),
-                    "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
-                    "compression_token_mask": comp_mask,
+            # Reconstruction: vLLM prompt_embeds batch if available, else per-sample greedy
+            recon_tokens_list: List[List[int]] = [[] for _ in dec_prefix_list]
+            if self._vllm_manager is not None:
+                # Batch compress once, then split per-sample to fill prompt embeds.
+                with torch.inference_mode():
+                    compression_vectors = self.model.compress(
+                        encoder_tokens=enc_tokens_flat,
+                        encoder_context=enc_ctx,
+                    )
+                comp_counts = [int(sum(mask)) for mask in enc_mem_masks]
+                comp_offsets = [0]
+                for c in comp_counts:
+                    comp_offsets.append(comp_offsets[-1] + c)
+
+                prompt_embeds = []
+                for i in range(len(dec_prefix_list)):
+                    comp_vec = compression_vectors[comp_offsets[i] : comp_offsets[i + 1]]
+                    prompt = self.model.tok_embeddings(dec_prefix_tensors[i].to(self.device))
+                    prompt = prompt.to(comp_vec.dtype)
+                    if comp_vec.numel() > 0:
+                        prompt[comp_mask_tensors[i]] = comp_vec
+                    prompt_embeds.append(prompt)
+
+                sampling_params = {"temperature": 0.0, "top_p": 1.0, "max_tokens": max(max_recon_lens) if max_recon_lens else 0}
+                outputs = self._vllm_manager.generate_from_embeddings(prompt_embeds, sampling_params=sampling_params)
+                for i, out in enumerate(outputs):
+                    if out.outputs:
+                        text = out.outputs[0].text
+                        recon_tokens_list[i] = self.tok_encode(text)[: max_recon_lens[i]]
+            else:
+                for i, (dec_t, comp_t, max_recon) in enumerate(zip(dec_prefix_tensors, comp_mask_tensors, max_recon_lens)):
+                    recon_tokens: List[int] = []
+                    dec_tokens = dec_t
+                    comp_mask = comp_t
+                    for _ in range(max_recon):
+                        dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
+                        dec_ctx = {
+                            "cu_seqlens_q": dec_cu,
+                            "cu_seqlens_k": dec_cu,
+                            "max_seqlen_q": dec_tokens.numel(),
+                            "max_seqlen_k": dec_tokens.numel(),
+                            "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
+                            "compression_token_mask": comp_mask,
+                        }
+                        logits = self.model(
+                            encoder_tokens=enc_tokens_flat[enc_cu[i]:enc_cu[i+1]],
+                            encoder_context={
+                                "cu_seqlens_q": torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
+                                "cu_seqlens_k": torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
+                                "max_seqlen_q": enc_lens[i],
+                                "max_seqlen_k": enc_lens[i],
+                                "positions": torch.arange(enc_lens[i], device=self.device, dtype=torch.int32),
+                                "encoder_mem_mask": torch.tensor(enc_mem_masks[i], device=self.device, dtype=torch.bool),
+                            },
+                            decoder_tokens=dec_tokens,
+                            decoder_context=dec_ctx,
+                            last_hidden_only=False,
+                        )
+                        next_token = int(torch.argmax(logits[-1]))
+                        if next_token == END_OF_RECONSTRUCTION_INDEX:
+                            break
+                        recon_tokens.append(next_token)
+                        dec_tokens = torch.cat([dec_tokens, torch.tensor([next_token], device=self.device, dtype=torch.long)], dim=0)
+                        comp_mask = torch.cat([comp_mask, torch.tensor([False], device=self.device, dtype=torch.bool)], dim=0)
+                    recon_tokens_list[i] = recon_tokens
+
+            # Build decoder with recon + continuation; defer scoring so we can batch PPL computation.
+            dec_tokens_full: List[torch.Tensor] = []
+            comp_masks_full: List[torch.Tensor] = []
+            targets_full: List[torch.Tensor] = []
+            cont_offsets: List[int] = []
+            cont_lengths: List[int] = []
+
+            for i, (dec_t, comp_t, recon_tokens, cont_tokens) in enumerate(zip(dec_prefix_tensors, comp_mask_tensors, recon_tokens_list, cont_list)):
+                dec_tokens = torch.cat([dec_t, torch.tensor(recon_tokens, device=self.device, dtype=torch.long)], dim=0)
+                comp_mask = torch.cat([comp_t, torch.zeros(len(recon_tokens), device=self.device, dtype=torch.bool)], dim=0)
+
+                cont_trim = cont_tokens[: max(0, self.max_length - dec_tokens.numel() - 1)]
+                cont_tensor = torch.tensor(cont_trim, device=self.device, dtype=torch.long)
+                dec_tokens = torch.cat([dec_tokens, cont_tensor], dim=0)
+                comp_mask = torch.cat([comp_mask, torch.zeros(len(cont_trim), device=self.device, dtype=torch.bool)], dim=0)
+                targets = torch.cat([dec_tokens[1:], torch.tensor([self.eot_token_id], device=self.device, dtype=torch.long)], dim=0)
+
+                cont_start = dec_prefix_lens[i] + len(recon_tokens)
+
+                dec_tokens_full.append(dec_tokens)
+                comp_masks_full.append(comp_mask)
+                targets_full.append(targets)
+                cont_offsets.append(cont_start)
+                cont_lengths.append(len(cont_trim))
+
+            # Score continuation in small batches to reduce peak memory.
+            score_bs = max(1, self._ppl_batch_size)
+            for score_start in range(0, len(dec_tokens_full), score_bs):
+                idxs = list(range(score_start, min(score_start + score_bs, len(dec_tokens_full))))
+
+                sub_enc_tokens = [enc_tokens_list[i] for i in idxs]
+                sub_enc_masks = [enc_mem_masks[i] for i in idxs]
+                enc_lens_sub = [len(t) for t in sub_enc_tokens]
+                enc_cu_sub = torch.tensor([0] + list(torch.tensor(enc_lens_sub).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+                max_enc_sub = max(enc_lens_sub) if enc_lens_sub else 0
+                enc_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens_sub], dim=0) if enc_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
+                enc_tokens_flat_sub = torch.tensor(sum(sub_enc_tokens, []), device=self.device, dtype=torch.long) if sub_enc_tokens else torch.empty(0, device=self.device, dtype=torch.long)
+                enc_mem_mask_flat_sub = torch.tensor(sum(sub_enc_masks, []), device=self.device, dtype=torch.bool) if sub_enc_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                enc_ctx_sub = {
+                    "cu_seqlens_q": enc_cu_sub,
+                    "cu_seqlens_k": enc_cu_sub,
+                    "max_seqlen_q": max_enc_sub,
+                    "max_seqlen_k": max_enc_sub,
+                    "positions": enc_positions_sub,
+                    "encoder_mem_mask": enc_mem_mask_flat_sub,
                 }
+
+                sub_dec_tokens = [dec_tokens_full[i] for i in idxs]
+                sub_comp_masks = [comp_masks_full[i] for i in idxs]
+                dec_lens_sub = [t.numel() for t in sub_dec_tokens]
+                dec_cu_sub = torch.tensor([0] + list(torch.tensor(dec_lens_sub).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+                max_dec_sub = max(dec_lens_sub) if dec_lens_sub else 0
+                dec_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens_sub], dim=0) if dec_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
+                dec_tokens_flat_sub = torch.cat(sub_dec_tokens, dim=0) if sub_dec_tokens else torch.empty(0, device=self.device, dtype=torch.long)
+                comp_mask_flat_sub = torch.cat(sub_comp_masks, dim=0) if sub_comp_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                dec_ctx_sub = {
+                    "cu_seqlens_q": dec_cu_sub,
+                    "cu_seqlens_k": dec_cu_sub,
+                    "max_seqlen_q": max_dec_sub,
+                    "max_seqlen_k": max_dec_sub,
+                    "positions": dec_positions_sub,
+                    "compression_token_mask": comp_mask_flat_sub,
+                }
+
                 logits = self.model(
-                    encoder_tokens=enc_tokens_t,
-                    encoder_context=enc_ctx,
-                    decoder_tokens=dec_tokens,
-                    decoder_context=dec_ctx,
+                    encoder_tokens=enc_tokens_flat_sub,
+                    encoder_context=enc_ctx_sub,
+                    decoder_tokens=dec_tokens_flat_sub,
+                    decoder_context=dec_ctx_sub,
                     last_hidden_only=False,
                 )
-                next_token = int(torch.argmax(logits[-1]))
-                if next_token == END_OF_RECONSTRUCTION_INDEX:
-                    break
-                recon_tokens.append(next_token)
-                dec_tokens = torch.cat([dec_tokens, torch.tensor([next_token], device=self.device, dtype=torch.long)], dim=0)
-                comp_mask = torch.cat([comp_mask, torch.tensor([False], device=self.device, dtype=torch.bool)], dim=0)
+                logprobs = F.log_softmax(logits.float(), dim=-1)
 
-            # Now append continuation and score it
-            continuation_trim = continuation_enc[: max(0, self.max_length - dec_tokens.numel() - 1)]
-            cont_tensor = torch.tensor(continuation_trim, device=self.device, dtype=torch.long)
-            dec_tokens = torch.cat([dec_tokens, cont_tensor], dim=0)
-            comp_mask = torch.cat([comp_mask, torch.zeros(len(continuation_trim), device=self.device, dtype=torch.bool)], dim=0)
-            # targets: shift by one, append eos
-            targets = torch.cat([dec_tokens[1:], torch.tensor([self.eot_token_id], device=self.device, dtype=torch.long)], dim=0)
+                for j, sample_idx in enumerate(idxs):
+                    dec_start = int(dec_cu_sub[j].item())
+                    cont_off = cont_offsets[sample_idx]
+                    cont_len = cont_lengths[sample_idx]
+                    tgt = targets_full[sample_idx]
 
-            dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
-            dec_ctx = {
-                "cu_seqlens_q": dec_cu,
-                "cu_seqlens_k": dec_cu,
-                "max_seqlen_q": dec_tokens.numel(),
-                "max_seqlen_k": dec_tokens.numel(),
-                "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
-                "compression_token_mask": comp_mask,
-            }
-            logits = self.model(
-                encoder_tokens=enc_tokens_t,
-                encoder_context=enc_ctx,
-                decoder_tokens=dec_tokens,
-                decoder_context=dec_ctx,
-                last_hidden_only=False,
-            )
-            logprobs = F.log_softmax(logits.float(), dim=-1)
-            # continuation starts after prefix + recon
-            cont_start = len(dec_prefix) + len(recon_tokens)
-            if cont_start < targets.numel():
-                lp_slice = logprobs[cont_start - 1 : cont_start - 1 + len(continuation_trim)]
-                tgt_slice = targets[cont_start - 1 : cont_start - 1 + len(continuation_trim)]
-                token_lp = lp_slice.gather(-1, tgt_slice.unsqueeze(-1)).squeeze(-1)
-                logprob = float(token_lp.sum().item())
-                greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
-            else:
-                logprob = float("-inf")
-                greedy = False
-            res.append((logprob, greedy))
+                    if cont_len > 0 and cont_off > 0 and cont_off < tgt.numel() + 1:
+                        lp_start = dec_start + cont_off - 1
+                        lp_end = lp_start + cont_len
+                        lp_slice = logprobs[lp_start:lp_end]
+                        tgt_slice = tgt[cont_off - 1 : cont_off - 1 + cont_len]
+                        if lp_slice.numel() == tgt_slice.numel() and lp_slice.numel() > 0:
+                            token_lp = lp_slice.gather(-1, tgt_slice.unsqueeze(-1)).squeeze(-1)
+                            logprob = float(token_lp.sum().item())
+                            greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
+                        else:
+                            logprob = float("-inf")
+                            greedy = False
+                    else:
+                        logprob = float("-inf")
+                        greedy = False
+                    res.append((logprob, greedy))
+
         return res
 
     # ---- helpers ----
