@@ -100,7 +100,7 @@ class NativeCausalLM(TemplateLM):
         vllm_gpu_memory_utilization: float = 0.5,
         vllm_output_root: Optional[str] = None,
         vllm_reconstruct_batch_size: int = 4000,
-        ppl_batch_size: Optional[int] = 16,
+        ppl_batch_size: Optional[int] = 8,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
@@ -833,6 +833,11 @@ class NativeCausalLM(TemplateLM):
                 enc_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens_sub], dim=0) if enc_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
                 enc_tokens_flat_sub = torch.tensor(sum(sub_enc_tokens, []), device=self.device, dtype=torch.long) if sub_enc_tokens else torch.empty(0, device=self.device, dtype=torch.long)
                 enc_mem_mask_flat_sub = torch.tensor(sum(sub_enc_masks, []), device=self.device, dtype=torch.bool) if sub_enc_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                # For scoring PPL on reconstruction only, erase encoder signal and compression masks.
+                if enc_tokens_flat_sub.numel() > 0:
+                    enc_tokens_flat_sub = torch.zeros_like(enc_tokens_flat_sub)
+                if enc_mem_mask_flat_sub.numel() > 0:
+                    enc_mem_mask_flat_sub = torch.zeros_like(enc_mem_mask_flat_sub)
                 enc_ctx_sub = {
                     "cu_seqlens_q": enc_cu_sub,
                     "cu_seqlens_k": enc_cu_sub,
@@ -850,6 +855,8 @@ class NativeCausalLM(TemplateLM):
                 dec_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens_sub], dim=0) if dec_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
                 dec_tokens_flat_sub = torch.cat(sub_dec_tokens, dim=0) if sub_dec_tokens else torch.empty(0, device=self.device, dtype=torch.long)
                 comp_mask_flat_sub = torch.cat(sub_comp_masks, dim=0) if sub_comp_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                if comp_mask_flat_sub.numel() > 0:
+                    comp_mask_flat_sub = torch.zeros_like(comp_mask_flat_sub)
                 dec_ctx_sub = {
                     "cu_seqlens_q": dec_cu_sub,
                     "cu_seqlens_k": dec_cu_sub,
