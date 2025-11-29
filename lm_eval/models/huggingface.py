@@ -221,7 +221,7 @@ class HFLM(TemplateLM):
             self._create_model(
                 pretrained=pretrained,
                 revision=revision,
-                dtype=dtype,
+                # dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 parallelize=parallelize,
                 gpus=gpus,
@@ -628,7 +628,7 @@ class HFLM(TemplateLM):
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
-                dtype=get_dtype(dtype),
+                # dtype=get_dtype(dtype),cur
                 trust_remote_code=trust_remote_code,
                 gguf_file=gguf_file,
                 quantization_config=quantization_config,
