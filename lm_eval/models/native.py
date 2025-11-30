@@ -887,6 +887,7 @@ class NativeCausalLM(TemplateLM):
         enc_mem_mask: List[bool] = []
         enc_lens: List[int] = []
         comp_offsets: List[int] = [0]
+        positions_flat: List[int] = []
 
         for p, glen in zip(prompts, gen_lens):
             p_tokens = self.tok_encode(p)
@@ -907,33 +908,36 @@ class NativeCausalLM(TemplateLM):
             total_comp_slots_list.append(slots)
             comp_offsets.append(comp_offsets[-1] + slots)
 
+            before_len = len(enc_tokens)
             for sp in ctx_spans:
                 enc_tokens.extend(sp)
                 enc_mem_mask.extend([False] * len(sp))
                 enc_tokens.extend([placeholder_id] * num_comp)
                 enc_mem_mask.extend([True] * num_comp)
-            enc_lens.append(len(enc_tokens) - sum(enc_lens))
+            enc_lens.append(len(enc_tokens) - before_len)
+            positions_flat.extend(range(enc_lens[-1]))
 
         if sum(enc_lens) == 0:
-            return embeds
+            compression_vectors = torch.empty(0, self.model.args.d_model, device=self.device, dtype=self._dtype)
+            enc_cu = torch.tensor([0] * (len(prompts) + 1), device=self.device, dtype=torch.int32)
+        else:
+            enc_tokens_t = torch.tensor(enc_tokens, device=self.device, dtype=torch.long)
+            enc_mem_mask_t = torch.tensor(enc_mem_mask, device=self.device, dtype=torch.bool)
+            enc_cu = torch.tensor([0] + list(torch.tensor(enc_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+            enc_ctx = {
+                "cu_seqlens_q": enc_cu,
+                "cu_seqlens_k": enc_cu,
+                "max_seqlen_q": max(enc_lens),
+                "max_seqlen_k": max(enc_lens),
+                "positions": torch.tensor(positions_flat, device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": enc_mem_mask_t,
+            }
 
-        enc_tokens_t = torch.tensor(enc_tokens, device=self.device, dtype=torch.long)
-        enc_mem_mask_t = torch.tensor(enc_mem_mask, device=self.device, dtype=torch.bool)
-        enc_cu = torch.tensor([0] + list(torch.tensor(enc_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
-        enc_ctx = {
-            "cu_seqlens_q": enc_cu,
-            "cu_seqlens_k": enc_cu,
-            "max_seqlen_q": max(enc_lens),
-            "max_seqlen_k": max(enc_lens),
-            "positions": torch.arange(len(enc_tokens), device=self.device, dtype=torch.int32),
-            "encoder_mem_mask": enc_mem_mask_t,
-        }
-
-        with torch.inference_mode():
-            compression_vectors = self.model.compress(
-                encoder_tokens=enc_tokens_t,
-                encoder_context=enc_ctx,
-            )
+            with torch.inference_mode():
+                compression_vectors = self.model.compress(
+                    encoder_tokens=enc_tokens_t,
+                    encoder_context=enc_ctx,
+                )
 
         for i, p_tokens in enumerate(prompt_tokens_list):
             slots = total_comp_slots_list[i]
@@ -946,7 +950,7 @@ class NativeCausalLM(TemplateLM):
             prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
             comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
             pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
-            if slots > 0:
+            if slots > 0 and compression_vectors.numel() > 0:
                 pe[comp_mask_t] = compression_vectors[comp_offsets[i] : comp_offsets[i + 1]].to(dtype=self._dtype)
             embeds[i] = pe
 
