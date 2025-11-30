@@ -606,12 +606,10 @@ class NativeCausalLM(TemplateLM):
                 and hasattr(self.model, "compression_embeddings")
             ):
                 include_bor = self._mode == "reconstruct_first"
-                embeds = []
-                gkwargs = []
-                for c, gk in chunk:
-                    emb = self._build_compress_prompt_embeds(c, include_bor)
-                    embeds.append(emb)
-                    gkwargs.append(gk)
+                prompts = [c for c, _ in chunk]
+                gkwargs = [g for _, g in chunk]
+                gen_lens = [g.get("max_generation_length", self.max_gen_toks) for g in gkwargs]
+                embeds = self._build_compress_prompt_embeds_batch(prompts, gen_lens, include_bor)
                 valid_indices = [i for i, e in enumerate(embeds) if e is not None]
                 outs_text = [""] * len(chunk)
                 if valid_indices:
@@ -861,55 +859,72 @@ class NativeCausalLM(TemplateLM):
         text = outputs[0].outputs[0].text
         return self._truncate_until(text, until)
 
-    def _build_compress_prompt_embeds(self, prompt: str, include_bor: bool) -> Optional[torch.Tensor]:
+    def _build_compress_prompt_embeds_batch(
+        self, prompts: List[str], gen_lens: List[int], include_bor: bool
+    ) -> List[Optional[torch.Tensor]]:
         """
-        Build prompt embeddings for compress_answer/reconstruct_first with optional BOR.
+        Batch build prompt embeddings for compress_answer/reconstruct_first with optional BOR.
         """
         num_comp = getattr(self.model.args, "num_compression_tokens", 0)
+        embeds: List[Optional[torch.Tensor]] = [None] * len(prompts)
+
+        # Fast path: no compression tokens
         if num_comp <= 0:
-            tokens = self.tok_encode(prompt)
-            if len(tokens) == 0:
-                return None
-            tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
-            return self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
+            for i, p in enumerate(prompts):
+                tokens = self.tok_encode(p)
+                if len(tokens) == 0:
+                    continue
+                tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
+                embeds[i] = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
+            return embeds
 
         max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
         placeholder_id = 0
-        prompt_tokens = self.tok_encode(prompt)
 
-        ctx_spans = [prompt_tokens[i : i + max_mem_span_len] for i in range(0, len(prompt_tokens), max_mem_span_len)]
-        if not ctx_spans:
-            ctx_spans = [[]]
-
-        bor_extra = 1 if include_bor else 0
-        total_static = 2 + len(prompt_tokens) + bor_extra  # BOM + EOM + prompt (+BOR)
-        max_comp_tokens = max(0, self.max_length - total_static - self.max_gen_toks)
-        max_chunks = max_comp_tokens // num_comp if num_comp > 0 else 0
-        if max_chunks <= 0:
-            max_chunks = 1
-        ctx_spans = ctx_spans[-max_chunks:]
-
-        total_comp_slots = num_comp * len(ctx_spans)
-
+        prompt_tokens_list: List[List[int]] = []
+        total_comp_slots_list: List[int] = []
         enc_tokens: List[int] = []
         enc_mem_mask: List[bool] = []
-        for sp in ctx_spans:
-            enc_tokens.extend(sp)
-            enc_mem_mask.extend([False] * len(sp))
-            enc_tokens.extend([placeholder_id] * num_comp)
-            enc_mem_mask.extend([True] * num_comp)
-        if len(enc_tokens) == 0:
-            enc_tokens = [placeholder_id]
-            enc_mem_mask = [False]
+        enc_lens: List[int] = []
+        comp_offsets: List[int] = [0]
+
+        for p, glen in zip(prompts, gen_lens):
+            p_tokens = self.tok_encode(p)
+            prompt_tokens_list.append(p_tokens)
+            ctx_spans = [p_tokens[i : i + max_mem_span_len] for i in range(0, len(p_tokens), max_mem_span_len)]
+            if not ctx_spans:
+                ctx_spans = [[]]
+
+            bor_extra = 1 if include_bor else 0
+            total_static = 2 + len(p_tokens) + bor_extra  # BOM + EOM + prompt (+BOR)
+            max_comp_tokens = max(0, self.max_length - total_static - glen)
+            max_chunks = max_comp_tokens // num_comp if num_comp > 0 else 0
+            if max_chunks <= 0:
+                max_chunks = 1
+            ctx_spans = ctx_spans[-max_chunks:]
+
+            slots = num_comp * len(ctx_spans)
+            total_comp_slots_list.append(slots)
+            comp_offsets.append(comp_offsets[-1] + slots)
+
+            for sp in ctx_spans:
+                enc_tokens.extend(sp)
+                enc_mem_mask.extend([False] * len(sp))
+                enc_tokens.extend([placeholder_id] * num_comp)
+                enc_mem_mask.extend([True] * num_comp)
+            enc_lens.append(len(enc_tokens) - sum(enc_lens))
+
+        if sum(enc_lens) == 0:
+            return embeds
 
         enc_tokens_t = torch.tensor(enc_tokens, device=self.device, dtype=torch.long)
         enc_mem_mask_t = torch.tensor(enc_mem_mask, device=self.device, dtype=torch.bool)
-        enc_cu = torch.tensor([0, len(enc_tokens)], device=self.device, dtype=torch.int32)
+        enc_cu = torch.tensor([0] + list(torch.tensor(enc_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
         enc_ctx = {
             "cu_seqlens_q": enc_cu,
             "cu_seqlens_k": enc_cu,
-            "max_seqlen_q": len(enc_tokens),
-            "max_seqlen_k": len(enc_tokens),
+            "max_seqlen_q": max(enc_lens),
+            "max_seqlen_k": max(enc_lens),
             "positions": torch.arange(len(enc_tokens), device=self.device, dtype=torch.int32),
             "encoder_mem_mask": enc_mem_mask_t,
         }
@@ -920,19 +935,22 @@ class NativeCausalLM(TemplateLM):
                 encoder_context=enc_ctx,
             )
 
-        dec_prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + prompt_tokens
-        comp_mask = [False] + ([True] * total_comp_slots) + [False] + ([False] * len(prompt_tokens))
-        if include_bor:
-            dec_prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
-            comp_mask.append(False)
+        for i, p_tokens in enumerate(prompt_tokens_list):
+            slots = total_comp_slots_list[i]
+            prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * slots) + [END_OF_MEMORY_INDEX] + p_tokens
+            comp_mask = [False] + ([True] * slots) + [False] + ([False] * len(p_tokens))
+            if include_bor:
+                prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+                comp_mask.append(False)
 
-        dec_prefix_t = torch.tensor(dec_prefix, device=self.device, dtype=torch.long)
-        comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+            prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
+            comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+            pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+            if slots > 0:
+                pe[comp_mask_t] = compression_vectors[comp_offsets[i] : comp_offsets[i + 1]].to(dtype=self._dtype)
+            embeds[i] = pe
 
-        prompt_embeds = self.model.tok_embeddings(dec_prefix_t).to(dtype=self._dtype)
-        if compression_vectors.numel() > 0:
-            prompt_embeds[comp_mask_t] = compression_vectors.to(dtype=self._dtype)
-        return prompt_embeds
+        return embeds
 
     def _generate_with_vllm_decoder_embeds(
         self,
