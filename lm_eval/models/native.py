@@ -100,7 +100,7 @@ class NativeCausalLM(TemplateLM):
         vllm_model_path: Optional[str] = None,
         vllm_max_model_len: Optional[int] = None,
         vllm_tensor_parallel: int = 1,
-        vllm_gpu_memory_utilization: float = 0.5,
+        vllm_gpu_memory_utilization: float = 0.4,
         vllm_output_root: Optional[str] = None,
         vllm_reconstruct_batch_size: int = 4000,
         ppl_batch_size: Optional[int] = 8,
