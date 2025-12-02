@@ -1442,7 +1442,7 @@ class NativeCausalLM(TemplateLM):
         with open(os.path.join(checkpoint_dir, "metadata.json")) as f:
             metadata = json.load(f)
 
-        modelargs = ModelArgs(**metadata["modelargs"])
+        modelargs = ModelArgs(**filter_kwargs_for(ModelArgs, metadata["modelargs"]))
         device_mesh = _build_device_mesh(distributed_args.world_size, modelargs.model_parallel_size)
         model = Model(modelargs)
         if device_mesh is not None:
@@ -1468,6 +1468,6 @@ class NativeCausalLM(TemplateLM):
 
         from data.lm_loader import DataLoaderArgs  # lazy import to avoid cycles
 
-        dataloader_args = DataLoaderArgs(**metadata["dataloader_args"])
+        dataloader_args = DataLoaderArgs(**filter_kwargs_for(DataLoaderArgs, metadata["dataloader_args"]))
         tokenizer = Tokenizer(tokenizer_path or dataloader_args.tokenizer_path)
         return model, tokenizer, metadata.get("updates", 0), device_mesh
