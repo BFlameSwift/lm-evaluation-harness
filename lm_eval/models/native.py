@@ -25,6 +25,36 @@ from eval_func.model2safetensors import convert_checkpoint
 from eval_func.vllm_runner import VLLMEngineWrapper, VLLMEngineConfig, VLLMDecoderManager
 import sys
 
+from typing import Type, TypeVar, Mapping, Any, Dict
+import inspect
+
+T = TypeVar("T")
+
+
+
+def filter_kwargs_for(
+    cls: Type[T],
+    raw_kwargs: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Filter kwargs for a class __init__ method.
+    """
+    sig = inspect.signature(cls)
+
+    # Only keep arguments that can be passed as keyword arguments
+    valid_names = {
+        name
+        for name, param in sig.parameters.items()
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        # Usually we don't want to include self
+        and name != "self"
+    }
+
+    return {k: v for k, v in raw_kwargs.items() if k in valid_names}
+
 
 def _str_to_dtype(name: Optional[str]) -> torch.dtype:
     if name is None or name == "auto":
