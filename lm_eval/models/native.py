@@ -10,7 +10,8 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 
 from arch.model import ModelArgs, create_kv_cache
-from arch.comp_mem import CompressedMemoryModel as Model
+# from arch.comp_mem import CompressedMemoryModel as Model
+from arch.comp_mem import MassiveCompressedMemoryModel as Model
 from config import DistributedArgs
 from data.tokenizer import Tokenizer
 from distributed import apply_tp
@@ -23,6 +24,7 @@ from data.ae_loader import (
 )
 from eval_func.model2safetensors import convert_checkpoint
 from eval_func.vllm_runner import VLLMEngineWrapper, VLLMEngineConfig, VLLMDecoderManager
+from eval_func.utils import load_checkpoint_harness,_build_device_mesh
 import sys
 
 from typing import Type, TypeVar, Mapping, Any, Dict
@@ -87,15 +89,6 @@ def _default_distributed_args() -> DistributedArgs:
     return DistributedArgs(rank=rank, local_rank=local_rank, world_size=world_size)
 
 
-def _build_device_mesh(world_size: int, mp_size: int):
-    """Return None for single-process runs to avoid init_process_group when RANK is missing."""
-    if world_size <= 1 and mp_size == 1:
-        return None
-    return init_device_mesh(
-        "cuda",
-        mesh_shape=(world_size // mp_size, mp_size),
-        mesh_dim_names=["dp", "tp"],
-    )
 
 
 @register_model("native")
@@ -164,7 +157,7 @@ class NativeCausalLM(TemplateLM):
                 apply_tp(model, device_mesh)
             tokenizer = Tokenizer(pretrain_model_dir)
         else:
-            model, tokenizer, _, device_mesh = self._load_checkpoint(checkpoint_dir, distributed_args, tokenizer_path)
+            model, tokenizer, _, device_mesh = load_checkpoint_harness(checkpoint_dir, distributed_args, tokenizer_path)
 
         self.model = model.to(dtype=self._dtype, device=self._device)
         self.model.eval()
@@ -275,6 +268,75 @@ class NativeCausalLM(TemplateLM):
         tensor = torch.tensor(padded, device=self.device, dtype=torch.long)
         return tensor, tensor  # attention mask not used
 
+    def _compress_tokens(self, enc_tokens_flat: torch.Tensor, enc_cu: torch.Tensor, enc_mem_mask_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Compress a packed encoder sequence; chunk per sample to keep each encoder call reasonably sized.
+        """
+        max_len = getattr(self.model.args, "max_seq_len", None)
+        has_multi = hasattr(self.model, "compress_multi_batches")
+
+        # Fallback: no max_len info, single call
+        if max_len is None:
+            max_seq = int(torch.diff(enc_cu).max().item()) if len(enc_cu) > 1 else enc_tokens_flat.numel()
+            ctx = {
+                "cu_seqlens_q": enc_cu,
+                "cu_seqlens_k": enc_cu,
+                "max_seqlen_q": max_seq,
+                "max_seqlen_k": max_seq,
+                "positions": torch.arange(enc_tokens_flat.numel(), device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": enc_mem_mask_flat,
+            }
+            return self.model.compress(encoder_tokens=enc_tokens_flat, encoder_context=ctx)
+
+        enc_tokens_mb: List[torch.Tensor] = []
+        enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
+        for i in range(len(enc_cu) - 1):
+            s, e = enc_cu[i].item(), enc_cu[i + 1].item()
+            seq_tokens = enc_tokens_flat[s:e]
+            seq_mask = enc_mem_mask_flat[s:e]
+            if seq_tokens.numel() == 0:
+                enc_tokens_mb.append(torch.empty(0, device=self.device, dtype=torch.long))
+                enc_ctx_mb.append({
+                    "cu_seqlens_q": torch.tensor([0, 0], device=self.device, dtype=torch.int32),
+                    "cu_seqlens_k": torch.tensor([0, 0], device=self.device, dtype=torch.int32),
+                    "max_seqlen_q": 0,
+                    "max_seqlen_k": 0,
+                    "positions": torch.empty(0, device=self.device, dtype=torch.int32),
+                    "encoder_mem_mask": torch.empty(0, device=self.device, dtype=torch.bool),
+                })
+                continue
+            for j in range(0, seq_tokens.numel(), max_len):
+                chunk_tokens = seq_tokens[j : j + max_len]
+                chunk_mask = seq_mask[j : j + max_len]
+                chunk_len = chunk_tokens.numel()
+                cu = torch.tensor([0, chunk_len], device=self.device, dtype=torch.int32)
+                enc_tokens_mb.append(chunk_tokens)
+                enc_ctx_mb.append({
+                    "cu_seqlens_q": cu,
+                    "cu_seqlens_k": cu,
+                    "max_seqlen_q": chunk_len,
+                    "max_seqlen_k": chunk_len,
+                    "positions": torch.arange(chunk_len, device=self.device, dtype=torch.int32),
+                    "encoder_mem_mask": chunk_mask,
+                })
+
+        with torch.autocast(device_type="cuda", dtype=self._dtype):
+            if has_multi:
+                return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
+            enc_tokens_cat = torch.cat(enc_tokens_mb, dim=0)
+            enc_masks_cat = torch.cat([ctx["encoder_mem_mask"] for ctx in enc_ctx_mb], dim=0)
+            cu = torch.tensor([0] + [t.numel() for t in enc_tokens_mb], device=self.device, dtype=torch.int32).cumsum(0)
+            max_seq = max(t.numel() for t in enc_tokens_mb) if enc_tokens_mb else 0
+            ctx = {
+                "cu_seqlens_q": cu,
+                "cu_seqlens_k": cu,
+                "max_seqlen_q": max_seq,
+                "max_seqlen_k": max_seq,
+                "positions": torch.arange(enc_tokens_cat.numel(), device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": enc_masks_cat,
+            }
+            return self.model.compress(encoder_tokens=enc_tokens_cat, encoder_context=ctx)
+
     def _build_prompt_embeds(
         self,
         encoder_tokens: torch.Tensor,
@@ -284,10 +346,7 @@ class NativeCausalLM(TemplateLM):
     ) -> torch.Tensor:
         """Encode compression slots and return embeddings with slots filled."""
         with torch.inference_mode():
-            compression_vectors = self.model.compress(
-                encoder_tokens=encoder_tokens,
-                encoder_context=encoder_context,
-            )
+            compression_vectors = self._compress_tokens(encoder_tokens, encoder_context["cu_seqlens_q"], encoder_context["encoder_mem_mask"])
         prompt_embeds = self.model.tok_embeddings(decoder_prefix.to(self.device))
         prompt_embeds = prompt_embeds.to(compression_vectors.dtype)
         prompt_embeds[compression_mask] = compression_vectors
@@ -310,18 +369,14 @@ class NativeCausalLM(TemplateLM):
         with ctx:
             if hasattr(self.model, "compression_embeddings"):
                 # Build dummy encoder/decoder contexts for compression model when used as plain LM
-                encoder_context = dict(context)
-                encoder_context["encoder_mem_mask"] = torch.zeros_like(positions, dtype=torch.bool)
                 decoder_context = dict(context)
                 decoder_context["compression_token_mask"] = torch.zeros_like(positions, dtype=torch.bool)
-                hidden = self.model(
-                    encoder_tokens=inps.flatten(),
-                    encoder_context=encoder_context,
-                    decoder_tokens=inps.flatten(),
-                    decoder_context=decoder_context,
-                    last_hidden_only=True,
-                )
-                logits = hidden
+                x_tokens = self.model.tok_embeddings(inps.flatten()).to(self._dtype)
+                h = x_tokens
+                for layer in self.model.layers:
+                    h = layer(h, context=decoder_context)
+                h = self.model.norm(h)
+                logits = h
             else:
                 logits = self.model(inps.flatten(), context=context, **kwargs)
         return logits.view(original_shape[0], original_shape[1], -1)
@@ -379,13 +434,12 @@ class NativeCausalLM(TemplateLM):
                         "compression_token_mask": torch.zeros(enc.numel(), device=self.device, dtype=torch.bool),
                     }
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
-                        logits = self.model(
-                            encoder_tokens=enc,
-                            encoder_context=enc_ctx,
-                            decoder_tokens=enc,
-                            decoder_context=dec_ctx,
-                            last_hidden_only=False,
-                        )
+                        x_tokens = self.model.tok_embeddings(enc).to(self._dtype)
+                        h = x_tokens
+                        for layer in self.model.layers:
+                            h = layer(h, context=dec_ctx)
+                        h = self.model.norm(h)
+                        logits = self.model.output(h).float()
                     nxt = int(torch.argmax(logits[-1]))
                     next_tokens.append(nxt)
                 # append tokens
@@ -918,6 +972,7 @@ class NativeCausalLM(TemplateLM):
         enc_lens: List[int] = []
         comp_offsets: List[int] = [0]
         positions_flat: List[int] = []
+        model_max_len = getattr(self.model.args, "max_seq_len", self.max_length)
 
         for p, glen in zip(prompts, gen_lens):
             p_tokens = self.tok_encode(p)
@@ -930,6 +985,9 @@ class NativeCausalLM(TemplateLM):
             total_static = 2 + len(p_tokens) + bor_extra  # BOM + EOM + prompt (+BOR)
             max_comp_tokens = max(0, self.max_length - total_static - glen)
             max_chunks = max_comp_tokens // num_comp if num_comp > 0 else 0
+            if num_comp > 0 and model_max_len:
+                enc_budget_chunks = max(1, model_max_len // (2 + num_comp))
+                max_chunks = min(max_chunks, enc_budget_chunks) if max_chunks > 0 else enc_budget_chunks
             if max_chunks <= 0:
                 max_chunks = 1
             ctx_spans = ctx_spans[-max_chunks:]
@@ -954,20 +1012,7 @@ class NativeCausalLM(TemplateLM):
             enc_tokens_t = torch.tensor(enc_tokens, device=self.device, dtype=torch.long)
             enc_mem_mask_t = torch.tensor(enc_mem_mask, device=self.device, dtype=torch.bool)
             enc_cu = torch.tensor([0] + list(torch.tensor(enc_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
-            enc_ctx = {
-                "cu_seqlens_q": enc_cu,
-                "cu_seqlens_k": enc_cu,
-                "max_seqlen_q": max(enc_lens),
-                "max_seqlen_k": max(enc_lens),
-                "positions": torch.tensor(positions_flat, device=self.device, dtype=torch.int32),
-                "encoder_mem_mask": enc_mem_mask_t,
-            }
-
-            with torch.inference_mode():
-                compression_vectors = self.model.compress(
-                    encoder_tokens=enc_tokens_t,
-                    encoder_context=enc_ctx,
-                )
+            compression_vectors = self._compress_tokens(enc_tokens_t, enc_cu, enc_mem_mask_t)
 
         for i, p_tokens in enumerate(prompt_tokens_list):
             slots = total_comp_slots_list[i]
@@ -1056,6 +1101,8 @@ class NativeCausalLM(TemplateLM):
             ans_offsets: List[int] = []
             cont_lengths: List[int] = []
 
+            model_max_len = getattr(self.model.args, "max_seq_len", self.max_length)
+
             for (_, context_enc, continuation_enc) in chunk:
                 # Chunk context to respect max_mem_span_len; keep the most recent spans.
                 ctx_spans = [context_enc[i : i + max_mem_span_len] for i in range(0, len(context_enc), max_mem_span_len)]
@@ -1071,6 +1118,20 @@ class NativeCausalLM(TemplateLM):
                     max_chunks = 1  # at least one span if compression is available
                 ctx_spans = ctx_spans[-max_chunks:] if max_chunks > 0 else ctx_spans
 
+                # Hard cap: ensure decoder length <= model_max_len by dropping spans if needed
+                total_comp_slots = num_comp * len(ctx_spans) if num_comp > 0 else 0
+                dec_budget = model_max_len if model_max_len is not None else self.max_length
+                cont_trim = continuation_enc  # do not truncate continuation
+                
+                drop_count = 0
+                while num_comp > 0 and (len(ctx_spans) * (num_comp + 2) + len(cont_trim)) > dec_budget and len(ctx_spans) > 1:
+                    ctx_spans = ctx_spans[1:]  # drop oldest span
+                    drop_count += 1
+                print(f"Dropping span {drop_count} of {len(ctx_spans)}")
+
+                if num_comp > 0 and (len(ctx_spans) * (num_comp + 2) + len(cont_trim)) > dec_budget:
+                    continue
+
                 # Encoder: concatenate spans, each followed by its compression slots.
                 enc_tokens, enc_mem_mask = [], []
                 for span in ctx_spans:
@@ -1080,15 +1141,17 @@ class NativeCausalLM(TemplateLM):
                         enc_tokens.extend([placeholder_id] * num_comp)
                         enc_mem_mask.extend([True] * num_comp)
 
-                # Decoder: one BOM, then all compression slots, then EOM + answer.
-                total_comp_slots = num_comp * len(ctx_spans) if num_comp > 0 else 0
-                max_cont_len = max(0, self.max_length - (total_comp_slots + 2))
-                cont_trim = continuation_enc[:max_cont_len]
-                dec_tokens = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + cont_trim
-                comp_mask = [False] + ([True] * total_comp_slots) + [False] + ([False] * len(cont_trim))
+                # Decoder: per-span BOM/slots/EOM, then answer.
+                dec_tokens = []
+                comp_mask = []
+                for _ in ctx_spans:
+                    dec_tokens.extend([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX])
+                    comp_mask.extend([False] + ([True] * num_comp) + [False])
+                dec_tokens.extend(cont_trim)
+                comp_mask.extend([False] * len(cont_trim))
 
                 targets = dec_tokens[1:] + [self.eot_token_id]
-                answer_start = total_comp_slots + 2  # skip BOM + all slots + EOM
+                answer_start = len(dec_tokens) - len(cont_trim)
 
                 enc_tokens_list.append(enc_tokens)
                 enc_mem_masks.append(enc_mem_mask)
@@ -1134,13 +1197,23 @@ class NativeCausalLM(TemplateLM):
 
             ctx = torch.autocast(device_type="cuda", dtype=self._dtype)
             with ctx:
-                logits = self.model(
-                    encoder_tokens=enc_tokens_flat,
-                    encoder_context=enc_ctx,
-                    decoder_tokens=dec_tokens_flat,
-                    decoder_context=dec_ctx,
-                    last_hidden_only=False,
-                )
+                if hasattr(self.model, "compression_embeddings"):
+                    comp_vectors = self._compress_tokens(enc_tokens_flat, enc_cu, enc_mem_mask_flat)
+                    x_tokens = self.model.tok_embeddings(dec_tokens_flat).to(self._dtype)
+                    x_tokens[comp_mask_flat] = comp_vectors.to(x_tokens.dtype)
+                    h = x_tokens
+                    for layer in self.model.layers:
+                        h = layer(h, context=dec_ctx)
+                    h = self.model.norm(h)
+                    logits = self.model.output(h).float()
+                else:
+                    logits = self.model(
+                        encoder_tokens=enc_tokens_flat,
+                        encoder_context=enc_ctx,
+                        decoder_tokens=dec_tokens_flat,
+                        decoder_context=dec_ctx,
+                        last_hidden_only=False,
+                    )
             logprobs = F.log_softmax(logits.float(), dim=-1)
 
             for i, (ans_off, cont_len) in enumerate(zip(ans_offsets, cont_lengths)):
@@ -1268,12 +1341,7 @@ class NativeCausalLM(TemplateLM):
             # Reconstruction: vLLM prompt_embeds batch if available, else per-sample greedy
             recon_tokens_list: List[List[int]] = [[] for _ in dec_prefix_list]
             if self._vllm_manager is not None:
-                # Batch compress once, then split per-sample to fill prompt embeds.
-                with torch.inference_mode():
-                    compression_vectors = self.model.compress(
-                        encoder_tokens=enc_tokens_flat,
-                        encoder_context=enc_ctx,
-                    )
+                compression_vectors = self._compress_tokens(enc_tokens_flat, enc_cu, enc_mem_mask_flat)
                 comp_counts = [int(sum(mask)) for mask in enc_mem_masks]
                 comp_offsets = [0]
                 for c in comp_counts:
@@ -1309,20 +1377,19 @@ class NativeCausalLM(TemplateLM):
                             "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
                             "compression_token_mask": comp_mask,
                         }
-                        logits = self.model(
-                            encoder_tokens=enc_tokens_flat[enc_cu[i]:enc_cu[i+1]],
-                            encoder_context={
-                                "cu_seqlens_q": torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
-                                "cu_seqlens_k": torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
-                                "max_seqlen_q": enc_lens[i],
-                                "max_seqlen_k": enc_lens[i],
-                                "positions": torch.arange(enc_lens[i], device=self.device, dtype=torch.int32),
-                                "encoder_mem_mask": torch.tensor(enc_mem_masks[i], device=self.device, dtype=torch.bool),
-                            },
-                            decoder_tokens=dec_tokens,
-                            decoder_context=dec_ctx,
-                            last_hidden_only=False,
+                        # compute compression for this sample
+                        comp_vec = self._compress_tokens(
+                            enc_tokens_flat[enc_cu[i]:enc_cu[i+1]],
+                            torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
+                            torch.tensor(enc_mem_masks[i], device=self.device, dtype=torch.bool),
                         )
+                        x_tokens = self.model.tok_embeddings(dec_tokens).to(self._dtype)
+                        x_tokens[comp_mask] = comp_vec.to(x_tokens.dtype)
+                        h_dec = x_tokens
+                        for layer in self.model.layers:
+                            h_dec = layer(h_dec, context=dec_ctx)
+                        h_dec = self.model.norm(h_dec)
+                        logits = self.model.output(h_dec).float()
                         next_token = int(torch.argmax(logits[-1]))
                         if next_token == END_OF_RECONSTRUCTION_INDEX:
                             break
@@ -1356,24 +1423,19 @@ class NativeCausalLM(TemplateLM):
                 cont_offsets.append(cont_start)
                 cont_lengths.append(len(cont_trim))
 
-            # Score continuation in small batches to reduce peak memory.
-            score_bs = max(1, self._ppl_batch_size)
-            for score_start in range(0, len(dec_tokens_full), score_bs):
-                idxs = list(range(score_start, min(score_start + score_bs, len(dec_tokens_full))))
+                # Score continuation in small batches to reduce peak memory.
+                score_bs = max(1, self._ppl_batch_size)
+                for score_start in range(0, len(dec_tokens_full), score_bs):
+                    idxs = list(range(score_start, min(score_start + score_bs, len(dec_tokens_full))))
 
-                sub_enc_tokens = [enc_tokens_list[i] for i in idxs]
-                sub_enc_masks = [enc_mem_masks[i] for i in idxs]
+                    sub_enc_tokens = [enc_tokens_list[i] for i in idxs]
+                    sub_enc_masks = [enc_mem_masks[i] for i in idxs]
                 enc_lens_sub = [len(t) for t in sub_enc_tokens]
                 enc_cu_sub = torch.tensor([0] + list(torch.tensor(enc_lens_sub).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
                 max_enc_sub = max(enc_lens_sub) if enc_lens_sub else 0
                 enc_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens_sub], dim=0) if enc_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
                 enc_tokens_flat_sub = torch.tensor(sum(sub_enc_tokens, []), device=self.device, dtype=torch.long) if sub_enc_tokens else torch.empty(0, device=self.device, dtype=torch.long)
                 enc_mem_mask_flat_sub = torch.tensor(sum(sub_enc_masks, []), device=self.device, dtype=torch.bool) if sub_enc_masks else torch.empty(0, device=self.device, dtype=torch.bool)
-        # For scoring PPL on reconstruction only, erase encoder signal and compression masks.
-                if enc_tokens_flat_sub.numel() > 0:
-                    enc_tokens_flat_sub = torch.zeros_like(enc_tokens_flat_sub)
-                if enc_mem_mask_flat_sub.numel() > 0:
-                    enc_mem_mask_flat_sub = torch.zeros_like(enc_mem_mask_flat_sub)
                 enc_ctx_sub = {
                     "cu_seqlens_q": enc_cu_sub,
                     "cu_seqlens_k": enc_cu_sub,
@@ -1391,8 +1453,6 @@ class NativeCausalLM(TemplateLM):
                 dec_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens_sub], dim=0) if dec_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
                 dec_tokens_flat_sub = torch.cat(sub_dec_tokens, dim=0) if sub_dec_tokens else torch.empty(0, device=self.device, dtype=torch.long)
                 comp_mask_flat_sub = torch.cat(sub_comp_masks, dim=0) if sub_comp_masks else torch.empty(0, device=self.device, dtype=torch.bool)
-                if comp_mask_flat_sub.numel() > 0:
-                    comp_mask_flat_sub = torch.zeros_like(comp_mask_flat_sub)
                 dec_ctx_sub = {
                     "cu_seqlens_q": dec_cu_sub,
                     "cu_seqlens_k": dec_cu_sub,
@@ -1402,13 +1462,23 @@ class NativeCausalLM(TemplateLM):
                     "compression_token_mask": comp_mask_flat_sub,
                 }
 
-                logits = self.model(
-                    encoder_tokens=enc_tokens_flat_sub,
-                    encoder_context=enc_ctx_sub,
-                    decoder_tokens=dec_tokens_flat_sub,
-                    decoder_context=dec_ctx_sub,
-                    last_hidden_only=False,
-                )
+                if hasattr(self.model, "compression_embeddings"):
+                    comp_vec = self._compress_tokens(enc_tokens_flat_sub, enc_cu_sub, enc_mem_mask_flat_sub)
+                    x_tokens = self.model.tok_embeddings(dec_tokens_flat_sub).to(self._dtype)
+                    x_tokens[comp_mask_flat_sub] = comp_vec.to(x_tokens.dtype)
+                    h = x_tokens
+                    for layer in self.model.layers:
+                        h = layer(h, context=dec_ctx_sub)
+                    h = self.model.norm(h)
+                    logits = self.model.output(h).float()
+                else:
+                    logits = self.model(
+                        encoder_tokens=enc_tokens_flat_sub,
+                        encoder_context=enc_ctx_sub,
+                        decoder_tokens=dec_tokens_flat_sub,
+                        decoder_context=dec_ctx_sub,
+                        last_hidden_only=False,
+                    )
                 logprobs = F.log_softmax(logits.float(), dim=-1)
 
                 for j, sample_idx in enumerate(idxs):
