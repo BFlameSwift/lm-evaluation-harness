@@ -145,6 +145,8 @@ class NativeCausalLM(TemplateLM):
 
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
+        # Native supports tensor-parallel only; data-parallel (world_size > model_parallel_size) will duplicate work.
+        self._distributed_args = distributed_args
 		
         if checkpoint_dir is None and pretrain_model_dir is None:
             raise ValueError("Provide either checkpoint_dir or pretrain_model_dir for native model.")
@@ -158,6 +160,16 @@ class NativeCausalLM(TemplateLM):
             tokenizer = Tokenizer(pretrain_model_dir)
         else:
             model, tokenizer, _, device_mesh = load_checkpoint_harness(checkpoint_dir, distributed_args, tokenizer_path)
+
+        # Guard against data-parallel: require world_size <= model_parallel_size
+        if self._distributed_args.world_size > 1 and device_mesh is not None:
+            tp_size = device_mesh.mesh.shape[1]
+            if self._distributed_args.world_size != tp_size:
+                raise ValueError(
+                    f"native model only supports tensor-parallel in lm-eval; "
+                    f"got world_size={self._distributed_args.world_size}, model_parallel_size={tp_size}. "
+                    "Please launch a single process or set num_processes == model_parallel_size."
+                )
 
         self.model = model.to(dtype=self._dtype, device=self._device)
         self.model.eval()
