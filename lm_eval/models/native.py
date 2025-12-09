@@ -161,14 +161,15 @@ class NativeCausalLM(TemplateLM):
         else:
             model, tokenizer, _, device_mesh = load_checkpoint_harness(checkpoint_dir, distributed_args, tokenizer_path)
 
-        # Guard against data-parallel: require world_size <= model_parallel_size
+        # Guard against data-parallel: require world_size <= model_parallel_size (TP only)
         if self._distributed_args.world_size > 1 and device_mesh is not None:
             tp_size = device_mesh.mesh.shape[1]
             if self._distributed_args.world_size != tp_size:
                 raise ValueError(
                     f"native model only supports tensor-parallel in lm-eval; "
                     f"got world_size={self._distributed_args.world_size}, model_parallel_size={tp_size}. "
-                    "Please launch a single process or set num_processes == model_parallel_size."
+                    "Set MODEL_PARALLEL_SIZE or model_args model_parallel_size to match num_processes, "
+                    "and ensure checkpoint shards exist (model_state_rank_0..{tp_size-1})."
                 )
 
         self.model = model.to(dtype=self._dtype, device=self._device)
