@@ -131,7 +131,7 @@ class NativeCausalLM(TemplateLM):
         compress_threshold: int = 8182,
         compress_chunk: int = 2048,
         max_cycles: int = 10,
-
+        temperature: float = 1.0,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
@@ -150,7 +150,7 @@ class NativeCausalLM(TemplateLM):
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
         self._max_cycles = max(1, int(max_cycles))
-
+        self._temperature = temperature
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
         # Native supports tensor-parallel only; data-parallel (world_size > model_parallel_size) will duplicate work.
@@ -218,14 +218,16 @@ class NativeCausalLM(TemplateLM):
                         output_dir=safedir,
                         tokenizer_path=tokenizer_path,
                         dtype=str(self._dtype).replace("torch.", ""),
+                        additional_kwargs={"max_position_embeddings": self._max_seq_length,"eos_token_id": self._tokenizer.eos_id,"pad_token_id": self._tokenizer.pad_id,"bos_token_id": self._tokenizer.bos_id,"temperature": self._temperature,"max_seq_len": self._max_seq_length},
                     )
             # breakpoint()
             try:
+                # breakpoint()
                 cfg = VLLMEngineConfig(
                     model_path=model_path,
                     tensor_parallel_size=vllm_tensor_parallel,
                     # dtype=str(self._dtype).replace("torch.", ""),
-                    max_model_len= vllm_max_model_len or self._max_seq_length or self._compress_threshold,
+                    max_model_len= vllm_max_model_len or self._max_seq_length,
                     enable_prompt_embeds=True,
                     tokenizer=tokenizer_path or getattr(self.model.args, "pretrain_model_dir", None),
                     additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
@@ -733,7 +735,7 @@ class NativeCausalLM(TemplateLM):
                 gkwargs = [g for _, g in chunk]
                 sampling_params = {
                     "max_tokens": max(g.get("max_generation_length", self.max_gen_toks) for g in gkwargs),
-                    "temperature": gkwargs[0].get("temperature", 1),
+                    "temperature": gkwargs[0].get("temperature", self._temperature),
                     "top_p": gkwargs[0].get("top_p", 1.0),
                 }
                 outputs = self._vllm_manager.engine_wrapper.generate(prompts, sampling_params)
@@ -764,7 +766,7 @@ class NativeCausalLM(TemplateLM):
                 if valid_indices:
                     sampling_params = {
                         "max_tokens": max(gkwargs[i].get("max_generation_length", self.max_gen_toks) for i in valid_indices),
-                        "temperature": gkwargs[valid_indices[0]].get("temperature", 0),
+                        "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
                         "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
                     }
                     batch_embeds = [embeds[i] for i in valid_indices]
@@ -787,7 +789,7 @@ class NativeCausalLM(TemplateLM):
                         text = self._generate_vllm_with_compress(
                             prompt=context_str,
                             max_gen_len=gk.get("max_generation_length", self.max_gen_toks),
-                            temperature=gk.get("temperature", 0.0),
+                            temperature=gk.get("temperature", self._temperature),
                             top_p=gk.get("top_p", 1.0),
                             until=gk.get("until"),
                         )
@@ -802,7 +804,7 @@ class NativeCausalLM(TemplateLM):
                 if valid_indices:
                     sampling_params = {
                         "max_tokens": max(gkwargs[i].get("max_generation_length", self.max_gen_toks) for i in valid_indices),
-                        "temperature": gkwargs[valid_indices[0]].get("temperature", 0),
+                        "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
                         "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
                     }
                     batch_embeds = [embeds[i] for i in valid_indices]
@@ -817,7 +819,7 @@ class NativeCausalLM(TemplateLM):
             for context_str, gen_kwargs in chunk:
                 until = gen_kwargs.get("until", None)
                 max_gen_len = gen_kwargs.get("max_generation_length", self.max_gen_toks)
-                temperature = gen_kwargs.get("temperature", 0)
+                temperature = gen_kwargs.get("temperature", self._temperature)
                 top_p = gen_kwargs.get("top_p", 1.0)
 
                 if self._mode in {"compress_answer", "reconstruct_first"} and hasattr(self.model, "compression_embeddings"):
@@ -833,7 +835,7 @@ class NativeCausalLM(TemplateLM):
                     continue
 
                 ctx_tokens, _ = self.tok_batch_encode([context_str])
-                breakpoint()
+                # breakpoint()
                 max_len = min(self.max_length, ctx_tokens.size(1) + max_gen_len)
                 output_tokens = self._model_generate(
                     ctx_tokens.to(self.device),
@@ -999,8 +1001,8 @@ class NativeCausalLM(TemplateLM):
         self,
         prompt: str,
         max_gen_len: int,
-        temperature: float,
-        top_p: float,
+        temperature: Optional[float],
+        top_p: Optional[float],
         until: Optional[List[str]],
     ) -> str:
         """
@@ -1040,9 +1042,9 @@ class NativeCausalLM(TemplateLM):
             tokens.extend(gen_tokens)
             comp_mask.extend([False] * len(gen_tokens))
 
-            if len(tokens) == 0:
-                tokens = [self.pad_token_id]
-                comp_mask = [False]
+            # if len(tokens) == 0:
+                # tokens = [self.pad_token_id]
+                # comp_mask = [False]
             
 
             tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
@@ -1572,7 +1574,7 @@ class NativeCausalLM(TemplateLM):
                         prompt[comp_mask_tensors[i]] = comp_vec
                     prompt_embeds.append(prompt)
 
-                sampling_params = {"temperature": 0.0, "top_p": 1.0, "max_tokens": max(max_recon_lens) if max_recon_lens else 0}
+                sampling_params = {"temperature": self._temperature, "top_p": 1.0, "max_tokens": max(max_recon_lens) if max_recon_lens else 0}
                 outputs = self._vllm_manager.generate_from_embeddings(prompt_embeds, sampling_params=sampling_params)
                 for i, out in enumerate(outputs):
                     if out.outputs:
