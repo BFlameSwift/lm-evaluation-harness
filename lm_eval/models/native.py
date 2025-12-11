@@ -131,6 +131,7 @@ class NativeCausalLM(TemplateLM):
         compress_threshold: int = 8182,
         compress_chunk: int = 2048,
         max_cycles: int = 10,
+        compress_start_tokens: Optional[str] = "<think>",
         temperature: float = 1.0,
     ) -> None:
         super().__init__()
@@ -150,6 +151,12 @@ class NativeCausalLM(TemplateLM):
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
         self._max_cycles = max(1, int(max_cycles))
+        self._compress_start_tokens = []
+        if compress_start_tokens:
+            for t in compress_start_tokens.split(","):
+                t = t.strip()
+                if t:
+                    self._compress_start_tokens.append(t)
         self._temperature = temperature
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
@@ -279,6 +286,18 @@ class NativeCausalLM(TemplateLM):
     @property
     def pad_token_id(self) -> int:
         return self._tokenizer.pad_id
+    
+    @property
+    def stop_ids(self) -> List[int]:
+        tokens = ["<|im_end|>","</s>","<|eot_id|>"]
+        ids = []
+        for token in tokens:
+            token_ids = self._tokenizer.encode(token, bos=False, eos=False)
+            if len(token_ids) == 1:
+                ids.append(token_ids[0])
+            else:
+                print(f"Warning: token {token} has {len(token_ids)} ids: {token_ids}")
+        return ids
 
     # ---- Tokenization helpers ----
     def tok_encode(self, string: str, add_special_tokens: Optional[bool] = None, **kwargs) -> List[int]:
@@ -1020,7 +1039,12 @@ class NativeCausalLM(TemplateLM):
         max_span_len = getattr(self.model.args, "max_mem_span_len", None)
         compress_chunk = max(1, self._compress_chunk)
         max_cycles = self._max_cycles
-
+        marker_id_seqs: List[List[int]] = []
+        for marker in self._compress_start_tokens:
+            ids = self.tok_encode(marker)
+            if ids:
+                marker_id_seqs.append(ids)
+        # breakpoint()
         prompt_tokens = self.tok_encode(prompt)
         gen_tokens: List[int] = []
         comp_blocks: List[torch.Tensor] = []
@@ -1029,7 +1053,7 @@ class NativeCausalLM(TemplateLM):
         out_text_parts: List[str] = []
         total_raw_compressed = 0
 
-        stop_ids = [self._tokenizer.eos_id]
+        stop_ids = self.stop_ids
 
         while not done and cycles < max_cycles:
             tokens: List[int] = []
@@ -1076,9 +1100,35 @@ class NativeCausalLM(TemplateLM):
                 gen_tokens.extend(new_tokens)
                 if out.outputs[0].finish_reason == "stop" or any(t in stop_ids for t in new_tokens):
                     done = True
-                if not done and len(gen_tokens) >= compress_threshold:
-                    chunk = gen_tokens[:compress_chunk]
-                    gen_tokens = gen_tokens[compress_chunk:]
+                # detect marker to allow early compression
+                marker_pos = None
+                marker_len = 0
+                if marker_id_seqs:
+                    for seq in marker_id_seqs:
+                        if len(seq) == 0 or len(seq) > len(gen_tokens):
+                            continue
+                        # simple scan for first occurrence
+                        for i in range(0, len(gen_tokens) - len(seq) + 1):
+                            if gen_tokens[i : i + len(seq)] == seq:
+                                marker_pos = i
+                                marker_len = len(seq)
+                                break
+                        if marker_pos is not None:
+                            break
+                # if markers provided: only compress suffix AFTER the marker
+                # breakpoint()
+                if marker_pos is not None:
+                    tail_start = marker_pos + marker_len
+                    tail_len = len(gen_tokens) - tail_start
+                    allow_compress = tail_len >= compress_threshold
+                    start_idx = tail_start
+                else:
+                    allow_compress = len(gen_tokens) >= compress_threshold
+                    start_idx = 0
+                if not done and allow_compress:
+                    chunk = gen_tokens[start_idx : start_idx + compress_chunk]
+                    
+                    gen_tokens = gen_tokens[:start_idx] + gen_tokens[start_idx + len(chunk) :]
                     out_text_parts.append(self.tok_decode(chunk))
                     total_raw_compressed += len(chunk)
                     # split chunk into spans of max_span_len, compress each
@@ -1090,9 +1140,10 @@ class NativeCausalLM(TemplateLM):
                         comp_vec = self._compress_plain_sequence(sub_t)
                         comp_blocks.append(comp_vec)
                     cycles += 1
+                # breakpoint()
             else:
                 done = True
-        final_text = "".join(out_text_parts) + self.tok_decode(gen_tokens)
+        final_text = "<ours_concat_text>".join(out_text_parts) + self.tok_decode(gen_tokens)
         final_text = self._truncate_until(final_text, until)
         dbg = {
             "prompt_len": len(prompt_tokens),

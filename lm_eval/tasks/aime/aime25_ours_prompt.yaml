@@ -1,16 +1,16 @@
 tag:
   - math_word_problems
-task: aime25
+task: aime25_ours_prompt
 dataset_path: math-ai/aime25
 # dataset_name: null
 output_type: generate_until
 training_split: test
 fewshot_split: test
 test_split: test
-# doc_to_text: "Question: {{problem}}\nAnswer:"
 doc_to_text: |
-  Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\boxed{ANSWER}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
-  {{problem}} <think>
+  Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\\boxed{{ANSWER}}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
+  {{problem}}
+# "Question: {{problem}}\nAnswer:"
 doc_to_target: "{{answer}}"
 process_results: !function utils.process_results
 metric_list:
