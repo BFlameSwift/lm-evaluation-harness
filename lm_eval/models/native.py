@@ -24,7 +24,7 @@ from data.ae_loader import (
 )
 from eval_func.model2safetensors import convert_checkpoint
 from eval_func.vllm_runner import VLLMEngineWrapper, VLLMEngineConfig, VLLMDecoderManager
-from eval_func.utils import load_checkpoint_harness,_build_device_mesh
+from eval_func.utils import load_checkpoint_harness, _build_device_mesh
 import sys
 
 from typing import Type, TypeVar, Mapping, Any, Dict
@@ -77,7 +77,7 @@ def _parse_mode(name: Optional[str]) -> str:
     if name is None:
         return "decoder"
     name = name.lower()
-    if name not in {"decoder", "compress_answer", "reconstruct_first"}:
+    if name not in {"decoder", "compress_answer", "reconstruct_first", "vllm_decoding_with_compress"}:
         raise ValueError(f"Unsupported native model mode: {name}")
     return name
 
@@ -103,6 +103,7 @@ class NativeCausalLM(TemplateLM):
       - decoder (default): vanilla causal scoring on decoder tokens only.
       - compress_answer: compress the context via encoder, then score the answer conditioned on memory.
       - reconstruct_first: reconstruct the context (optionally with vLLM prompt_embeds), then score continuation PPL.
+      - vllm_decoding_with_compress: use vLLM to decode the context, then compress the context conditioned on memory.
     """
 
     backend = "causal"
@@ -123,10 +124,13 @@ class NativeCausalLM(TemplateLM):
         vllm_model_path: Optional[str] = None,
         vllm_max_model_len: Optional[int] = None,
         vllm_tensor_parallel: int = 1,
-        vllm_gpu_memory_utilization: float = 0.4,
+        vllm_gpu_memory_utilization: float = 0.5,
         vllm_output_root: Optional[str] = None,
         vllm_reconstruct_batch_size: int = 4000,
         ppl_batch_size: Optional[int] = 8,
+        compress_threshold: int = 8182,
+        compress_chunk: int = 2048,
+        max_cycles: int = 10,
 
     ) -> None:
         super().__init__()
@@ -140,8 +144,12 @@ class NativeCausalLM(TemplateLM):
         self._use_vllm_answer = use_vllm_answer
         self._vllm_manager = None
         self._vllm_output_root = vllm_output_root
+        self._last_generate_debug: List[dict] = []
         self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
         self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
+        self._compress_threshold = max(1, int(compress_threshold))
+        self._compress_chunk = max(1, int(compress_chunk))
+        self._max_cycles = max(1, int(max_cycles))
 
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
@@ -162,8 +170,8 @@ class NativeCausalLM(TemplateLM):
             model, tokenizer, _, device_mesh = load_checkpoint_harness(checkpoint_dir, distributed_args, tokenizer_path)
 
         # Guard against data-parallel: require world_size <= model_parallel_size (TP only)
-        if self._distributed_args.world_size > 1 and device_mesh is not None:
-            tp_size = device_mesh.mesh.shape[1]
+        if self._distributed_args.world_size > 1:
+            tp_size = device_mesh.mesh.shape[1] if device_mesh is not None else 1
             if self._distributed_args.world_size != tp_size:
                 raise ValueError(
                     f"native model only supports tensor-parallel in lm-eval; "
@@ -185,12 +193,14 @@ class NativeCausalLM(TemplateLM):
 
         # Optional vLLM init for reconstruction speedup or decoder fast path (decoder-only, prompt_embeds)
         need_vllm = self._use_vllm_reconstruct or self._use_vllm_decoder or self._use_vllm_answer
-        
+        if self._mode == "vllm_decoding_with_compress":
+            need_vllm = True
         # breakpoint()
 
         if need_vllm:
             # Prepare decoder-only safetensors if path not provided
             model_path = vllm_model_path
+            # breakpoint()
             if model_path is None:
                 base_dir = self._vllm_output_root or checkpoint_dir
                 if base_dir is None:
@@ -200,6 +210,7 @@ class NativeCausalLM(TemplateLM):
                 need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
                     os.path.join(safedir, "config.json")
                 )
+                # breakpoint()
                 if need_convert:
                     os.makedirs(safedir, exist_ok=True)
                     convert_checkpoint(
@@ -208,19 +219,22 @@ class NativeCausalLM(TemplateLM):
                         tokenizer_path=tokenizer_path,
                         dtype=str(self._dtype).replace("torch.", ""),
                     )
+            # breakpoint()
             try:
                 cfg = VLLMEngineConfig(
                     model_path=model_path,
                     tensor_parallel_size=vllm_tensor_parallel,
-                    dtype=str(self._dtype).replace("torch.", ""),
-                    max_model_len=vllm_max_model_len or self._max_seq_length,
+                    # dtype=str(self._dtype).replace("torch.", ""),
+                    max_model_len= vllm_max_model_len or self._max_seq_length or self._compress_threshold,
                     enable_prompt_embeds=True,
                     tokenizer=tokenizer_path or getattr(self.model.args, "pretrain_model_dir", None),
                     additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
                 )
+                # breakpoint()
+                engine = VLLMEngineWrapper(cfg)
+                # breakpoint()
                 self._vllm_manager = VLLMDecoderManager(
-                    engine_wrapper=VLLMEngineWrapper(cfg),
-                    tokenizer=self._tokenizer,
+                    engine_wrapper=engine,
                 )
                 # breakpoint()
             except Exception as e:
@@ -238,7 +252,7 @@ class NativeCausalLM(TemplateLM):
 
     @property
     def max_gen_toks(self) -> int:
-        return 1024
+        return self._compress_threshold or self._max_seq_length or self._vllm_max_model_len
 
     @property
     def batch_size(self) -> int:
@@ -350,20 +364,84 @@ class NativeCausalLM(TemplateLM):
             }
             return self.model.compress(encoder_tokens=enc_tokens_cat, encoder_context=ctx)
 
-    def _build_prompt_embeds(
-        self,
-        encoder_tokens: torch.Tensor,
-        encoder_context: dict,
-        decoder_prefix: torch.Tensor,
-        compression_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Encode compression slots and return embeddings with slots filled."""
-        with torch.inference_mode():
-            compression_vectors = self._compress_tokens(encoder_tokens, encoder_context["cu_seqlens_q"], encoder_context["encoder_mem_mask"])
-        prompt_embeds = self.model.tok_embeddings(decoder_prefix.to(self.device))
-        prompt_embeds = prompt_embeds.to(compression_vectors.dtype)
-        prompt_embeds[compression_mask] = compression_vectors
-        return prompt_embeds
+    def _compress_plain_sequence(self, tokens: torch.Tensor, num_comp: Optional[int] = None) -> torch.Tensor:
+        """
+        Compress a single token sequence without inserting slots/BOM/EOM.
+        Useful for streaming/iterative compression where spans are managed externally.
+        """
+        if num_comp is None:
+            num_comp = getattr(self.model.args, "num_compression_tokens", 0)
+        span_limit = getattr(self.model.args, "max_mem_span_len", None)
+        if span_limit is None or span_limit <= 0:
+            max_len = self._max_seq_length
+            span_limit = max_len - num_comp if max_len is not None else tokens.numel()
+        span_limit = max(1, span_limit)
+        has_multi = hasattr(self.model, "compress_multi_batches")
+
+        if tokens.numel() == 0:
+            return torch.empty(0, device=self.device, dtype=self._dtype)
+
+        # we always append placeholders for compression tokens
+        if num_comp <= 0:
+            return torch.empty(0, device=self.device, dtype=self._dtype)
+
+        enc_tokens_mb: List[torch.Tensor] = []
+        enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
+
+        for i in range(0, tokens.numel(), span_limit):
+            chunk = tokens[i : i + span_limit]
+            # tokens + placeholders
+            enc_tokens_seq = torch.cat(
+                [chunk, torch.full((num_comp,), 0, device=self.device, dtype=torch.long)],
+                dim=0,
+            )
+            enc_mask_seq = torch.cat(
+                [torch.zeros_like(chunk, dtype=torch.bool), torch.ones(num_comp, device=self.device, dtype=torch.bool)],
+                dim=0,
+            )
+            clen = enc_tokens_seq.numel()
+            cu = torch.tensor([0, clen], device=self.device, dtype=torch.int32)
+            enc_tokens_mb.append(enc_tokens_seq)
+            enc_ctx_mb.append({
+                "cu_seqlens_q": cu,
+                "cu_seqlens_k": cu,
+                "max_seqlen_q": clen,
+                "max_seqlen_k": clen,
+                "positions": torch.arange(clen, device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": enc_mask_seq,
+            })
+
+        with torch.autocast(device_type="cuda", dtype=self._dtype):
+            if has_multi:
+                return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
+            enc_tokens_cat = torch.cat(enc_tokens_mb, dim=0)
+            enc_masks_cat = torch.cat([ctx["encoder_mem_mask"] for ctx in enc_ctx_mb], dim=0)
+            cu = torch.tensor([0] + [t.numel() for t in enc_tokens_mb], device=self.device, dtype=torch.int32).cumsum(0)
+            max_seq = max(t.numel() for t in enc_tokens_mb)
+            ctx = {
+                "cu_seqlens_q": cu,
+                "cu_seqlens_k": cu,
+                "max_seqlen_q": max_seq,
+                "max_seqlen_k": max_seq,
+                "positions": torch.arange(enc_tokens_cat.numel(), device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": enc_masks_cat,
+            }
+            return self.model.compress(encoder_tokens=enc_tokens_cat, encoder_context=ctx)
+
+    # def _build_prompt_embeds(
+    #     self,
+    #     encoder_tokens: torch.Tensor,
+    #     encoder_context: dict,
+    #     decoder_prefix: torch.Tensor,
+    #     compression_mask: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     """Encode compression slots and return embeddings with slots filled."""
+    #     with torch.inference_mode():
+    #         compression_vectors = self._compress_tokens(encoder_tokens, encoder_context["cu_seqlens_q"], encoder_context["encoder_mem_mask"])
+    #     prompt_embeds = self.model.tok_embeddings(decoder_prefix.to(self.device))
+    #     prompt_embeds = prompt_embeds.to(compression_vectors.dtype)
+    #     prompt_embeds[compression_mask] = compression_vectors
+    #     return prompt_embeds
 
     # ---- Core model calls ----
     @torch.no_grad()
@@ -655,7 +733,7 @@ class NativeCausalLM(TemplateLM):
                 gkwargs = [g for _, g in chunk]
                 sampling_params = {
                     "max_tokens": max(g.get("max_generation_length", self.max_gen_toks) for g in gkwargs),
-                    "temperature": gkwargs[0].get("temperature", 0),
+                    "temperature": gkwargs[0].get("temperature", 1),
                     "top_p": gkwargs[0].get("top_p", 1.0),
                 }
                 outputs = self._vllm_manager.engine_wrapper.generate(prompts, sampling_params)
@@ -698,11 +776,23 @@ class NativeCausalLM(TemplateLM):
                 continue
 
             if (
-                self._mode in {"compress_answer", "reconstruct_first"}
+                self._mode in {"compress_answer", "reconstruct_first", "vllm_decoding_with_compress"}
                 and self._vllm_manager is not None
                 and hasattr(self.model, "compression_embeddings")
             ):
                 include_bor = self._mode == "reconstruct_first"
+                if self._mode == "vllm_decoding_with_compress":
+                    # new iterative vLLM decode with compression
+                    for context_str, gk in chunk:
+                        text = self._generate_vllm_with_compress(
+                            prompt=context_str,
+                            max_gen_len=gk.get("max_generation_length", self.max_gen_toks),
+                            temperature=gk.get("temperature", 0.0),
+                            top_p=gk.get("top_p", 1.0),
+                            until=gk.get("until"),
+                        )
+                        results.append(text)
+                    continue
                 prompts = [c for c, _ in chunk]
                 gkwargs = [g for _, g in chunk]
                 gen_lens = [g.get("max_generation_length", self.max_gen_toks) for g in gkwargs]
@@ -743,6 +833,7 @@ class NativeCausalLM(TemplateLM):
                     continue
 
                 ctx_tokens, _ = self.tok_batch_encode([context_str])
+                breakpoint()
                 max_len = min(self.max_length, ctx_tokens.size(1) + max_gen_len)
                 output_tokens = self._model_generate(
                     ctx_tokens.to(self.device),
@@ -904,6 +995,118 @@ class NativeCausalLM(TemplateLM):
                 cutoff = min(cutoff, idx)
         return text[:cutoff]
 
+    def _generate_vllm_with_compress(
+        self,
+        prompt: str,
+        max_gen_len: int,
+        temperature: float,
+        top_p: float,
+        until: Optional[List[str]],
+    ) -> str:
+        """
+        Iterative vLLM decoding with on-the-fly compression of generated tokens.
+        Compress only generated tokens; prompt tokens stay uncompressed.
+        """
+        if self._vllm_manager is None:
+            raise ValueError("vLLM manager not initialized")
+        num_comp = getattr(self.model.args, "num_compression_tokens", 0)
+        if num_comp <= 0:
+            return self._generate_with_vllm_decoder(prompt, max_gen_len, temperature, top_p, until)
+
+        placeholder_id = 0
+        compress_threshold = self._compress_threshold
+        max_span_len = getattr(self.model.args, "max_mem_span_len", None)
+        compress_chunk = max(1, self._compress_chunk)
+        max_cycles = self._max_cycles
+
+        prompt_tokens = self.tok_encode(prompt)
+        gen_tokens: List[int] = []
+        comp_blocks: List[torch.Tensor] = []
+        cycles = 0
+        done = False
+        out_text_parts: List[str] = []
+        total_raw_compressed = 0
+
+        stop_ids = [self._tokenizer.eos_id]
+
+        while not done and cycles < max_cycles:
+            tokens: List[int] = []
+            comp_mask: List[bool] = []
+            tokens.extend(prompt_tokens)
+            comp_mask.extend([False] * len(prompt_tokens))
+            for comp in comp_blocks:
+                tokens.extend([BEGIN_OF_MEMORY_INDEX] + [placeholder_id] * num_comp + [END_OF_MEMORY_INDEX])
+                comp_mask.extend([False] + [True] * num_comp + [False])
+            tokens.extend(gen_tokens)
+            comp_mask.extend([False] * len(gen_tokens))
+
+            if len(tokens) == 0:
+                tokens = [self.pad_token_id]
+                comp_mask = [False]
+            
+
+            tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
+            embeds = self.model.tok_embeddings(tok_tensor).to(self._dtype)
+            if comp_blocks:
+                comp_concat = torch.cat(comp_blocks, dim=0)
+                comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+                need = comp_mask_t.sum().item()
+                if comp_concat.shape[0] != need:
+                    # shape mismatch guard: trim or pad with zeros
+                    if comp_concat.shape[0] > need:
+                        comp_concat = comp_concat[:need]
+                    else:
+                        pad = torch.zeros(need - comp_concat.shape[0], comp_concat.shape[1], device=comp_concat.device, dtype=comp_concat.dtype)
+                        comp_concat = torch.cat([comp_concat, pad], dim=0)
+                embeds[comp_mask_t] = comp_concat.to(embeds.dtype)
+            outs = self._vllm_manager.generate_from_embeddings(
+                [embeds],
+                sampling_params={
+                    "max_tokens": max_gen_len,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "stop_token_ids": stop_ids,
+                },
+            )
+            out = outs[0] if outs else None
+            if out and out.outputs and out.outputs[0].token_ids is not None:
+                new_tokens = out.outputs[0].token_ids
+                gen_tokens.extend(new_tokens)
+                if out.outputs[0].finish_reason == "stop" or any(t in stop_ids for t in new_tokens):
+                    done = True
+                if not done and len(gen_tokens) >= compress_threshold:
+                    chunk = gen_tokens[:compress_chunk]
+                    gen_tokens = gen_tokens[compress_chunk:]
+                    out_text_parts.append(self.tok_decode(chunk))
+                    total_raw_compressed += len(chunk)
+                    # split chunk into spans of max_span_len, compress each
+                    for j in range(0, len(chunk), max_span_len):
+                        sub = chunk[j : j + max_span_len]
+                        if not sub:
+                            continue
+                        sub_t = torch.tensor(sub, device=self.device, dtype=torch.long)
+                        comp_vec = self._compress_plain_sequence(sub_t)
+                        comp_blocks.append(comp_vec)
+                    cycles += 1
+            else:
+                done = True
+        final_text = "".join(out_text_parts) + self.tok_decode(gen_tokens)
+        final_text = self._truncate_until(final_text, until)
+        dbg = {
+            "prompt_len": len(prompt_tokens),
+            "final_tokens_len": len(prompt_tokens) + sum(b.shape[0] for b in comp_blocks) + len(gen_tokens),
+            "total_raw_compressed": total_raw_compressed,
+            "compress_steps": cycles,
+            "max_gen_len": max_gen_len,
+            "generated_text": final_text,
+        }
+        self._last_generate_debug.append(dbg)
+        # Keep the debug log bounded to avoid unbounded growth.
+        if len(self._last_generate_debug) > 200:
+            self._last_generate_debug = self._last_generate_debug[-200:]
+        print(f"[vllm_compress_debug] {dbg}")
+        return final_text
+
     def _generate_with_vllm_decoder(
         self,
         prompt: str,
@@ -1044,33 +1247,33 @@ class NativeCausalLM(TemplateLM):
 
         return embeds
 
-    def _generate_with_vllm_decoder_embeds(
-        self,
-        prompt: str,
-        max_gen_len: int,
-        temperature: float,
-        top_p: float,
-        until: Optional[List[str]],
-    ) -> str:
-        """Use vLLM prompt_embeds for decoder generation on compression models."""
-        if self._vllm_manager is None:
-            raise RuntimeError("vLLM manager is not initialized for decoder mode.")
-        # Encode prompt tokens without padding
-        tokens = self.tok_encode(prompt)
-        if len(tokens) == 0:
-            return ""
-        tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
-        embeds = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
-        sampling_params = {
-            "max_tokens": max_gen_len,
-            "temperature": temperature,
-            "top_p": top_p,
-        }
-        outputs = self._vllm_manager.generate_from_embeddings([embeds], sampling_params=sampling_params)
-        if not outputs or not outputs[0].outputs:
-            return ""
-        text = outputs[0].outputs[0].text
-        return self._truncate_until(text, until)
+    # def _generate_with_vllm_decoder_embeds(
+    #     self,
+    #     prompt: str,
+    #     max_gen_len: int,
+    #     temperature: float,
+    #     top_p: float,
+    #     until: Optional[List[str]],
+    # ) -> str:
+    #     """Use vLLM prompt_embeds for decoder generation on compression models."""
+    #     if self._vllm_manager is None:
+    #         raise RuntimeError("vLLM manager is not initialized for decoder mode.")
+    #     # Encode prompt tokens without padding
+    #     tokens = self.tok_encode(prompt)
+    #     if len(tokens) == 0:
+    #         return ""
+    #     tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
+    #     embeds = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
+    #     sampling_params = {
+    #         "max_tokens": max_gen_len,
+    #         "temperature": temperature,
+    #         "top_p": top_p,
+    #     }
+    #     outputs = self._vllm_manager.generate_from_embeddings([embeds], sampling_params=sampling_params)
+    #     if not outputs or not outputs[0].outputs:
+    #         return ""
+    #     text = outputs[0].outputs[0].text
+    #     return self._truncate_until(text, until)
 
     # ---- compression-aware scoring ----
     @torch.no_grad()
@@ -1520,37 +1723,37 @@ class NativeCausalLM(TemplateLM):
         return res
 
     # ---- helpers ----
-    @staticmethod
-    def _load_checkpoint(checkpoint_dir: str, distributed_args: DistributedArgs, tokenizer_path: Optional[str] = None):
-        with open(os.path.join(checkpoint_dir, "metadata.json")) as f:
-            metadata = json.load(f)
+    # @staticmethod
+    # def _load_checkpoint(checkpoint_dir: str, distributed_args: DistributedArgs, tokenizer_path: Optional[str] = None):
+    #     with open(os.path.join(checkpoint_dir, "metadata.json")) as f:
+    #         metadata = json.load(f)
 
-        modelargs = ModelArgs(**filter_kwargs_for(ModelArgs, metadata["modelargs"]))
-        device_mesh = _build_device_mesh(distributed_args.world_size, modelargs.model_parallel_size)
-        model = Model(modelargs)
-        if device_mesh is not None:
-            apply_tp(model, device_mesh)
-            tp_rank = device_mesh.get_local_rank("tp")
-        else:
-            tp_rank = 0
-        device = torch.device(f"cuda:{distributed_args.local_rank}")
+    #     modelargs = ModelArgs(**filter_kwargs_for(ModelArgs, metadata["modelargs"]))
+    #     device_mesh = _build_device_mesh(distributed_args.world_size, modelargs.model_parallel_size)
+    #     model = Model(modelargs)
+    #     if device_mesh is not None:
+    #         apply_tp(model, device_mesh)
+    #         tp_rank = device_mesh.get_local_rank("tp")
+    #     else:
+    #         tp_rank = 0
+    #     device = torch.device(f"cuda:{distributed_args.local_rank}")
 
-        model_path = os.path.join(checkpoint_dir, f"model_state_rank_{tp_rank}.pth")
-        model_state = torch.load(model_path, map_location="cpu")
-        # Be lenient to handle compressor weights or config drift
-        missing, unexpected = model.load_state_dict(model_state, strict=False)
-        if unexpected:
-            import warnings
-            warnings.warn(f"Unexpected keys in checkpoint ignored: {list(unexpected)}")
-        if missing:
-            import warnings
-            warnings.warn(f"Missing keys when loading checkpoint: {list(missing)}")
-        model = model.to(torch.bfloat16).to(device)
-        torch.set_autocast_gpu_dtype(torch.bfloat16)
-        model.eval()
+    #     model_path = os.path.join(checkpoint_dir, f"model_state_rank_{tp_rank}.pth")
+    #     model_state = torch.load(model_path, map_location="cpu")
+    #     # Be lenient to handle compressor weights or config drift
+    #     missing, unexpected = model.load_state_dict(model_state, strict=False)
+    #     if unexpected:
+    #         import warnings
+    #         warnings.warn(f"Unexpected keys in checkpoint ignored: {list(unexpected)}")
+    #     if missing:
+    #         import warnings
+    #         warnings.warn(f"Missing keys when loading checkpoint: {list(missing)}")
+    #     model = model.to(torch.bfloat16).to(device)
+    #     torch.set_autocast_gpu_dtype(torch.bfloat16)
+    #     model.eval()
 
-        from data.lm_loader import DataLoaderArgs  # lazy import to avoid cycles
+    #     from data.lm_loader import DataLoaderArgs  # lazy import to avoid cycles
 
-        dataloader_args = DataLoaderArgs(**filter_kwargs_for(DataLoaderArgs, metadata["dataloader_args"]))
-        tokenizer = Tokenizer(tokenizer_path or dataloader_args.tokenizer_path)
-        return model, tokenizer, metadata.get("updates", 0), device_mesh
+    #     dataloader_args = DataLoaderArgs(**filter_kwargs_for(DataLoaderArgs, metadata["dataloader_args"]))
+    #     tokenizer = Tokenizer(tokenizer_path or dataloader_args.tokenizer_path)
+    #     return model, tokenizer, metadata.get("updates", 0), device_mesh
