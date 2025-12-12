@@ -9,8 +9,7 @@ fewshot_split: test
 test_split: test
 # doc_to_text: "Question: {{problem}}\nAnswer:"
 doc_to_text: |
-  Solve the following math problem efficiently and clearly.  The last line of your response should be of the following format: 'Therefore, the final answer is: $\boxed{ANSWER}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
-  {{problem}} <think>
+  {{problem}}
 doc_to_target: "{{answer}}"
 process_results: !function utils.process_results
 metric_list:
@@ -23,10 +22,16 @@ generation_kwargs:
     - "</s>"
     - "<|im_end|>"
     - "<|eot_id|>"
-  do_sample: false
-  temperature: 0.0
+    - "<|endoftext|>"
+    - "<|end_of_text|>"
+  do_sample: true
+  temperature: 1.0
   max_gen_toks: 32768
+  use_chat_template: true
+  add_thinking_tokens: true
+
+
 repeats: 1
 num_fewshot: 0
 metadata:
-  version: 0.0
+  version: 0.0apply_chat_template

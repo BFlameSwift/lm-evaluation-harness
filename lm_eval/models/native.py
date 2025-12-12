@@ -118,6 +118,7 @@ class NativeCausalLM(TemplateLM):
         dtype: str = "bfloat16",
         mode: str = "decoder",
         max_mem_span_len: Optional[int] = None,
+        # for vllm related
         use_vllm_decoder: bool = False,
         use_vllm_answer: bool = False,
         use_vllm_reconstruct: bool = False,
@@ -126,13 +127,19 @@ class NativeCausalLM(TemplateLM):
         vllm_tensor_parallel: int = 1,
         vllm_gpu_memory_utilization: float = 0.5,
         vllm_output_root: Optional[str] = None,
+        # for reconstruction related
         vllm_reconstruct_batch_size: int = 4000,
         ppl_batch_size: Optional[int] = 8,
+        # for compression related
         compress_threshold: int = 8182,
         compress_chunk: int = 2048,
         max_cycles: int = 10,
         compress_start_tokens: Optional[str] = "<think>",
         temperature: float = 1.0,
+        # chat template related， also load from yaml task
+        use_chat_template: bool = False, 
+        chat_add_generation_prompt: bool = True,
+        add_thinking_tokens: bool = False,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
@@ -152,11 +159,16 @@ class NativeCausalLM(TemplateLM):
         self._compress_chunk = max(1, int(compress_chunk))
         self._max_cycles = max(1, int(max_cycles))
         self._compress_start_tokens = []
+        
+        
         if compress_start_tokens:
             for t in compress_start_tokens.split(","):
                 t = t.strip()
                 if t:
                     self._compress_start_tokens.append(t)
+        self._chat_use_template = bool(use_chat_template)
+        self._chat_add_generation_prompt = bool(chat_add_generation_prompt)
+        self._add_thinking_tokens = bool(add_thinking_tokens)
         self._temperature = temperature
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
@@ -300,12 +312,41 @@ class NativeCausalLM(TemplateLM):
         return ids
 
     # ---- Tokenization helpers ----
-    def tok_encode(self, string: str, add_special_tokens: Optional[bool] = None, **kwargs) -> List[int]:
+    def tok_encode(self, string: str, add_special_tokens: Optional[bool] = None,add_thinking_tokens: Optional[bool] = False, **kwargs) -> List[int]:
         # native tokenizer already includes BOS/EOS control; keep minimal
-        return self._tokenizer.encode(string, bos=False, eos=False)
+        if add_thinking_tokens:
+            string = string + "<think>"
+            return self._tokenizer.encode(string, bos=False, eos=False)
+        else:
+            return self._tokenizer.encode(string, bos=False, eos=False)
+
+    def _format_chat(self, user_text: str, assistant_text: Optional[str] = None, add_generation_prompt: Optional[bool] = None) -> str:
+        """
+        Optionally wrap text with chat template. If assistant_text is None, will
+        produce a prompt that expects model generation; otherwise returns a full
+        conversation with assistant content included.
+        """
+        if not self._chat_use_template:
+            return user_text if assistant_text is None else user_text + "\n" + assistant_text
+        try:
+            add_gen = self._chat_add_generation_prompt if add_generation_prompt is None else add_generation_prompt
+            messages = [{"role": "user", "content": user_text}]
+            if assistant_text is not None:
+                messages.append({"role": "assistant", "content": assistant_text})
+                add_gen = False if add_generation_prompt is None else add_generation_prompt
+            return self._tokenizer.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen)
+        except Exception:
+            # fallback to raw text on any failure
+            return user_text if assistant_text is None else user_text + "\n" + assistant_text
 
     def tok_decode(self, tokens: List[int]) -> str:
         return self._tokenizer.decode(tokens)
+    def tok_decode_w_special_tokens(self, tokens: List[int]) -> str:
+        return self._tokenizer.decode_w_special_tokens(tokens)
+    
+    def get_full_text_apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
+        
+        return self._tokenizer.apply_chat_template(chat_history, tokenize=False, add_generation_prompt=False)
 
     def tok_batch_encode(self, strings: List[str], left_truncate_len: Optional[int] = None, **kwargs):
         tokens = [self._tokenizer.encode(s, bos=False, eos=False) for s in strings]
@@ -744,14 +785,24 @@ class NativeCausalLM(TemplateLM):
         iterator = tqdm(range(0, len(req_args), self.batch_size), disable=disable_tqdm, desc=f"native generate ({self._mode})")
         for start in iterator:
             chunk = req_args[start : start + self.batch_size]
+            gkwargs = [g for _, g in chunk]
+            if gkwargs[0].get("add_thinking_tokens", False):
+                self._add_thinking_tokens = True
+            if gkwargs[0].get("use_chat_template", False):
+                self._chat_use_template = True
+            # breakpoint()
             # Try batched vLLM paths first
             if (
                 self._mode == "decoder"
                 and self._vllm_manager is not None
                 and not hasattr(self.model, "compression_embeddings")
             ):
-                prompts = [c for c, _ in chunk]
-                gkwargs = [g for _, g in chunk]
+
+                if self._chat_use_template:
+                    prompts = [self._format_chat(c, add_generation_prompt=True) for c, _ in chunk]
+                else:
+                    prompts = [c for c, _ in chunk]
+
                 sampling_params = {
                     "max_tokens": max(g.get("max_generation_length", self.max_gen_toks) for g in gkwargs),
                     "temperature": gkwargs[0].get("temperature", self._temperature),
@@ -772,7 +823,11 @@ class NativeCausalLM(TemplateLM):
                 embeds = []
                 gkwargs = []
                 for c, gk in chunk:
-                    tokens = self.tok_encode(c)
+                    if self._chat_use_template:
+                        prompt_c = self._format_chat(c, add_generation_prompt=True)
+                    else:
+                        prompt_c = c
+                    tokens = self.tok_encode(prompt_c)
                     if len(tokens) == 0:
                         embeds.append(None)
                         gkwargs.append(gk)
@@ -780,6 +835,7 @@ class NativeCausalLM(TemplateLM):
                     tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
                     embeds.append(self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype))
                     gkwargs.append(gk)
+                    
                 valid_indices = [i for i, e in enumerate(embeds) if e is not None]
                 outs_text = [""] * len(chunk)
                 if valid_indices:
@@ -804,7 +860,10 @@ class NativeCausalLM(TemplateLM):
                 include_bor = self._mode == "reconstruct_first"
                 if self._mode == "vllm_decoding_with_compress":
                     # new iterative vLLM decode with compression
+                    # breakpoint()
                     for context_str, gk in chunk:
+
+                        context_str = self._format_chat(context_str, add_generation_prompt=True)
                         text = self._generate_vllm_with_compress(
                             prompt=context_str,
                             max_gen_len=gk.get("max_generation_length", self.max_gen_toks),
@@ -812,9 +871,10 @@ class NativeCausalLM(TemplateLM):
                             top_p=gk.get("top_p", 1.0),
                             until=gk.get("until"),
                         )
+
                         results.append(text)
                     continue
-                prompts = [c for c, _ in chunk]
+                prompts = [self._format_chat(c, add_generation_prompt=True) for c, _ in chunk]
                 gkwargs = [g for _, g in chunk]
                 gen_lens = [g.get("max_generation_length", self.max_gen_toks) for g in gkwargs]
                 embeds = self._build_compress_prompt_embeds_batch(prompts, gen_lens, include_bor)
@@ -853,6 +913,7 @@ class NativeCausalLM(TemplateLM):
                     results.append(text)
                     continue
 
+                context_str = self._format_chat(context_str, add_generation_prompt=True)
                 ctx_tokens, _ = self.tok_batch_encode([context_str])
                 # breakpoint()
                 max_len = min(self.max_length, ctx_tokens.size(1) + max_gen_len)
@@ -1045,7 +1106,7 @@ class NativeCausalLM(TemplateLM):
             if ids:
                 marker_id_seqs.append(ids)
         # breakpoint()
-        prompt_tokens = self.tok_encode(prompt)
+        prompt_tokens = self.tok_encode(prompt, add_thinking_tokens=self._add_thinking_tokens)
         gen_tokens: List[int] = []
         comp_blocks: List[torch.Tensor] = []
         cycles = 0
@@ -1065,6 +1126,10 @@ class NativeCausalLM(TemplateLM):
                 comp_mask.extend([False] + [True] * num_comp + [False])
             tokens.extend(gen_tokens)
             comp_mask.extend([False] * len(gen_tokens))
+            
+            # tokens_decoded = self.tok_decode(tokens)
+            tokens_decoded_prompt = self.tok_decode_w_special_tokens(prompt_tokens)
+            tokens_decoded_gen = self.tok_decode_w_special_tokens(gen_tokens)
 
             # if len(tokens) == 0:
                 # tokens = [self.pad_token_id]
@@ -1085,16 +1150,22 @@ class NativeCausalLM(TemplateLM):
                         pad = torch.zeros(need - comp_concat.shape[0], comp_concat.shape[1], device=comp_concat.device, dtype=comp_concat.dtype)
                         comp_concat = torch.cat([comp_concat, pad], dim=0)
                 embeds[comp_mask_t] = comp_concat.to(embeds.dtype)
+                
+            print("prompt_tokens: ", len(prompt_tokens))
+            print("embeds: ", embeds.shape)
+            breakpoint()
             outs = self._vllm_manager.generate_from_embeddings(
                 [embeds],
                 sampling_params={
-                    "max_tokens": max_gen_len,
+                    # for max_tokens, we need to subtract the prompt tokens and the compressed tokens
+                    "max_tokens": min(self._max_seq_length  - len(prompt_tokens) - len(comp_blocks) * (num_comp + 2) , max_gen_len),
                     "temperature": temperature,
                     "top_p": top_p,
                     "stop_token_ids": stop_ids,
                 },
             )
             out = outs[0] if outs else None
+            print("generated tokens: ", len(out.outputs[0].token_ids))
             if out and out.outputs and out.outputs[0].token_ids is not None:
                 new_tokens = out.outputs[0].token_ids
                 gen_tokens.extend(new_tokens)
@@ -1117,19 +1188,24 @@ class NativeCausalLM(TemplateLM):
                             break
                 # if markers provided: only compress suffix AFTER the marker
                 # breakpoint()
+                prefix_len = len(prompt_tokens) + len(comp_blocks) * (num_comp + 2)
                 if marker_pos is not None:
                     tail_start = marker_pos + marker_len
                     tail_len = len(gen_tokens) - tail_start
-                    allow_compress = tail_len >= compress_threshold
+                    allow_compress = tail_len >= compress_threshold or len(gen_tokens) + prefix_len >= self._max_seq_length
                     start_idx = tail_start
                 else:
-                    allow_compress = len(gen_tokens) >= compress_threshold
+                    allow_compress = len(gen_tokens) >= compress_threshold or len(gen_tokens) + prefix_len >= self._max_seq_length
                     start_idx = 0
                 if not done and allow_compress:
                     chunk = gen_tokens[start_idx : start_idx + compress_chunk]
-                    
+                    print("compress chunk: ", len(chunk))
+                    # breakpoint()
                     gen_tokens = gen_tokens[:start_idx] + gen_tokens[start_idx + len(chunk) :]
-                    out_text_parts.append(self.tok_decode(chunk))
+                    print("after compress gen_tokens: ", len(gen_tokens))
+                    # breakpoint()
+                    # out_text_parts.append(self.tok_decode(chunk))
+                    out_text_parts.append(self.tok_decode_w_special_tokens(chunk))
                     total_raw_compressed += len(chunk)
                     # split chunk into spans of max_span_len, compress each
                     for j in range(0, len(chunk), max_span_len):
@@ -1143,7 +1219,8 @@ class NativeCausalLM(TemplateLM):
                 # breakpoint()
             else:
                 done = True
-        final_text = "<ours_concat_text>".join(out_text_parts) + self.tok_decode(gen_tokens)
+        # final_text = "<ours_concat_text>".join(out_text_parts) + self.tok_decode(gen_tokens)
+        final_text = "<ours_concat_text>".join(out_text_parts) + self.tok_decode_w_special_tokens(gen_tokens)
         final_text = self._truncate_until(final_text, until)
         dbg = {
             "prompt_len": len(prompt_tokens),
