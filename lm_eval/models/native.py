@@ -188,6 +188,8 @@ class NativeCausalLM(TemplateLM):
         else:
             model, tokenizer, _, device_mesh = load_checkpoint_harness(checkpoint_dir, distributed_args, tokenizer_path)
 
+        self._is_hf_model = hasattr(model, "config") and not hasattr(model, "args")
+
         # Guard against data-parallel: require world_size <= model_parallel_size (TP only)
         if self._distributed_args.world_size > 1:
             tp_size = device_mesh.mesh.shape[1] if device_mesh is not None else 1
@@ -205,10 +207,19 @@ class NativeCausalLM(TemplateLM):
         self._device_mesh = device_mesh
         self._model_parallel_group = device_mesh.get_group(1) if device_mesh is not None else None
 
-        self._max_seq_length = max_seq_length or self.model.args.max_seq_len
+        if max_seq_length is not None:
+            self._max_seq_length = int(max_seq_length)
+        else:
+            if hasattr(self.model, "args"):
+                self._max_seq_length = int(self.model.args.max_seq_len)
+            else:
+                self._max_seq_length = int(
+                    getattr(getattr(self.model, "config", None), "max_position_embeddings", 2048) or 2048
+                )
         if self._max_mem_span_len_override is not None:
             # Respect override for compression-aware paths
-            self.model.args.max_mem_span_len = self._max_mem_span_len_override
+            if hasattr(self.model, "args"):
+                self.model.args.max_mem_span_len = self._max_mem_span_len_override
 
         # Optional vLLM init for reconstruction speedup or decoder fast path (decoder-only, prompt_embeds)
         need_vllm = self._use_vllm_reconstruct or self._use_vllm_decoder or self._use_vllm_answer
@@ -221,24 +232,35 @@ class NativeCausalLM(TemplateLM):
             model_path = vllm_model_path
             # breakpoint()
             if model_path is None:
-                base_dir = self._vllm_output_root or checkpoint_dir
-                if base_dir is None:
-                    raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
-                safedir = os.path.join(base_dir, "safemodel")
-                model_path = safedir
-                need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
-                    os.path.join(safedir, "config.json")
-                )
-                # breakpoint()
-                if need_convert:
-                    os.makedirs(safedir, exist_ok=True)
-                    convert_checkpoint(
-                        checkpoint_dir=checkpoint_dir,
-                        output_dir=safedir,
-                        tokenizer_path=tokenizer_path,
-                        dtype=str(self._dtype).replace("torch.", ""),
-                        additional_kwargs={"max_position_embeddings": self._max_seq_length,"eos_token_id": self._tokenizer.eos_id,"pad_token_id": self._tokenizer.pad_id,"bos_token_id": self._tokenizer.bos_id,"temperature": self._temperature,"max_seq_len": self._max_seq_length},
+                # HF checkpoints: vLLM can load directly from checkpoint_dir (already a transformers directory).
+                is_native_ckpt = checkpoint_dir is not None and os.path.exists(os.path.join(checkpoint_dir, "metadata.json"))
+                if not is_native_ckpt:
+                    model_path = checkpoint_dir
+                else:
+                    base_dir = self._vllm_output_root or checkpoint_dir
+                    if base_dir is None:
+                        raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
+                    safedir = os.path.join(base_dir, "safemodel")
+                    model_path = safedir
+                    need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
+                        os.path.join(safedir, "config.json")
                     )
+                    if need_convert:
+                        os.makedirs(safedir, exist_ok=True)
+                        convert_checkpoint(
+                            checkpoint_dir=checkpoint_dir,
+                            output_dir=safedir,
+                            tokenizer_path=tokenizer_path,
+                            dtype=str(self._dtype).replace("torch.", ""),
+                            additional_kwargs={
+                                "max_position_embeddings": self._max_seq_length,
+                                "eos_token_id": self.eos_token_id,
+                                "pad_token_id": self.pad_token_id,
+                                "bos_token_id": getattr(self._tokenizer, "bos_id", None),
+                                "temperature": self._temperature,
+                                "max_seq_len": self._max_seq_length,
+                            },
+                        )
             # breakpoint()
             try:
                 # breakpoint()
@@ -248,7 +270,7 @@ class NativeCausalLM(TemplateLM):
                     # dtype=str(self._dtype).replace("torch.", ""),
                     max_model_len= vllm_max_model_len or self._max_seq_length,
                     enable_prompt_embeds=True,
-                    tokenizer=tokenizer_path or getattr(self.model.args, "pretrain_model_dir", None),
+                    tokenizer=tokenizer_path or checkpoint_dir,
                     additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
                 )
                 # breakpoint()
@@ -297,7 +319,12 @@ class NativeCausalLM(TemplateLM):
 
     @property
     def pad_token_id(self) -> int:
-        return self._tokenizer.pad_id
+        pad = getattr(self._tokenizer, "pad_id", None)
+        if pad is None:
+            pad = getattr(self._tokenizer, "pad_token_id", None)
+        if pad is None or (isinstance(pad, int) and pad < 0):
+            return self.eos_token_id
+        return pad
     
     @property
     def stop_ids(self) -> List[int]:
@@ -1158,7 +1185,7 @@ class NativeCausalLM(TemplateLM):
                 [embeds],
                 sampling_params={
                     # for max_tokens, we need to subtract the prompt tokens and the compressed tokens
-                    "max_tokens": min(self._max_seq_length  - len(prompt_tokens) - len(comp_blocks) * (num_comp + 2) , max_gen_len),
+                    "max_tokens": min(self._max_seq_length, max_gen_len) - (len(prompt_tokens) + len(comp_blocks) * (num_comp + 2)) ,
                     "temperature": temperature,
                     "top_p": top_p,
                     "stop_token_ids": stop_ids,
@@ -1195,7 +1222,7 @@ class NativeCausalLM(TemplateLM):
                     allow_compress = tail_len >= compress_threshold or len(gen_tokens) + prefix_len >= self._max_seq_length
                     start_idx = tail_start
                 else:
-                    allow_compress = len(gen_tokens) >= compress_threshold or len(gen_tokens) + prefix_len >= self._max_seq_length
+                    allow_compress = len(gen_tokens) + prefix_len >= compress_threshold or len(gen_tokens) + prefix_len >= self._max_seq_length
                     start_idx = 0
                 if not done and allow_compress:
                     chunk = gen_tokens[start_idx : start_idx + compress_chunk]
