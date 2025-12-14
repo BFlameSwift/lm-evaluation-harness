@@ -1796,19 +1796,36 @@ class NativeCausalLM(TemplateLM):
                 cont_offsets.append(cont_start)
                 cont_lengths.append(len(cont_trim))
 
-                # Score continuation in small batches to reduce peak memory.
-                score_bs = max(1, self._ppl_batch_size)
-                for score_start in range(0, len(dec_tokens_full), score_bs):
-                    idxs = list(range(score_start, min(score_start + score_bs, len(dec_tokens_full))))
+            # Score continuation in small batches to reduce peak memory.
+            chunk_results: List[Tuple[float, bool]] = [(float("-inf"), False)] * len(dec_tokens_full)
+            score_bs = max(1, self._ppl_batch_size)
+            for score_start in range(0, len(dec_tokens_full), score_bs):
+                idxs = list(range(score_start, min(score_start + score_bs, len(dec_tokens_full))))
 
-                    sub_enc_tokens = [enc_tokens_list[i] for i in idxs]
-                    sub_enc_masks = [enc_mem_masks[i] for i in idxs]
+                sub_enc_tokens = [enc_tokens_list[k] for k in idxs]
+                sub_enc_masks = [enc_mem_masks[k] for k in idxs]
                 enc_lens_sub = [len(t) for t in sub_enc_tokens]
-                enc_cu_sub = torch.tensor([0] + list(torch.tensor(enc_lens_sub).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+                enc_cu_sub = torch.tensor(
+                    [0] + list(torch.tensor(enc_lens_sub).cumsum(0).tolist()),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
                 max_enc_sub = max(enc_lens_sub) if enc_lens_sub else 0
-                enc_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens_sub], dim=0) if enc_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
-                enc_tokens_flat_sub = torch.tensor(sum(sub_enc_tokens, []), device=self.device, dtype=torch.long) if sub_enc_tokens else torch.empty(0, device=self.device, dtype=torch.long)
-                enc_mem_mask_flat_sub = torch.tensor(sum(sub_enc_masks, []), device=self.device, dtype=torch.bool) if sub_enc_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                enc_positions_sub = (
+                    torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens_sub], dim=0)
+                    if enc_lens_sub
+                    else torch.empty(0, device=self.device, dtype=torch.int32)
+                )
+                enc_tokens_flat_sub = (
+                    torch.tensor(sum(sub_enc_tokens, []), device=self.device, dtype=torch.long)
+                    if sub_enc_tokens
+                    else torch.empty(0, device=self.device, dtype=torch.long)
+                )
+                enc_mem_mask_flat_sub = (
+                    torch.tensor(sum(sub_enc_masks, []), device=self.device, dtype=torch.bool)
+                    if sub_enc_masks
+                    else torch.empty(0, device=self.device, dtype=torch.bool)
+                )
                 enc_ctx_sub = {
                     "cu_seqlens_q": enc_cu_sub,
                     "cu_seqlens_k": enc_cu_sub,
@@ -1818,14 +1835,26 @@ class NativeCausalLM(TemplateLM):
                     "encoder_mem_mask": enc_mem_mask_flat_sub,
                 }
 
-                sub_dec_tokens = [dec_tokens_full[i] for i in idxs]
-                sub_comp_masks = [comp_masks_full[i] for i in idxs]
-                dec_lens_sub = [t.numel() for t in sub_dec_tokens]
-                dec_cu_sub = torch.tensor([0] + list(torch.tensor(dec_lens_sub).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+                sub_dec_tokens = [dec_tokens_full[k] for k in idxs]
+                sub_comp_masks = [comp_masks_full[k] for k in idxs]
+                dec_lens_sub = [int(t.numel()) for t in sub_dec_tokens]
+                dec_cu_sub = torch.tensor(
+                    [0] + list(torch.tensor(dec_lens_sub).cumsum(0).tolist()),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
                 max_dec_sub = max(dec_lens_sub) if dec_lens_sub else 0
-                dec_positions_sub = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens_sub], dim=0) if dec_lens_sub else torch.empty(0, device=self.device, dtype=torch.int32)
-                dec_tokens_flat_sub = torch.cat(sub_dec_tokens, dim=0) if sub_dec_tokens else torch.empty(0, device=self.device, dtype=torch.long)
-                comp_mask_flat_sub = torch.cat(sub_comp_masks, dim=0) if sub_comp_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                dec_positions_sub = (
+                    torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens_sub], dim=0)
+                    if dec_lens_sub
+                    else torch.empty(0, device=self.device, dtype=torch.int32)
+                )
+                dec_tokens_flat_sub = (
+                    torch.cat(sub_dec_tokens, dim=0) if sub_dec_tokens else torch.empty(0, device=self.device, dtype=torch.long)
+                )
+                comp_mask_flat_sub = (
+                    torch.cat(sub_comp_masks, dim=0) if sub_comp_masks else torch.empty(0, device=self.device, dtype=torch.bool)
+                )
                 dec_ctx_sub = {
                     "cu_seqlens_q": dec_cu_sub,
                     "cu_seqlens_k": dec_cu_sub,
@@ -1835,47 +1864,62 @@ class NativeCausalLM(TemplateLM):
                     "compression_token_mask": comp_mask_flat_sub,
                 }
 
-                if hasattr(self.model, "compression_embeddings"):
-                    comp_vec = self._compress_tokens(enc_tokens_flat_sub, enc_cu_sub, enc_mem_mask_flat_sub)
-                    x_tokens = self.model.tok_embeddings(dec_tokens_flat_sub).to(self._dtype)
-                    x_tokens[comp_mask_flat_sub] = comp_vec.to(x_tokens.dtype)
-                    h = x_tokens
-                    for layer in self.model.layers:
-                        h = layer(h, context=dec_ctx_sub)
-                    h = self.model.norm(h)
-                    logits = self.model.output(h).float()
-                else:
-                    logits = self.model(
-                        encoder_tokens=enc_tokens_flat_sub,
-                        encoder_context=enc_ctx_sub,
-                        decoder_tokens=dec_tokens_flat_sub,
-                        decoder_context=dec_ctx_sub,
-                        last_hidden_only=False,
-                    )
+                ctx = torch.autocast(device_type="cuda", dtype=self._dtype)
+                with ctx:
+                    if hasattr(self.model, "compression_embeddings"):
+                        comp_vec = self._compress_tokens(enc_tokens_flat_sub, enc_cu_sub, enc_mem_mask_flat_sub)
+                        x_tokens = self.model.tok_embeddings(dec_tokens_flat_sub).to(self._dtype)
+                        if comp_mask_flat_sub.any():
+                            x_tokens[comp_mask_flat_sub] = comp_vec.to(x_tokens.dtype)
+                        h = x_tokens
+                        for layer in self.model.layers:
+                            h = layer(h, context=dec_ctx_sub)
+                        h = self.model.norm(h)
+                        logits = self.model.output(h).float()
+                    else:
+                        logits = self.model(
+                            encoder_tokens=enc_tokens_flat_sub,
+                            encoder_context=enc_ctx_sub,
+                            decoder_tokens=dec_tokens_flat_sub,
+                            decoder_context=dec_ctx_sub,
+                            last_hidden_only=False,
+                        )
+
+                if self._model_parallel_group is not None:
+                    from distributed.tensor_parallel import gather_from_model_parallel_region
+
+                    logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
+
                 logprobs = F.log_softmax(logits.float(), dim=-1)
 
                 for j, sample_idx in enumerate(idxs):
                     dec_start = int(dec_cu_sub[j].item())
-                    cont_off = cont_offsets[sample_idx]
-                    cont_len = cont_lengths[sample_idx]
+                    dec_len = int(dec_lens_sub[j])
+                    cont_off = int(cont_offsets[sample_idx])
+                    cont_len = int(cont_lengths[sample_idx])
                     tgt = targets_full[sample_idx]
 
-                    if cont_len > 0 and cont_off > 0 and cont_off < tgt.numel() + 1:
-                        lp_start = dec_start + cont_off - 1
-                        lp_end = lp_start + cont_len
-                        lp_slice = logprobs[lp_start:lp_end]
-                        tgt_slice = tgt[cont_off - 1 : cont_off - 1 + cont_len]
-                        if lp_slice.numel() == tgt_slice.numel() and lp_slice.numel() > 0:
-                            token_lp = lp_slice.gather(-1, tgt_slice.unsqueeze(-1)).squeeze(-1)
-                            logprob = float(token_lp.sum().item())
-                            greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
-                        else:
-                            logprob = float("-inf")
-                            greedy = False
-                    else:
-                        logprob = float("-inf")
-                        greedy = False
-                    res.append((logprob, greedy))
+                    rel_start = cont_off - 1
+                    rel_end = rel_start + cont_len
+                    if cont_len <= 0 or cont_off <= 0 or rel_end > dec_len:
+                        chunk_results[sample_idx] = (float("-inf"), False)
+                        continue
+
+                    lp_start = dec_start + rel_start
+                    lp_end = lp_start + cont_len
+                    lp_slice = logprobs[lp_start:lp_end]
+                    tgt_slice = tgt[rel_start:rel_end]
+
+                    if lp_slice.ndim != 2 or lp_slice.shape[0] != tgt_slice.numel() or tgt_slice.numel() == 0:
+                        chunk_results[sample_idx] = (float("-inf"), False)
+                        continue
+
+                    token_lp = lp_slice.gather(-1, tgt_slice.unsqueeze(-1)).squeeze(-1)
+                    logprob = float(token_lp.sum().item())
+                    greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
+                    chunk_results[sample_idx] = (logprob, greedy)
+
+            res.extend(chunk_results)
 
         return res
 
