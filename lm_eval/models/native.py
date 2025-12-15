@@ -1040,16 +1040,18 @@ class NativeCausalLM(TemplateLM):
         if not ctx_spans:
             ctx_spans = [[]]
 
-        # Budget: BOM + comp_slots + EOM + prompt (+ BOR) + answer
+        # Budget: (BOM + span + EOM ) * slots + prompt (+ BOR) + answer
         # Ensure we keep room for generation tokens
         bor_extra = 1 if include_bor else 0
-        max_comp_tokens = max(0, self.max_length - (len(prompt_tokens) + 2 + bor_extra + max_gen_len))
-        max_chunks = max_comp_tokens // num_comp if num_comp > 0 else 0
+        max_comp_tokens = max(0, self.max_length - (len(prompt_tokens) + 4 + bor_extra + max_gen_len))
+        max_chunks = max_comp_tokens // (num_comp + 2) if num_comp > 0 else 0
         if max_chunks <= 0:
             max_chunks = 1
         ctx_spans = ctx_spans[-max_chunks:]
+        
+        # breakpoint()
 
-        total_comp_slots = num_comp * len(ctx_spans)
+        total_comp_slots = (num_comp + 2) * len(ctx_spans)
         # Build encoder packed tensors
         enc_tokens: List[int] = []
         enc_mem_mask: List[bool] = []
@@ -1060,11 +1062,28 @@ class NativeCausalLM(TemplateLM):
             enc_mem_mask.extend([True] * num_comp)
 
         # Decoder prefix: BOM + slots + EOM + prompt (question); optionally BOR (for reconstruct_first)
-        dec_prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + prompt_tokens
-        comp_mask = [False] + ([True] * total_comp_slots) + [False] + ([False] * len(prompt_tokens))
+        # dec_prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + prompt_tokens
+        # comp_mask = [False] + ([True] * total_comp_slots) + [False] + ([False] * len(prompt_tokens))
+        
+        dec_prefix = []
+        comp_mask = []
+        for _ in range(len(ctx_spans)):
+            dec_prefix.extend([BEGIN_OF_MEMORY_INDEX] + [placeholder_id] * num_comp + [END_OF_MEMORY_INDEX])
+            comp_mask.extend([False] + [True] * num_comp + [False])
+            
+        if self._add_boq_index:
+            dec_prefix.append(BEGIN_OF_QUERY_INDEX)
+            comp_mask.append(False)
+        
+        dec_prefix.extend(prompt_tokens)
+        comp_mask.extend([False] * len(prompt_tokens))
+  
+        
         if include_bor:
             dec_prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
             comp_mask.append(False)
+            
+        # breakpoint()
 
         # Cap generation so total length <= max_length
         max_new = max(0, min(max_gen_len, self.max_length - len(dec_prefix)))
@@ -1566,28 +1585,32 @@ class NativeCausalLM(TemplateLM):
                 ctx_spans = [context_enc[i : i + max_mem_span_len] for i in range(0, len(context_enc), max_mem_span_len)]
                 # Determine how many chunks can fit given max_length budget.
                 # Decoder will be: BOM + num_comp * n_chunks + EOM + continuation
-                max_comp_tokens = max(0, self.max_length - (2 + len(continuation_enc)))
-                max_chunks = max_comp_tokens // max(1, num_comp) if num_comp > 0 else 0
+                max_comp_tokens = max(0, self.max_length - (4 + len(continuation_enc)))
+                max_chunks = max_comp_tokens // max(1, num_comp+2) if num_comp > 0 else 0
+                
                 if num_comp == 0:
                     # Fallback: no compression tokens, just trim context to fit
                     ctx_spans = [context_enc[-max_mem_span_len:]]
                     max_chunks = 0
                 if max_chunks == 0 and num_comp > 0:
                     max_chunks = 1  # at least one span if compression is available
+                    
                 ctx_spans = ctx_spans[-max_chunks:] if max_chunks > 0 else ctx_spans
 
                 # Hard cap: ensure decoder length <= model_max_len by dropping spans if needed
-                total_comp_slots = num_comp * len(ctx_spans) if num_comp > 0 else 0
+                total_comp_slots = (num_comp + 2) * len(ctx_spans) if num_comp > 0 else 0
+                
                 dec_budget = model_max_len if model_max_len is not None else self.max_length
                 cont_trim = continuation_enc  # do not truncate continuation
                 
                 drop_count = 0
-                while num_comp > 0 and (len(ctx_spans) * (num_comp + 2) + len(cont_trim)) > dec_budget and len(ctx_spans) > 1:
+                while num_comp > 0 and total_comp_slots + len(cont_trim) > dec_budget and len(ctx_spans) > 1:
                     ctx_spans = ctx_spans[1:]  # drop oldest span
                     drop_count += 1
                 print(f"Dropping span {drop_count} of {len(ctx_spans)}")
 
-                if num_comp > 0 and (len(ctx_spans) * (num_comp + 2) + len(cont_trim)) > dec_budget:
+                if num_comp > 0 and total_comp_slots + len(cont_trim) > dec_budget:
+                    print(f"Total comp slots: {total_comp_slots}, continuation length: {len(cont_trim)}, dec budget: {dec_budget}")
                     continue
 
                 # Encoder: concatenate spans, each followed by its compression slots.
@@ -1605,6 +1628,11 @@ class NativeCausalLM(TemplateLM):
                 for _ in ctx_spans:
                     dec_tokens.extend([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX])
                     comp_mask.extend([False] + ([True] * num_comp) + [False])
+                
+                if self._add_boq_index:
+                    dec_tokens.extend([BEGIN_OF_QUERY_INDEX])
+                    comp_mask.extend([False])
+                    
                 dec_tokens.extend(cont_trim)
                 comp_mask.extend([False] * len(cont_trim))
 
