@@ -15,6 +15,7 @@ from arch.comp_mem import MassiveCompressedMemoryModel as Model
 from config import DistributedArgs
 from data.tokenizer import Tokenizer
 from distributed import apply_tp
+from datetime import datetime
 from torch.distributed.device_mesh import init_device_mesh
 from data.ae_loader import (
     BEGIN_OF_MEMORY_INDEX,
@@ -125,13 +126,13 @@ class NativeCausalLM(TemplateLM):
         vllm_model_path: Optional[str] = None,
         vllm_max_model_len: Optional[int] = None,
         vllm_tensor_parallel: int = 1,
-        vllm_gpu_memory_utilization: float = 0.5,
+        vllm_gpu_memory_utilization: float = 0.4,
         vllm_output_root: Optional[str] = None,
         # for reconstruction related
         vllm_reconstruct_batch_size: int = 4000,
         ppl_batch_size: Optional[int] = 8,
         # for compression related
-        compress_threshold: int = 8182,
+        compress_threshold: int = 8192,
         compress_chunk: int = 2048,
         max_cycles: int = 10,
         compress_start_tokens: Optional[str] = "<think>",
@@ -140,6 +141,11 @@ class NativeCausalLM(TemplateLM):
         use_chat_template: bool = False, 
         chat_add_generation_prompt: bool = True,
         add_thinking_tokens: bool = False,
+        # reconstruct_first (loglikelihood) controls
+        reconstruct_add_bor: bool = False,
+        reconstruct_max_bor: int = 3,
+        save_loglikelihood_debug: bool = True,
+        loglikelihood_debug_path: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
@@ -170,11 +176,16 @@ class NativeCausalLM(TemplateLM):
         self._chat_add_generation_prompt = bool(chat_add_generation_prompt)
         self._add_thinking_tokens = bool(add_thinking_tokens)
         self._temperature = temperature
+        self._reconstruct_add_bor = bool(reconstruct_add_bor)
+        self._reconstruct_max_bor = max(0, int(reconstruct_max_bor))
+        self._save_loglikelihood_debug = bool(save_loglikelihood_debug)
+        self._loglikelihood_debug_path = loglikelihood_debug_path
+        self._last_loglikelihood_debug: List[dict] = []
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
         # Native supports tensor-parallel only; data-parallel (world_size > model_parallel_size) will duplicate work.
         self._distributed_args = distributed_args
-		
+        
         if checkpoint_dir is None and pretrain_model_dir is None:
             raise ValueError("Provide either checkpoint_dir or pretrain_model_dir for native model.")
 
@@ -337,6 +348,29 @@ class NativeCausalLM(TemplateLM):
             else:
                 print(f"Warning: token {token} has {len(token_ids)} ids: {token_ids}")
         return ids
+
+    def _append_loglikelihood_debug_rows(self, rows: List[dict]) -> None:
+        if not self._save_loglikelihood_debug:
+            return
+        if self._distributed_args.rank != 0:
+            return
+        if not rows:
+            return
+        self._last_loglikelihood_debug.extend(rows)
+        out_path = self._loglikelihood_debug_path
+        datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if out_path is None:
+            if not self._vllm_output_root:
+                return
+            os.makedirs(self._vllm_output_root, exist_ok=True)
+            out_path = os.path.join(self._vllm_output_root, f"loglikelihood_debug_{datetime_str}.jsonl")
+            self._loglikelihood_debug_path = out_path
+        else:
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        
+        with open(out_path, "a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # ---- Tokenization helpers ----
     def tok_encode(self, string: str, add_special_tokens: Optional[bool] = None,add_thinking_tokens: Optional[bool] = False, **kwargs) -> List[int]:
@@ -922,6 +956,7 @@ class NativeCausalLM(TemplateLM):
                 continue
 
             # Fallback: torch paths, process one by one within chunk
+            # generate for greedy decoding
             for context_str, gen_kwargs in chunk:
                 until = gen_kwargs.get("until", None)
                 max_gen_len = gen_kwargs.get("max_generation_length", self.max_gen_toks)
@@ -1180,7 +1215,6 @@ class NativeCausalLM(TemplateLM):
                 
             print("prompt_tokens: ", len(prompt_tokens))
             print("embeds: ", embeds.shape)
-            breakpoint()
             outs = self._vllm_manager.generate_from_embeddings(
                 [embeds],
                 sampling_params={
@@ -1317,23 +1351,47 @@ class NativeCausalLM(TemplateLM):
         return self._truncate_until(text, until)
 
     def _build_compress_prompt_embeds_batch(
-        self, prompts: List[str], gen_lens: List[int], include_bor: bool
-    ) -> List[Optional[torch.Tensor]]:
+        self,
+        prompts: List[str],
+        gen_lens: List[int],
+        include_bor: bool,
+        *,
+        decoder_include_prompt_tokens: bool = True,
+        decoder_memory_layout: str = "per_span", #"single",
+        return_meta: bool = False,
+        prompt_tokens_override: Optional[List[List[int]]] = None,
+    ) -> Tuple[List[Optional[torch.Tensor]], Optional[Dict[str, List[Any]]]]:
         """
         Batch build prompt embeddings for compress_answer/reconstruct_first with optional BOR.
         """
         num_comp = getattr(self.model.args, "num_compression_tokens", 0)
         embeds: List[Optional[torch.Tensor]] = [None] * len(prompts)
+        if decoder_memory_layout not in {"single", "per_span"}:
+            raise ValueError(f"Unsupported decoder_memory_layout: {decoder_memory_layout}")
+        selected_spans_list: List[int] = []
+        selected_flat_lens: List[int] = []
 
         # Fast path: no compression tokens
         if num_comp <= 0:
+            meta_n_spans = [0] * len(prompts)
+            meta_flat_lens = [0] * len(prompts)
             for i, p in enumerate(prompts):
-                tokens = self.tok_encode(p)
+                tokens = prompt_tokens_override[i] if prompt_tokens_override is not None else self.tok_encode(p)
                 if len(tokens) == 0:
                     continue
-                tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
+                if decoder_include_prompt_tokens:
+                    prefix_tokens = tokens[:] + ([BEGIN_OF_RECONSTRUCTION_INDEX] if include_bor else [])
+                else:
+                    # memory-only prefix degenerates to (optional) BOR
+                    prefix_tokens = [BEGIN_OF_RECONSTRUCTION_INDEX] if include_bor else []
+                if not prefix_tokens:
+                    continue
+                tok_tensor = torch.tensor(prefix_tokens, device=self.device, dtype=torch.long)
                 embeds[i] = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
-            return embeds
+                meta_n_spans[i] = 0
+                meta_flat_lens[i] = 0
+            meta = {"n_spans": meta_n_spans, "flat_ctx_len": meta_flat_lens, "slots": [0] * len(prompts)}
+            return (embeds, meta) if return_meta else embeds
 
         max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
         placeholder_id = 0
@@ -1348,22 +1406,27 @@ class NativeCausalLM(TemplateLM):
         model_max_len = getattr(self.model.args, "max_seq_len", self.max_length)
 
         for p, glen in zip(prompts, gen_lens):
-            p_tokens = self.tok_encode(p)
+            p_tokens = prompt_tokens_override[len(prompt_tokens_list)] if prompt_tokens_override is not None else self.tok_encode(p)
             prompt_tokens_list.append(p_tokens)
             ctx_spans = [p_tokens[i : i + max_mem_span_len] for i in range(0, len(p_tokens), max_mem_span_len)]
             if not ctx_spans:
                 ctx_spans = [[]]
 
             bor_extra = 1 if include_bor else 0
-            total_static = 2 + len(p_tokens) + bor_extra  # BOM + EOM + prompt (+BOR)
+            prompt_in_dec_len = len(p_tokens) if decoder_include_prompt_tokens else 0
+            total_static = (2 if decoder_memory_layout == "single" else 0) + prompt_in_dec_len + bor_extra
             max_comp_tokens = max(0, self.max_length - total_static - glen)
-            max_chunks = max_comp_tokens // num_comp if num_comp > 0 else 0
+            span_cost = num_comp if decoder_memory_layout == "single" else (num_comp + 2)
+            max_chunks = max_comp_tokens // max(1, span_cost) if num_comp > 0 else 0
             if num_comp > 0 and model_max_len:
-                enc_budget_chunks = max(1, model_max_len // (2 + num_comp))
+                per_span = max(1, max_mem_span_len + num_comp)
+                enc_budget_chunks = max(1, model_max_len // per_span)
                 max_chunks = min(max_chunks, enc_budget_chunks) if max_chunks > 0 else enc_budget_chunks
             if max_chunks <= 0:
                 max_chunks = 1
             ctx_spans = ctx_spans[-max_chunks:]
+            selected_spans_list.append(len(ctx_spans))
+            selected_flat_lens.append(sum(len(sp) for sp in ctx_spans))
 
             slots = num_comp * len(ctx_spans)
             total_comp_slots_list.append(slots)
@@ -1389,8 +1452,16 @@ class NativeCausalLM(TemplateLM):
 
         for i, p_tokens in enumerate(prompt_tokens_list):
             slots = total_comp_slots_list[i]
-            prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * slots) + [END_OF_MEMORY_INDEX] + p_tokens
-            comp_mask = [False] + ([True] * slots) + [False] + ([False] * len(p_tokens))
+            if decoder_memory_layout == "single":
+                prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * slots) + [END_OF_MEMORY_INDEX]
+                comp_mask = [False] + ([True] * slots) + [False]
+            else:
+                n_spans = selected_spans_list[i]
+                prefix = ([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX]) * n_spans
+                comp_mask = ([False] + ([True] * num_comp) + [False]) * n_spans
+            if decoder_include_prompt_tokens:
+                prefix = prefix + p_tokens
+                comp_mask = comp_mask + ([False] * len(p_tokens))
             if include_bor:
                 prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
                 comp_mask.append(False)
@@ -1402,7 +1473,8 @@ class NativeCausalLM(TemplateLM):
                 pe[comp_mask_t] = compression_vectors[comp_offsets[i] : comp_offsets[i + 1]].to(dtype=self._dtype)
             embeds[i] = pe
 
-        return embeds
+        meta = {"n_spans": selected_spans_list, "flat_ctx_len": selected_flat_lens, "slots": total_comp_slots_list}
+        return (embeds, meta) if return_meta else embeds
 
     # def _generate_with_vllm_decoder_embeds(
     #     self,
@@ -1626,6 +1698,36 @@ class NativeCausalLM(TemplateLM):
         num_comp = getattr(self.model.args, "num_compression_tokens", 0)
         max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
         placeholder_id = 0
+        add_bor = bool(self._reconstruct_add_bor)
+
+        max_bor = int(self._reconstruct_max_bor)
+        def _postprocess_recon(
+            tokens: List[int],
+            max_len: int,
+        ) -> Tuple[List[int], dict]:
+            out: List[int] = []
+            # bor_count = 0
+            eor_count = 0
+            stop_reason: Optional[str] = None
+            for t in tokens:
+                # if t == BEGIN_OF_RECONSTRUCTION_INDEX:
+                #     bor_count >= max_bor:
+                #         stop_reason = "bor_limit"
+                #         break
+                #     bor_count += 1
+                if t == END_OF_RECONSTRUCTION_INDEX:
+                    eor_count += 1
+                    if eor_count >= max_bor:
+                        stop_reason = "max_eor"
+                        break
+
+                out.append(int(t))
+                if len(out) >= max_len:
+                    stop_reason = "max_recon"
+                    break
+            if stop_reason is None:
+                stop_reason = "max_recon"
+            return out, {"stop_reason": stop_reason}
 
         res: List[Tuple[float, bool]] = []
         bs = self._vllm_reconstruct_batch_size if self._vllm_manager is not None else self.batch_size
@@ -1642,34 +1744,60 @@ class NativeCausalLM(TemplateLM):
             cont_list: List[List[int]] = []
             dec_prefix_lens: List[int] = []
             max_recon_lens: List[int] = []
+            n_spans_list: List[int] = []
+            n_slots_list: List[int] = []
+            # stop_on_eor_list: List[bool] = []
+            # enforce_bor_limit_list: List[bool] = []
 
-            for (_, context_enc, continuation_enc) in chunk:
-                # Split ctx into spans, keep as many as fit budget.
-                ctx_spans = [context_enc[i : i + max_mem_span_len] for i in range(0, len(context_enc), max_mem_span_len)]
-                if not ctx_spans:
-                    ctx_spans = [[]]
+            if self._vllm_manager is None:
+                raise NotImplementedError("reconstruct_first loglikelihood requires vLLM in this harness.")
 
-                if num_comp > 0:
-                    max_slots_tokens = max(0, self.max_length - len(continuation_enc) - 4)  # BOM/EOM/BOR + EOT
-                    max_chunks = max_slots_tokens // num_comp if num_comp > 0 else 0
-                    if max_chunks <= 0:
-                        max_chunks = 1
-                    ctx_spans = ctx_spans[-max_chunks:]
-                else:
-                    # no compression slots; keep last span only
-                    ctx_spans = ctx_spans[-1:]
+            # Use the shared prompt-embeds builder (with token override) so that:
+            # - span selection respects decoder length (per-span BOM/slots/EOM layout)
+            # - encoder length respects model_max_len / max_mem_span_len budget
+            ctx_tokens_override = [context_enc for (_, context_enc, _) in chunk]
+            cont_tokens_override = [continuation_enc for (_, _, continuation_enc) in chunk]
+            # Reserve continuation + 1 EOT for scoring; reconstruction budget is computed later.
+            gen_lens_for_slots = [len(c) + 1 for c in cont_tokens_override]
+            dummy_prompts = [""] * len(chunk)
+            prompt_embeds_for_recon, meta = self._build_compress_prompt_embeds_batch(
+                dummy_prompts,
+                gen_lens_for_slots,
+                include_bor=add_bor,
+                decoder_include_prompt_tokens=False,
+                decoder_memory_layout="per_span",
+                return_meta=True,
+                prompt_tokens_override=ctx_tokens_override,
+            )
+            meta_n_spans = meta.get("n_spans", [1] * len(chunk))
 
-                total_comp_slots = num_comp * len(ctx_spans) if num_comp > 0 else 0
-                dec_prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * total_comp_slots) + [END_OF_MEMORY_INDEX] + [BEGIN_OF_RECONSTRUCTION_INDEX]
-                comp_prefix = [False] + ([True] * total_comp_slots) + [False] + [False]
+            for i, (context_enc, continuation_enc) in enumerate(zip(ctx_tokens_override, cont_tokens_override)):
+                # Split ctx into spans; select last n_spans chosen by the builder.
+                ctx_spans_all = [context_enc[j : j + max_mem_span_len] for j in range(0, len(context_enc), max_mem_span_len)]
+                if not ctx_spans_all:
+                    ctx_spans_all = [[]]
+                n_spans = int(meta_n_spans[i]) if i < len(meta_n_spans) else 1
+                if n_spans <= 0:
+                    n_spans = 1
+                ctx_spans = ctx_spans_all[-n_spans:]
+
+                # Decoder prefix: per-span BOM/slots/EOM blocks, then optional BOR.
+                dec_prefix = ([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX]) * len(ctx_spans)
+                comp_prefix = ([False] + ([True] * num_comp) + [False]) * len(ctx_spans)
+                if add_bor:
+                    dec_prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+                    comp_prefix.append(False)
                 dec_prefix_len = len(dec_prefix)
 
-                # Flatten spans for encoder and reconstruction target
+                # Flatten spans for reconstruction-length budgeting and delimiter heuristics.
                 flat_ctx = [t for sp in ctx_spans for t in sp]
-                # Budget for reconstruction tokens
                 budget_recon = max(0, self.max_length - dec_prefix_len - len(continuation_enc) - 1)  # reserve one for EOT
                 max_recon = min(len(flat_ctx), budget_recon)
                 flat_ctx = flat_ctx[-max_recon:] if max_recon > 0 else []
+
+                # If BOR/EOR show up in the reconstruction target, they are content delimiters and
+                # should not be treated as early-stopping signals during reconstruction.
+
 
                 # Encoder tokens with per-span slots
                 enc_tokens, enc_mem_mask = [], []
@@ -1681,7 +1809,7 @@ class NativeCausalLM(TemplateLM):
                         enc_tokens.extend([placeholder_id] * num_comp)
                         enc_mem_mask.extend([True] * num_comp)
 
-                cont_trim = continuation_enc[: max(0, self.max_length - dec_prefix_len - max_recon)]
+                cont_trim = continuation_enc  # defer truncation until after reconstruction
 
                 enc_tokens_list.append(enc_tokens)
                 enc_mem_masks.append(enc_mem_mask)
@@ -1690,6 +1818,8 @@ class NativeCausalLM(TemplateLM):
                 cont_list.append(cont_trim)
                 dec_prefix_lens.append(dec_prefix_len)
                 max_recon_lens.append(max_recon)
+                n_spans_list.append(len(ctx_spans))
+                n_slots_list.append(num_comp * len(ctx_spans))
 
             # Pack encoder
             enc_lens = [len(t) for t in enc_tokens_list]
@@ -1713,33 +1843,42 @@ class NativeCausalLM(TemplateLM):
 
             # Reconstruction: vLLM prompt_embeds batch if available, else per-sample greedy
             recon_tokens_list: List[List[int]] = [[] for _ in dec_prefix_list]
+            recon_infos: List[dict] = [{"stop_reason": None} for _ in dec_prefix_list]
             if self._vllm_manager is not None:
-                compression_vectors = self._compress_tokens(enc_tokens_flat, enc_cu, enc_mem_mask_flat)
-                comp_counts = [int(sum(mask)) for mask in enc_mem_masks]
-                comp_offsets = [0]
-                for c in comp_counts:
-                    comp_offsets.append(comp_offsets[-1] + c)
-
-                prompt_embeds = []
-                for i in range(len(dec_prefix_list)):
-                    comp_vec = compression_vectors[comp_offsets[i] : comp_offsets[i + 1]]
-                    prompt = self.model.tok_embeddings(dec_prefix_tensors[i].to(self.device))
-                    prompt = prompt.to(comp_vec.dtype)
-                    if comp_vec.numel() > 0:
-                        prompt[comp_mask_tensors[i]] = comp_vec
-                    prompt_embeds.append(prompt)
-
-                sampling_params = {"temperature": self._temperature, "top_p": 1.0, "max_tokens": max(max_recon_lens) if max_recon_lens else 0}
-                outputs = self._vllm_manager.generate_from_embeddings(prompt_embeds, sampling_params=sampling_params)
-                for i, out in enumerate(outputs):
-                    if out.outputs:
-                        text = out.outputs[0].text
-                        recon_tokens_list[i] = self.tok_encode(text)[: max_recon_lens[i]]
+                valid_indices = [
+                    i
+                    for i, (pe, mr) in enumerate(zip(prompt_embeds_for_recon, max_recon_lens))
+                    if pe is not None and mr > 0
+                ]
+                if valid_indices:
+                    sampling_params = {
+                        "temperature": self._temperature,
+                        "top_p": 1.0,
+                        "max_tokens": max(max_recon_lens[i] for i in valid_indices),
+                    }
+                    # if all(stop_on_eor_list[i] for i in valid_indices):
+                    #     sampling_params["stop_token_ids"] = [END_OF_RECONSTRUCTION_INDEX]
+                    batch_embeds = [prompt_embeds_for_recon[i] for i in valid_indices]  # type: ignore[index]
+                    outputs = self._vllm_manager.generate_from_embeddings(batch_embeds, sampling_params=sampling_params)
+                    for sample_idx, out in zip(valid_indices, outputs):
+                        if out.outputs:
+                            token_ids = out.outputs[0].token_ids or []
+                            recon_tokens, info = _postprocess_recon(
+                                token_ids,
+                                max_recon_lens[sample_idx],
+                            )
+                            recon_tokens_list[sample_idx] = recon_tokens
+                            recon_infos[sample_idx] = info
             else:
+                raise NotImplementedError("Greedy decoding is not supported for native harness.")
                 for i, (dec_t, comp_t, max_recon) in enumerate(zip(dec_prefix_tensors, comp_mask_tensors, max_recon_lens)):
                     recon_tokens: List[int] = []
                     dec_tokens = dec_t
                     comp_mask = comp_t
+                    bor_count = 0
+                    stop_reason: Optional[str] = None
+                    # stop_on_eor = stop_on_eor_list[i]
+                    # enforce_bor_limit = enforce_bor_limit_list[i]
                     for _ in range(max_recon):
                         dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
                         dec_ctx = {
@@ -1750,26 +1889,35 @@ class NativeCausalLM(TemplateLM):
                             "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
                             "compression_token_mask": comp_mask,
                         }
-                        # compute compression for this sample
-                        comp_vec = self._compress_tokens(
-                            enc_tokens_flat[enc_cu[i]:enc_cu[i+1]],
-                            torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
-                            torch.tensor(enc_mem_masks[i], device=self.device, dtype=torch.bool),
-                        )
-                        x_tokens = self.model.tok_embeddings(dec_tokens).to(self._dtype)
-                        x_tokens[comp_mask] = comp_vec.to(x_tokens.dtype)
-                        h_dec = x_tokens
-                        for layer in self.model.layers:
-                            h_dec = layer(h_dec, context=dec_ctx)
+                        
+                    # compute compression for this sample
+                    comp_vec = self._compress_tokens(
+                        enc_tokens_flat[enc_cu[i]:enc_cu[i+1]],
+                        torch.tensor([0, enc_lens[i]], device=self.device, dtype=torch.int32),
+                        torch.tensor(enc_mem_masks[i], device=self.device, dtype=torch.bool),
+                    )
+                    x_tokens = self.model.tok_embeddings(dec_tokens).to(self._dtype)
+                    x_tokens[comp_mask] = comp_vec.to(x_tokens.dtype)
+                    h_dec = x_tokens
+                    for layer in self.model.layers:
+                        h_dec = layer(h_dec, context=dec_ctx)
                         h_dec = self.model.norm(h_dec)
                         logits = self.model.output(h_dec).float()
                         next_token = int(torch.argmax(logits[-1]))
-                        if next_token == END_OF_RECONSTRUCTION_INDEX:
+                        if stop_on_eor and next_token == END_OF_RECONSTRUCTION_INDEX:
+                            stop_reason = "eor"
                             break
-                        recon_tokens.append(next_token)
-                        dec_tokens = torch.cat([dec_tokens, torch.tensor([next_token], device=self.device, dtype=torch.long)], dim=0)
-                        comp_mask = torch.cat([comp_mask, torch.tensor([False], device=self.device, dtype=torch.bool)], dim=0)
-                    recon_tokens_list[i] = recon_tokens
+                        if next_token == BEGIN_OF_RECONSTRUCTION_INDEX:
+                            # if enforce_bor_limit and bor_count >= max_bor:
+                            #     stop_reason = "bor_limit"
+                            #     break
+                            # bor_count += 1
+                            break
+                    recon_tokens.append(next_token)
+                    dec_tokens = torch.cat([dec_tokens, torch.tensor([next_token], device=self.device, dtype=torch.long)], dim=0)
+                    comp_mask = torch.cat([comp_mask, torch.tensor([False], device=self.device, dtype=torch.bool)], dim=0)
+                recon_tokens_list[i] = recon_tokens
+                recon_infos[i] = {"bor_count": bor_count, "stop_reason": stop_reason or "max_recon"}
 
             # Build decoder with recon + continuation; defer scoring so we can batch PPL computation.
             dec_tokens_full: List[torch.Tensor] = []
@@ -1777,6 +1925,7 @@ class NativeCausalLM(TemplateLM):
             targets_full: List[torch.Tensor] = []
             cont_offsets: List[int] = []
             cont_lengths: List[int] = []
+            cont_trim_list: List[List[int]] = []
 
             for i, (dec_t, comp_t, recon_tokens, cont_tokens) in enumerate(zip(dec_prefix_tensors, comp_mask_tensors, recon_tokens_list, cont_list)):
                 dec_tokens = torch.cat([dec_t, torch.tensor(recon_tokens, device=self.device, dtype=torch.long)], dim=0)
@@ -1795,9 +1944,11 @@ class NativeCausalLM(TemplateLM):
                 targets_full.append(targets)
                 cont_offsets.append(cont_start)
                 cont_lengths.append(len(cont_trim))
+                cont_trim_list.append(cont_trim)
 
             # Score continuation in small batches to reduce peak memory.
             chunk_results: List[Tuple[float, bool]] = [(float("-inf"), False)] * len(dec_tokens_full)
+            debug_rows: List[dict] = []
             score_bs = max(1, self._ppl_batch_size)
             for score_start in range(0, len(dec_tokens_full), score_bs):
                 idxs = list(range(score_start, min(score_start + score_bs, len(dec_tokens_full))))
@@ -1919,9 +2070,38 @@ class NativeCausalLM(TemplateLM):
                     greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
                     chunk_results[sample_idx] = (logprob, greedy)
 
+            for i in range(len(dec_tokens_full)):
+                logprob, greedy = chunk_results[i]
+                recon_tokens = recon_tokens_list[i]
+                info = recon_infos[i] if i < len(recon_infos) else {}
+                debug_rows.append(
+                    {
+                        "request_index": batch_start + i,
+                        "mode": "reconstruct_first",
+                        "reconstruct_add_bor": add_bor,
+                        "reconstruct_max_bor": max_bor,
+                        "num_comp": num_comp,
+                        "max_mem_span_len": max_mem_span_len,
+                        "n_spans": n_spans_list[i],
+                        "total_comp_slots": n_slots_list[i],
+                        "dec_prefix_len": dec_prefix_lens[i],
+                        "max_recon_len": max_recon_lens[i],
+                        "recon_tokens_len": len(recon_tokens),
+                        # "recon_tokens": recon_tokens,
+                        "recon_stop_reason": info.get("stop_reason"),
+                        "recon_text_preview": self.tok_decode_w_special_tokens(recon_tokens) if recon_tokens else "",
+                        "cont_len_scored": cont_lengths[i],
+                        "cont_tokens_scored": cont_trim_list[i],
+                        "logprob": logprob,
+                        "greedy": greedy,
+                    }
+                )
+            self._append_loglikelihood_debug_rows(debug_rows)
+
             res.extend(chunk_results)
 
         return res
+
 
     # ---- helpers ----
     # @staticmethod
