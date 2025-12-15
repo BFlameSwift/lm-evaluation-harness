@@ -23,6 +23,7 @@ from data.ae_loader import (
     BEGIN_OF_RECONSTRUCTION_INDEX,
     END_OF_RECONSTRUCTION_INDEX,
 )
+from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
 from eval_func.model2safetensors import convert_checkpoint
 from eval_func.vllm_runner import VLLMEngineWrapper, VLLMEngineConfig, VLLMDecoderManager
 from eval_func.utils import load_checkpoint_harness, _build_device_mesh
@@ -146,6 +147,7 @@ class NativeCausalLM(TemplateLM):
         reconstruct_max_bor: int = 3,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
+        add_boq_index: bool = True,
     ) -> None:
         super().__init__()
         self._dtype = _str_to_dtype(dtype)
@@ -165,7 +167,7 @@ class NativeCausalLM(TemplateLM):
         self._compress_chunk = max(1, int(compress_chunk))
         self._max_cycles = max(1, int(max_cycles))
         self._compress_start_tokens = []
-        
+        self._add_boq_index = bool(add_boq_index)
         
         if compress_start_tokens:
             for t in compress_start_tokens.split(","):
@@ -1356,7 +1358,7 @@ class NativeCausalLM(TemplateLM):
         gen_lens: List[int],
         include_bor: bool,
         *,
-        decoder_include_prompt_tokens: bool = True,
+        decoder_include_prompt_tokens: bool = False,
         decoder_memory_layout: str = "per_span", #"single",
         return_meta: bool = False,
         prompt_tokens_override: Optional[List[List[int]]] = None,
@@ -1373,12 +1375,17 @@ class NativeCausalLM(TemplateLM):
 
         # Fast path: no compression tokens
         if num_comp <= 0:
+            # temp no BOQ index
+                
             meta_n_spans = [0] * len(prompts)
             meta_flat_lens = [0] * len(prompts)
             for i, p in enumerate(prompts):
                 tokens = prompt_tokens_override[i] if prompt_tokens_override is not None else self.tok_encode(p)
                 if len(tokens) == 0:
                     continue
+                prefix_tokens = []
+                if self._add_boq_index:
+                    prefix_tokens.append(BEGIN_OF_QUERY_INDEX)
                 if decoder_include_prompt_tokens:
                     prefix_tokens = tokens[:] + ([BEGIN_OF_RECONSTRUCTION_INDEX] if include_bor else [])
                 else:
@@ -1462,9 +1469,15 @@ class NativeCausalLM(TemplateLM):
             if decoder_include_prompt_tokens:
                 prefix = prefix + p_tokens
                 comp_mask = comp_mask + ([False] * len(p_tokens))
+            if self._add_boq_index:
+                prefix = prefix + [BEGIN_OF_QUERY_INDEX]
+                comp_mask = comp_mask + [False]
+            
+
             if include_bor:
                 prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
                 comp_mask.append(False)
+            breakpoint()
 
             prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
             comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
@@ -2088,6 +2101,7 @@ class NativeCausalLM(TemplateLM):
                         "max_recon_len": max_recon_lens[i],
                         "recon_tokens_len": len(recon_tokens),
                         # "recon_tokens": recon_tokens,
+                        "dec_tokens_full": dec_tokens_full[i].tolist(),
                         "recon_stop_reason": info.get("stop_reason"),
                         "recon_text_preview": self.tok_decode_w_special_tokens(recon_tokens) if recon_tokens else "",
                         "cont_len_scored": cont_lengths[i],
