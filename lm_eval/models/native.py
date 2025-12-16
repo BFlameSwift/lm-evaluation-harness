@@ -31,6 +31,7 @@ import sys
 import math
 from typing import Type, TypeVar, Mapping, Any, Dict
 import inspect
+import gc
 
 T = TypeVar("T")
 
@@ -298,6 +299,78 @@ class NativeCausalLM(TemplateLM):
             except Exception as e:
                 print(f"WARNING: Failed to init vLLM, falling back to torch backend. Error: {e}", file=sys.stderr)
                 self._vllm_manager = None
+
+    def shutdown_vllm_manager(
+        self,
+        *,
+        empty_cache: bool = True,
+        ipc_collect: bool = True,
+        synchronize: bool = True,
+    ) -> None:
+        """
+        Best-effort release of GPU memory held by `self._vllm_manager`.
+
+        Notes:
+        - vLLM does not guarantee a perfect "shutdown" API across versions.
+        - This helper drops references, triggers GC, and clears CUDA caching allocator.
+        """
+        mgr = getattr(self, "_vllm_manager", None)
+        if mgr is None:
+            return
+
+        try:
+            engine_wrapper = getattr(mgr, "engine_wrapper", None)
+            if engine_wrapper is not None:
+                try:
+                    # Our wrapper supports a soft shutdown (drops Python refs).
+                    engine_wrapper.shutdown()
+                except Exception as e:
+                    print(f"WARNING: Failed to shutdown vLLM, Error: {e}", file=sys.stderr)
+                try:
+                    # Ensure attribute is gone to break reference cycles.
+                    if hasattr(engine_wrapper, "engine"):
+                        
+                        engine_wrapper.engine = None
+                except Exception as e:
+                    print(f"WARNING: Failed to set engine_wrapper.engine to None, Error: {e}", file=sys.stderr)
+
+            # Optional vLLM-side cleanup when available.
+            try:
+                from vllm.distributed import destroy_model_parallel  # type: ignore
+
+                destroy_model_parallel()
+            except Exception as e:
+                print(f"WARNING: Failed to destroy model parallel, Error: {e}", file=sys.stderr)
+                pass
+        finally:
+            self._vllm_manager = None
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            if torch.cuda.is_available():
+                try:
+                    if synchronize:
+                        torch.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    if ipc_collect:
+                        torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+                try:
+                    if empty_cache:
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+    def __del__(self) -> None:
+        # Never raise from a destructor.
+        try:
+            self.shutdown_vllm_manager()
+        except Exception as e:
+            print(f"WARNING: Failed to shutdown vLLM in destructor, Error: {e}", file=sys.stderr)
 
     # ---- Required TemplateLM properties ----
     @property
@@ -1520,33 +1593,8 @@ class NativeCausalLM(TemplateLM):
         meta = {"n_spans": selected_spans_list, "flat_ctx_len": selected_flat_lens, "slots": total_comp_slots_list}
         return (embeds, meta) if return_meta else embeds
 
-    # def _generate_with_vllm_decoder_embeds(
-    #     self,
-    #     prompt: str,
-    #     max_gen_len: int,
-    #     temperature: float,
-    #     top_p: float,
-    #     until: Optional[List[str]],
-    # ) -> str:
-    #     """Use vLLM prompt_embeds for decoder generation on compression models."""
-    #     if self._vllm_manager is None:
-    #         raise RuntimeError("vLLM manager is not initialized for decoder mode.")
-    #     # Encode prompt tokens without padding
-    #     tokens = self.tok_encode(prompt)
-    #     if len(tokens) == 0:
-    #         return ""
-    #     tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
-    #     embeds = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
-    #     sampling_params = {
-    #         "max_tokens": max_gen_len,
-    #         "temperature": temperature,
-    #         "top_p": top_p,
-    #     }
-    #     outputs = self._vllm_manager.generate_from_embeddings([embeds], sampling_params=sampling_params)
-    #     if not outputs or not outputs[0].outputs:
-    #         return ""
-    #     text = outputs[0].outputs[0].text
-    #     return self._truncate_until(text, until)
+
+
         # ---- compression-aware scoring ----
     @torch.no_grad()
     def _loglikelihood_tokens_compress_answer(
@@ -1585,16 +1633,16 @@ class NativeCausalLM(TemplateLM):
             if all_ + static_count + cont_len <= maxlen:
                 return all_ // max_mem_span_len * max_mem_span_len  # x 取最大 512 倍数
             # x // 512 * (num_comp + 2) + (all - x) < = maxlen - static_count - cont_len, x is raw_comp_len
-            A = all_ + static_count + cont_len - maxlen
+            A = all_ + static_count + cont_len 
             B = max_mem_span_len - (num_comp + 2)
+            # A - B * k <= maxlen -> k >= (A - maxlen) / B
             
-            k = math.floor((all_ - maxlen + static_count + cont_len) / (max_mem_span_len - (num_comp + 2))) + 1
+            k = math.ceil((all_ - maxlen + static_count + cont_len) / (max_mem_span_len - (num_comp + 2)))
             print("all_, maxlen, num_comp,max_mem_span_len, static_count, cont_len", all_, maxlen, num_comp,max_mem_span_len, static_count, cont_len)
-            print("k", k)
-            print(" k * max_mem_span_len ", k * max_mem_span_len)
+            # print("k", k)
+            # print(" k * max_mem_span_len ", k * max_mem_span_len)
             print("all_ - k * max_mem_span_len ", all_ - k * max_mem_span_len)
             print("all_ - k * max_mem_span_len + k * (num_comp + 2) ", all_ - k * max_mem_span_len + k * (num_comp + 2))
-            print()
             return max(0, k * max_mem_span_len)
         
         
@@ -1626,8 +1674,10 @@ class NativeCausalLM(TemplateLM):
             prompt_tokens_list, suffix_tokens_list = zip(*[compute_needed_comp_slots(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)])
             
             # breakpoint()
-            
-            prompt_tokens_override = prompt_tokens_list
+            if self._fill_decoder_prefix_embeds is True:
+                prompt_tokens_override = prompt_tokens_list
+
+
             # prompt_tokens, suffix_tokens = compute_needed_comp_slots(prompt_tokens_override[0])
 
 
@@ -1640,6 +1690,7 @@ class NativeCausalLM(TemplateLM):
 
             if not nonempty_idxs:
                 res.extend(chunk_results)
+                print("no nonempty_idxs")
                 continue
 
             dummy_prompts = [""] * len(chunk)
@@ -1657,14 +1708,19 @@ class NativeCausalLM(TemplateLM):
             )
             # breakpoint()
             
-            # cont_t = torch.tensor(cont, device=self.device, dtype=torch.long)
-            suffix_t = torch.tensor(suffix_tokens_list, device=self.device, dtype=torch.long)   
-            
-            suffix_embeds_list = self.model.tok_embeddings(suffix_t).to(dtype=self._dtype)
-            
-            concat_embds_list = [torch.cat([pe, suffix_e], dim=0) for pe, suffix_e in zip(prefix_embeds_list, suffix_embeds_list)]
-            
-            
+            # Suffix tokens (uncompressed tail of the prompt) can be ragged across the batch.
+            # Embed per-sample to avoid creating a rectangular tensor.
+            suffix_embeds_list: List[torch.Tensor] = []
+            for suffix in suffix_tokens_list:
+                if suffix:
+                    st = torch.tensor(suffix, device=self.device, dtype=torch.long)
+                    with torch.autocast(device_type="cuda", dtype=self._dtype):
+                        se = self.model.tok_embeddings(st).to(dtype=self._dtype)
+                    suffix_embeds_list.append(se)
+                else:
+                    suffix_embeds_list.append(None)
+                    # suffix_embeds_list.append(torch.empty((0, self.model.args.d_model), device=self.device, dtype=self._dtype))
+
             seq_embeds: List[torch.Tensor] = []
             prefix_lens: List[int] = []
             cont_lens: List[int] = []
@@ -1672,10 +1728,11 @@ class NativeCausalLM(TemplateLM):
             valid_map: List[int] = []
 
             for i in nonempty_idxs:
-                # pe = prefix_embeds_list[i]
-                pe = concat_embds_list[i]
-                if pe is None:
+                pe0 = prefix_embeds_list[i]
+                if pe0 is None:
                     continue
+                suffix_e = suffix_embeds_list[i]
+                pe = torch.cat([pe0, suffix_e], dim=0) if suffix_e.numel() else pe0
                 cont = cont_tokens_list[i]
                 cont_len = len(cont)
                 if cont_len <= 0:
@@ -1697,6 +1754,7 @@ class NativeCausalLM(TemplateLM):
 
             if not seq_embeds:
                 res.extend(chunk_results)
+                print("no seq_embeds")
                 continue
 
             dec_lens = [int(t.shape[0]) for t in seq_embeds]
@@ -1712,7 +1770,6 @@ class NativeCausalLM(TemplateLM):
                 # Not used by attention; kept for completeness.
                 "compression_token_mask": torch.zeros(sum(dec_lens), device=self.device, dtype=torch.bool),
             }
-
             embeds_flat = torch.cat(seq_embeds, dim=0)
             with torch.autocast(device_type="cuda", dtype=self._dtype):
                 h = embeds_flat
@@ -1725,6 +1782,10 @@ class NativeCausalLM(TemplateLM):
                 from distributed.tensor_parallel import gather_from_model_parallel_region
 
                 logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
+                
+            breakpoint()
+            self.shutdown_vllm_manager()
+            breakpoint()
 
             logprobs = F.log_softmax(logits.float(), dim=-1)
 
@@ -1747,7 +1808,7 @@ class NativeCausalLM(TemplateLM):
                 token_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
                 logprob = float(token_lp.sum().item()) if token_lp.numel() > 0 else float("-inf")
                 greedy = bool((lp.argmax(dim=-1) == tgt).all().item()) if token_lp.numel() > 0 else False
-                chunk_results[orig_idx] = (logprob, greedy)
+                chunk_results[orig_idx] = (logprob, False)
 
             res.extend(chunk_results)
         # Safety: if we somehow produced fewer responses than requests, pad with -inf.
@@ -1757,194 +1818,6 @@ class NativeCausalLM(TemplateLM):
         return res
 
 
-    # ---- compression-aware scoring ----
-    # @torch.no_grad()
-    # def _loglikelihood_tokens_compress_answer(
-    #     self,
-    #     requests: List[Tuple[Tuple[str, str], List[int], List[int]]],
-    #     disable_tqdm: bool = False,
-    #     override_bs: Optional[int] = None,
-    # ) -> List[Tuple[float, bool]]:
-    #     """
-    #     Compress the context (question) into memory slots, then score only the continuation
-    #     (answer) tokens conditioned on those slots, without reconstructing the question.
-    #     """
-    #     bs = override_bs or self.batch_size
-    #     try:
-    #         bs = int(bs)
-    #     except Exception:
-    #         bs = 1
-
-    #     num_comp = getattr(self.model.args, "num_compression_tokens", 0)
-    #     # Use a valid vocab id for placeholder slots; pad_id is -100 in our tokenizer,
-    #     # which would break embedding lookup.
-    #     placeholder_id = 0
-    #     # Use model-configured memory span if present, otherwise fall back to max_length.
-    #     max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
-    #     # warning if not load from max_mem_span_len
-    #     print(f"Using max_mem_span_len={max_mem_span_len} for compress_answer loglikelihood.")
-        
-
-    #     res: List[Tuple[float, bool]] = []
-    #     iterator = range(0, len(requests), bs)
-    #     pbar = tqdm(iterator, disable=disable_tqdm or self.rank != 0, desc="native loglikelihood (compress)")
-    #     for batch_start in pbar:
-    #         chunk = requests[batch_start : batch_start + bs]
-
-    #         enc_tokens_list: List[List[int]] = []
-    #         enc_mem_masks: List[List[bool]] = []
-    #         dec_tokens_list: List[List[int]] = []
-    #         comp_masks: List[List[bool]] = []
-    #         targets_list: List[List[int]] = []
-    #         ans_offsets: List[int] = []
-    #         cont_lengths: List[int] = []
-
-    #         model_max_len = getattr(self.model.args, "max_seq_len", self.max_length)
-
-    #         for (_, context_enc, continuation_enc) in chunk:
-    #             # Chunk context to respect max_mem_span_len; keep the most recent spans.
-    #             ctx_spans = [context_enc[i : i + max_mem_span_len] for i in range(0, len(context_enc), max_mem_span_len)]
-    #             # Determine how many chunks can fit given max_length budget.
-    #             # Decoder will be: BOM + num_comp * n_chunks + EOM + continuation
-    #             max_comp_tokens = max(0, self.max_length - (4 + len(continuation_enc)))
-    #             max_chunks = max_comp_tokens // max(1, num_comp+2) if num_comp > 0 else 0
-                
-    #             if num_comp == 0:
-    #                 # Fallback: no compression tokens, just trim context to fit
-    #                 ctx_spans = [context_enc[-max_mem_span_len:]]
-    #                 max_chunks = 0
-    #             if max_chunks == 0 and num_comp > 0:
-    #                 max_chunks = 1  # at least one span if compression is available
-                    
-    #             ctx_spans = ctx_spans[-max_chunks:] if max_chunks > 0 else ctx_spans
-
-    #             # Hard cap: ensure decoder length <= model_max_len by dropping spans if needed
-    #             total_comp_slots = (num_comp + 2) * len(ctx_spans) if num_comp > 0 else 0
-                
-    #             dec_budget = model_max_len if model_max_len is not None else self.max_length
-    #             cont_trim = continuation_enc  # do not truncate continuation
-                
-    #             drop_count = 0
-    #             while num_comp > 0 and total_comp_slots + len(cont_trim) > dec_budget and len(ctx_spans) > 1:
-    #                 ctx_spans = ctx_spans[1:]  # drop oldest span
-    #                 drop_count += 1
-    #             print(f"Dropping span {drop_count} of {len(ctx_spans)}")
-
-    #             if num_comp > 0 and total_comp_slots + len(cont_trim) > dec_budget:
-    #                 print(f"Total comp slots: {total_comp_slots}, continuation length: {len(cont_trim)}, dec budget: {dec_budget}")
-    #                 continue
-
-    #             # Encoder: concatenate spans, each followed by its compression slots.
-    #             enc_tokens, enc_mem_mask = [], []
-    #             for span in ctx_spans:
-    #                 enc_tokens.extend(span)
-    #                 enc_mem_mask.extend([False] * len(span))
-    #                 if num_comp > 0:
-    #                     enc_tokens.extend([placeholder_id] * num_comp)
-    #                     enc_mem_mask.extend([True] * num_comp)
-
-    #             # Decoder: per-span BOM/slots/EOM, then answer.
-    #             dec_tokens = []
-    #             comp_mask = []
-    #             for _ in ctx_spans:
-    #                 dec_tokens.extend([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX])
-    #                 comp_mask.extend([False] + ([True] * num_comp) + [False])
-                
-    #             if self._add_boq_index:
-    #                 dec_tokens.extend([BEGIN_OF_QUERY_INDEX])
-    #                 comp_mask.extend([False])
-                    
-    #             dec_tokens.extend(cont_trim)
-    #             comp_mask.extend([False] * len(cont_trim))
-
-    #             targets = dec_tokens[1:] + [self.eot_token_id]
-    #             answer_start = len(dec_tokens) - len(cont_trim)
-
-    #             enc_tokens_list.append(enc_tokens)
-    #             enc_mem_masks.append(enc_mem_mask)
-    #             dec_tokens_list.append(dec_tokens)
-    #             comp_masks.append(comp_mask)
-    #             targets_list.append(targets)
-    #             ans_offsets.append(answer_start)
-    #             cont_lengths.append(len(cont_trim))
-
-    #         # pack encoder sequences
-    #         enc_lens = [len(t) for t in enc_tokens_list]
-    #         enc_cu = torch.tensor([0] + list(torch.tensor(enc_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
-    #         max_enc = max(enc_lens)
-    #         enc_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in enc_lens], dim=0)
-    #         enc_tokens_flat = torch.tensor(sum(enc_tokens_list, []), device=self.device, dtype=torch.long)
-    #         enc_mem_mask_flat = torch.tensor(sum(enc_mem_masks, []), device=self.device, dtype=torch.bool)
-    #         enc_ctx = {
-    #             "cu_seqlens_q": enc_cu,
-    #             "cu_seqlens_k": enc_cu,
-    #             "max_seqlen_q": max_enc,
-    #             "max_seqlen_k": max_enc,
-    #             "positions": enc_positions,
-    #             "encoder_mem_mask": enc_mem_mask_flat,
-    #         }
-
-    #         # pack decoder sequences
-    #         dec_lens = [len(t) for t in dec_tokens_list]
-    #         dec_cu = torch.tensor([0] + list(torch.tensor(dec_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
-    #         max_dec = max(dec_lens)
-    #         dec_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens], dim=0)
-    #         dec_tokens_flat = torch.tensor(sum(dec_tokens_list, []), device=self.device, dtype=torch.long)
-    #         comp_mask_flat = torch.tensor(sum(comp_masks, []), device=self.device, dtype=torch.bool)
-    #         dec_ctx = {
-    #             "cu_seqlens_q": dec_cu,
-    #             "cu_seqlens_k": dec_cu,
-    #             "max_seqlen_q": max_dec,
-    #             "max_seqlen_k": max_dec,
-    #             "positions": dec_positions,
-    #             "compression_token_mask": comp_mask_flat,
-    #         }
-
-    #         targets_flat = torch.tensor(sum(targets_list, []), device=self.device, dtype=torch.long)
-
-    #         ctx = torch.autocast(device_type="cuda", dtype=self._dtype)
-    #         with ctx:
-    #             if hasattr(self.model, "compression_embeddings"):
-    #                 comp_vectors = self._compress_tokens(enc_tokens_flat, enc_cu, enc_mem_mask_flat)
-    #                 x_tokens = self.model.tok_embeddings(dec_tokens_flat).to(self._dtype)
-    #                 x_tokens[comp_mask_flat] = comp_vectors.to(x_tokens.dtype)
-    #                 h = x_tokens
-    #                 for layer in self.model.layers:
-    #                     h = layer(h, context=dec_ctx)
-    #                 h = self.model.norm(h)
-    #                 logits = self.model.output(h).float()
-    #             else:
-    #                 logits = self.model(
-    #                     encoder_tokens=enc_tokens_flat,
-    #                     encoder_context=enc_ctx,
-    #                     decoder_tokens=dec_tokens_flat,
-    #                     decoder_context=dec_ctx,
-    #                     last_hidden_only=False,
-    #                 )
-    #         logprobs = F.log_softmax(logits.float(), dim=-1)
-
-    #         for i, (ans_off, cont_len) in enumerate(zip(ans_offsets, cont_lengths)):
-    #             start, end = dec_cu[i].item(), dec_cu[i + 1].item()
-    #             sample_logprobs = logprobs[start : end - 1, :]  # drop final padding target
-    #             sample_targets = targets_flat[start : end - 1]
-    #             answer_slice = slice(ans_off, ans_off + cont_len)
-    #             if cont_len <= 0 or sample_logprobs.numel() == 0 or sample_targets.numel() == 0:
-    #                 res.append((float("-inf"), False))
-    #                 continue
-    #             lp = sample_logprobs[answer_slice]
-    #             tgt = sample_targets[answer_slice]
-    #             if lp.numel() == 0 or tgt.numel() == 0:
-    #                 res.append((float("-inf"), False))
-    #                 continue
-    #             token_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-    #             logprob = float(token_lp.sum().item()) if token_lp.numel() > 0 else float("-inf")
-    #             greedy = bool((lp.argmax(dim=-1) == tgt).all().item()) if token_lp.numel() > 0 else False
-    #             res.append((logprob, greedy))
-    #     # Safety: if we somehow produced fewer responses than requests, pad with -inf.
-    #     if len(res) < len(requests):
-    #         missing = len(requests) - len(res)
-    #         res.extend([(float("-inf"), False)] * missing)
-    #     return res
 
     @torch.no_grad()
     def _loglikelihood_tokens_reconstruct_first(
@@ -2364,40 +2237,3 @@ class NativeCausalLM(TemplateLM):
             res.extend(chunk_results)
 
         return res
-
-
-    # ---- helpers ----
-    # @staticmethod
-    # def _load_checkpoint(checkpoint_dir: str, distributed_args: DistributedArgs, tokenizer_path: Optional[str] = None):
-    #     with open(os.path.join(checkpoint_dir, "metadata.json")) as f:
-    #         metadata = json.load(f)
-
-    #     modelargs = ModelArgs(**filter_kwargs_for(ModelArgs, metadata["modelargs"]))
-    #     device_mesh = _build_device_mesh(distributed_args.world_size, modelargs.model_parallel_size)
-    #     model = Model(modelargs)
-    #     if device_mesh is not None:
-    #         apply_tp(model, device_mesh)
-    #         tp_rank = device_mesh.get_local_rank("tp")
-    #     else:
-    #         tp_rank = 0
-    #     device = torch.device(f"cuda:{distributed_args.local_rank}")
-
-    #     model_path = os.path.join(checkpoint_dir, f"model_state_rank_{tp_rank}.pth")
-    #     model_state = torch.load(model_path, map_location="cpu")
-    #     # Be lenient to handle compressor weights or config drift
-    #     missing, unexpected = model.load_state_dict(model_state, strict=False)
-    #     if unexpected:
-    #         import warnings
-    #         warnings.warn(f"Unexpected keys in checkpoint ignored: {list(unexpected)}")
-    #     if missing:
-    #         import warnings
-    #         warnings.warn(f"Missing keys when loading checkpoint: {list(missing)}")
-    #     model = model.to(torch.bfloat16).to(device)
-    #     torch.set_autocast_gpu_dtype(torch.bfloat16)
-    #     model.eval()
-
-    #     from data.lm_loader import DataLoaderArgs  # lazy import to avoid cycles
-
-    #     dataloader_args = DataLoaderArgs(**filter_kwargs_for(DataLoaderArgs, metadata["dataloader_args"]))
-    #     tokenizer = Tokenizer(tokenizer_path or dataloader_args.tokenizer_path)
-    #     return model, tokenizer, metadata.get("updates", 0), device_mesh
