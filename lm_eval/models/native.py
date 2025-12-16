@@ -148,6 +148,9 @@ class NativeCausalLM(TemplateLM):
         reconstruct_max_bor: int = 3,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
+        shutdown_vllm_after_loglikelihood: bool = False,
+        shutdown_vllm_kill_children: bool = False,
+        shutdown_vllm_verbose: bool = False,
         add_boq_index: bool = True,
         
         fill_decoder_prefix_embeds: bool = True,
@@ -186,6 +189,9 @@ class NativeCausalLM(TemplateLM):
         self._save_loglikelihood_debug = bool(save_loglikelihood_debug)
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
+        self._shutdown_vllm_after_loglikelihood = bool(shutdown_vllm_after_loglikelihood)
+        self._shutdown_vllm_kill_children = bool(shutdown_vllm_kill_children)
+        self._shutdown_vllm_verbose = bool(shutdown_vllm_verbose)
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
         # Native supports tensor-parallel only; data-parallel (world_size > model_parallel_size) will duplicate work.
@@ -306,6 +312,9 @@ class NativeCausalLM(TemplateLM):
         empty_cache: bool = True,
         ipc_collect: bool = True,
         synchronize: bool = True,
+        verbose: bool = True,
+        terminate_children: bool = False,
+        terminate_timeout_s: float = 10.0,
     ) -> None:
         """
         Best-effort release of GPU memory held by `self._vllm_manager`.
@@ -314,6 +323,32 @@ class NativeCausalLM(TemplateLM):
         - vLLM does not guarantee a perfect "shutdown" API across versions.
         - This helper drops references, triggers GC, and clears CUDA caching allocator.
         """
+        def _call(obj: Any, name: str) -> None:
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"WARNING: vLLM cleanup failed calling {type(obj).__name__}.{name}(): {e}", file=sys.stderr)
+
+        def _get(obj: Any, path: List[str]) -> Any:
+            cur = obj
+            for p in path:
+                cur = getattr(cur, p, None)
+                if cur is None:
+                    return None
+            return cur
+
+        before_alloc = before_reserved = None
+        before_free = before_total = None
+        if verbose and torch.cuda.is_available():
+            try:
+                before_alloc = int(torch.cuda.memory_allocated())
+                before_reserved = int(torch.cuda.memory_reserved())
+                before_free, before_total = torch.cuda.mem_get_info()
+            except Exception:
+                pass
+
         mgr = getattr(self, "_vllm_manager", None)
         if mgr is None:
             return
@@ -321,9 +356,32 @@ class NativeCausalLM(TemplateLM):
         try:
             engine_wrapper = getattr(mgr, "engine_wrapper", None)
             if engine_wrapper is not None:
+                engine = getattr(engine_wrapper, "engine", None)
+                if engine is not None:
+                    # Try common top-level hooks.
+                    _call(engine, "shutdown")
+                    _call(engine, "close")
+                    _call(engine, "__del__")
+
+                    # Try common nested engines/executors across vLLM versions.
+                    for sub_path in (
+                        ["llm_engine"],
+                        ["llm_engine", "engine_core"],
+                        ["llm_engine", "executor"],
+                        ["llm_engine", "model_executor"],
+                        ["engine_core"],
+                        ["executor"],
+                        ["model_executor"],
+                    ):
+                        sub = _get(engine, list(sub_path))
+                        if sub is not None:
+                            _call(sub, "shutdown")
+                            _call(sub, "close")
+                            _call(sub, "__del__")
+
                 try:
                     # Our wrapper supports a soft shutdown (drops Python refs).
-                    engine_wrapper.shutdown()
+                    _call(engine_wrapper, "shutdown")
                 except Exception as e:
                     print(f"WARNING: Failed to shutdown vLLM, Error: {e}", file=sys.stderr)
                 try:
@@ -333,6 +391,10 @@ class NativeCausalLM(TemplateLM):
                         engine_wrapper.engine = None
                 except Exception as e:
                     print(f"WARNING: Failed to set engine_wrapper.engine to None, Error: {e}", file=sys.stderr)
+                try:
+                    mgr.engine_wrapper = None
+                except Exception:
+                    pass
 
             # Optional vLLM-side cleanup when available.
             try:
@@ -342,26 +404,72 @@ class NativeCausalLM(TemplateLM):
             except Exception as e:
                 print(f"WARNING: Failed to destroy model parallel, Error: {e}", file=sys.stderr)
                 pass
+            try:
+                from vllm.distributed.parallel_state import destroy_model_parallel as destroy_mp2  # type: ignore
+
+                destroy_mp2()
+            except Exception:
+                pass
         finally:
+            if terminate_children:
+                try:
+                    import multiprocessing as mp
+
+                    children = mp.active_children()
+                    if verbose and children:
+                        print(f"[native] vLLM shutdown: terminating {len(children)} child processes", file=sys.stderr)
+                    for p in children:
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                    for p in children:
+                        try:
+                            p.join(timeout=float(terminate_timeout_s))
+                        except Exception:
+                            pass
+                    for p in children:
+                        try:
+                            if p.is_alive():
+                                p.kill()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"WARNING: Failed to terminate child processes, Error: {e}", file=sys.stderr)
+
             self._vllm_manager = None
             try:
                 gc.collect()
-            except Exception:
+            except Exception as e:
+                print(f"WARNING: Failed to collect garbage, Error: {e}", file=sys.stderr)
                 pass
             if torch.cuda.is_available():
                 try:
                     if synchronize:
                         torch.cuda.synchronize()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"WARNING: Failed to synchronize, Error: {e}", file=sys.stderr)
                 try:
                     if ipc_collect:
                         torch.cuda.ipc_collect()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"WARNING: Failed to ipc collect, Error: {e}", file=sys.stderr)
                 try:
                     if empty_cache:
                         torch.cuda.empty_cache()
+                except Exception as e:
+                    print(f"WARNING: Failed to empty cache, Error: {e}", file=sys.stderr)
+
+            if verbose and torch.cuda.is_available():
+                try:
+                    after_alloc = int(torch.cuda.memory_allocated())
+                    after_reserved = int(torch.cuda.memory_reserved())
+                    after_free, after_total = torch.cuda.mem_get_info()
+                    print(
+                        f"[native] vLLM shutdown mem: allocated {before_alloc}->{after_alloc}, "
+                        f"reserved {before_reserved}->{after_reserved}, free {before_free}->{after_free} / total {after_total}",
+                        file=sys.stderr,
+                    )
                 except Exception:
                     pass
 
@@ -495,74 +603,99 @@ class NativeCausalLM(TemplateLM):
         tensor = torch.tensor(padded, device=self.device, dtype=torch.long)
         return tensor, tensor  # attention mask not used
 
-    def _compress_tokens(self, enc_tokens_flat: torch.Tensor, enc_cu: torch.Tensor, enc_mem_mask_flat: torch.Tensor) -> torch.Tensor:
+    def _compress_tokens(
+        self,
+        enc_tokens_flat: torch.Tensor,
+        enc_cu: torch.Tensor,
+        enc_mem_mask_flat: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Compress a packed encoder sequence; chunk per sample to keep each encoder call reasonably sized.
-        """
-        max_len = getattr(self.model.args, "max_seq_len", None)
-        has_multi = hasattr(self.model, "compress_multi_batches")
+        Compress packed encoder tokens into compression vectors.
 
-        # Fallback: no max_len info, single call
-        if max_len is None:
-            max_seq = int(torch.diff(enc_cu).max().item()) if len(enc_cu) > 1 else enc_tokens_flat.numel()
-            ctx = {
-                "cu_seqlens_q": enc_cu,
-                "cu_seqlens_k": enc_cu,
-                "max_seqlen_q": max_seq,
-                "max_seqlen_k": max_seq,
-                "positions": torch.arange(enc_tokens_flat.numel(), device=self.device, dtype=torch.int32),
-                "encoder_mem_mask": enc_mem_mask_flat,
-            }
-            return self.model.compress(encoder_tokens=enc_tokens_flat, encoder_context=ctx)
+        Important:
+        - We must never create a single encoder sequence whose `positions` exceed the model max length
+          (e.g. 8192), otherwise rotary embedding indexing will fail.
+        - We also must not split a (span_tokens + placeholders) unit across chunks, or the placeholder
+          tokens would not attend to their corresponding span.
+
+        Strategy:
+        - For each packed sample, drop placeholder tokens (mask=True) to recover raw span tokens.
+        - Chunk raw tokens by `max_mem_span_len`, append `num_comp` placeholders per chunk, and run
+          `compress_multi_batches` (preferred) on those per-span micro-batches.
+        """
+        num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
+        if num_comp <= 0:
+            return torch.empty(0, device=self.device, dtype=self._dtype)
+
+        span_limit = getattr(self.model.args, "max_mem_span_len", None)
+        if span_limit is None or span_limit <= 0:
+            span_limit = self._max_mem_span_len_override or self.max_length
+        span_limit = max(1, int(span_limit))
+
+        has_multi = hasattr(self.model, "compress_multi_batches")
 
         enc_tokens_mb: List[torch.Tensor] = []
         enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
-        for i in range(len(enc_cu) - 1):
-            s, e = enc_cu[i].item(), enc_cu[i + 1].item()
+
+        # Build per-span micro-batches (each <= max_mem_span_len + num_comp tokens).
+        for i in range(max(0, int(enc_cu.numel()) - 1)):
+            s = int(enc_cu[i].item())
+            e = int(enc_cu[i + 1].item())
             seq_tokens = enc_tokens_flat[s:e]
             seq_mask = enc_mem_mask_flat[s:e]
+
+            # Recover raw tokens (drop placeholder positions).
             if seq_tokens.numel() == 0:
-                enc_tokens_mb.append(torch.empty(0, device=self.device, dtype=torch.long))
-                enc_ctx_mb.append({
-                    "cu_seqlens_q": torch.tensor([0, 0], device=self.device, dtype=torch.int32),
-                    "cu_seqlens_k": torch.tensor([0, 0], device=self.device, dtype=torch.int32),
-                    "max_seqlen_q": 0,
-                    "max_seqlen_k": 0,
-                    "positions": torch.empty(0, device=self.device, dtype=torch.int32),
-                    "encoder_mem_mask": torch.empty(0, device=self.device, dtype=torch.bool),
-                })
-                continue
-            for j in range(0, seq_tokens.numel(), max_len):
-                chunk_tokens = seq_tokens[j : j + max_len]
-                chunk_mask = seq_mask[j : j + max_len]
-                chunk_len = chunk_tokens.numel()
-                cu = torch.tensor([0, chunk_len], device=self.device, dtype=torch.int32)
-                enc_tokens_mb.append(chunk_tokens)
-                enc_ctx_mb.append({
-                    "cu_seqlens_q": cu,
-                    "cu_seqlens_k": cu,
-                    "max_seqlen_q": chunk_len,
-                    "max_seqlen_k": chunk_len,
-                    "positions": torch.arange(chunk_len, device=self.device, dtype=torch.int32),
-                    "encoder_mem_mask": chunk_mask,
-                })
+                raw = torch.empty(0, device=self.device, dtype=torch.long)
+            else:
+                raw = seq_tokens[~seq_mask]
+
+            # Ensure at least one span so downstream slot accounting stays consistent.
+            span_chunks: List[torch.Tensor]
+            if raw.numel() == 0:
+                span_chunks = [raw]
+            else:
+                span_chunks = [raw[j : j + span_limit] for j in range(0, raw.numel(), span_limit)]
+
+            for chunk in span_chunks:
+                # tokens + placeholders
+                enc_seq = torch.cat(
+                    [chunk.to(dtype=torch.long), torch.full((num_comp,), 0, device=self.device, dtype=torch.long)],
+                    dim=0,
+                )
+                enc_mask_seq = torch.cat(
+                    [
+                        torch.zeros(int(chunk.numel()), device=self.device, dtype=torch.bool),
+                        torch.ones(num_comp, device=self.device, dtype=torch.bool),
+                    ],
+                    dim=0,
+                )
+                clen = int(enc_seq.numel())
+                cu = torch.tensor([0, clen], device=self.device, dtype=torch.int32)
+                enc_tokens_mb.append(enc_seq)
+                enc_ctx_mb.append(
+                    {
+                        "cu_seqlens_q": cu,
+                        "cu_seqlens_k": cu,
+                        "max_seqlen_q": clen,
+                        "max_seqlen_k": clen,
+                        "positions": torch.arange(clen, device=self.device, dtype=torch.int32),
+                        "encoder_mem_mask": enc_mask_seq,
+                    }
+                )
+
+        if not enc_tokens_mb:
+            return torch.empty(0, device=self.device, dtype=self._dtype)
 
         with torch.autocast(device_type="cuda", dtype=self._dtype):
             if has_multi:
                 return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
-            enc_tokens_cat = torch.cat(enc_tokens_mb, dim=0)
-            enc_masks_cat = torch.cat([ctx["encoder_mem_mask"] for ctx in enc_ctx_mb], dim=0)
-            cu = torch.tensor([0] + [t.numel() for t in enc_tokens_mb], device=self.device, dtype=torch.int32).cumsum(0)
-            max_seq = max(t.numel() for t in enc_tokens_mb) if enc_tokens_mb else 0
-            ctx = {
-                "cu_seqlens_q": cu,
-                "cu_seqlens_k": cu,
-                "max_seqlen_q": max_seq,
-                "max_seqlen_k": max_seq,
-                "positions": torch.arange(enc_tokens_cat.numel(), device=self.device, dtype=torch.int32),
-                "encoder_mem_mask": enc_masks_cat,
-            }
-            return self.model.compress(encoder_tokens=enc_tokens_cat, encoder_context=ctx)
+
+            # Fallback: run per-span compression sequentially to keep positions valid.
+            outs: List[torch.Tensor] = []
+            for t, ctx in zip(enc_tokens_mb, enc_ctx_mb):
+                outs.append(self.model.compress(encoder_tokens=t, encoder_context=ctx))
+            return torch.cat(outs, dim=0) if outs else torch.empty(0, device=self.device, dtype=self._dtype)
 
     def _compress_plain_sequence(self, tokens: torch.Tensor, num_comp: Optional[int] = None) -> torch.Tensor:
         """
@@ -614,19 +747,12 @@ class NativeCausalLM(TemplateLM):
         with torch.autocast(device_type="cuda", dtype=self._dtype):
             if has_multi:
                 return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
-            enc_tokens_cat = torch.cat(enc_tokens_mb, dim=0)
-            enc_masks_cat = torch.cat([ctx["encoder_mem_mask"] for ctx in enc_ctx_mb], dim=0)
-            cu = torch.tensor([0] + [t.numel() for t in enc_tokens_mb], device=self.device, dtype=torch.int32).cumsum(0)
-            max_seq = max(t.numel() for t in enc_tokens_mb)
-            ctx = {
-                "cu_seqlens_q": cu,
-                "cu_seqlens_k": cu,
-                "max_seqlen_q": max_seq,
-                "max_seqlen_k": max_seq,
-                "positions": torch.arange(enc_tokens_cat.numel(), device=self.device, dtype=torch.int32),
-                "encoder_mem_mask": enc_masks_cat,
-            }
-            return self.model.compress(encoder_tokens=enc_tokens_cat, encoder_context=ctx)
+
+            # Fallback: run per-span compression sequentially to keep positions valid.
+            outs: List[torch.Tensor] = []
+            for t, ctx in zip(enc_tokens_mb, enc_ctx_mb):
+                outs.append(self.model.compress(encoder_tokens=t, encoder_context=ctx))
+            return torch.cat(outs, dim=0) if outs else torch.empty(0, device=self.device, dtype=self._dtype)
 
     # def _build_prompt_embeds(
     #     self,
@@ -858,6 +984,7 @@ class NativeCausalLM(TemplateLM):
             return self._loglikelihood_tokens_compress_answer(requests, disable_tqdm, override_bs)
         if self._mode == "reconstruct_first" and hasattr(self.model, "compression_embeddings"):
             return self._loglikelihood_tokens_reconstruct_first(requests, disable_tqdm)
+
         res: List[Tuple[float, bool]] = []
         bs = override_bs or self.batch_size
         try:
@@ -1528,10 +1655,6 @@ class NativeCausalLM(TemplateLM):
             max_comp_tokens = max(0, self.max_length - total_static - glen)
             span_cost = num_comp if decoder_memory_layout == "single" else (num_comp + 2)
             max_chunks = max_comp_tokens // max(1, span_cost) if num_comp > 0 else 0
-            if num_comp > 0 and model_max_len:
-                per_span = max(1, max_mem_span_len + num_comp)
-                enc_budget_chunks = max(1, model_max_len // per_span)
-                max_chunks = min(max_chunks, enc_budget_chunks) if max_chunks > 0 else enc_budget_chunks
             if max_chunks <= 0:
                 max_chunks = 1
             ctx_spans = ctx_spans[-max_chunks:]
@@ -1613,50 +1736,39 @@ class NativeCausalLM(TemplateLM):
         except Exception:
             bs = 1
 
-        num_comp = getattr(self.model.args, "num_compression_tokens", 0)
-        # Use a valid vocab id for placeholder slots; pad_id is -100 in our tokenizer,
-        # which would break embedding lookup.
+        num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
         placeholder_id = 0
-        # Use model-configured memory span if present, otherwise fall back to max_length.
-        max_mem_span_len = getattr(self.model.args, "max_mem_span_len", self.max_length)
-        # warning if not load from max_mem_span_len
-        print(f"Using max_mem_span_len={max_mem_span_len} for compress_answer loglikelihood.")
-        
+        max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", self.max_length))
         include_bor = False
-        static_count = 2 if self._add_boq_index and include_bor else 1 if include_bor or self._add_boq_index else 0
-        static_count += 1 # for the eos
-        
-        static_count += 10 # for safety
-        
-        
-        def max_x(all_, maxlen, num_comp,max_mem_span_len, static_count, cont_len):
-            if all_ + static_count + cont_len <= maxlen:
-                return all_ // max_mem_span_len * max_mem_span_len  # x 取最大 512 倍数
-            # x // 512 * (num_comp + 2) + (all - x) < = maxlen - static_count - cont_len, x is raw_comp_len
-            A = all_ + static_count + cont_len 
-            B = max_mem_span_len - (num_comp + 2)
-            # A - B * k <= maxlen -> k >= (A - maxlen) / B
-            
-            k = math.ceil((all_ - maxlen + static_count + cont_len) / (max_mem_span_len - (num_comp + 2)))
-            print("all_, maxlen, num_comp,max_mem_span_len, static_count, cont_len", all_, maxlen, num_comp,max_mem_span_len, static_count, cont_len)
-            # print("k", k)
-            # print(" k * max_mem_span_len ", k * max_mem_span_len)
-            print("all_ - k * max_mem_span_len ", all_ - k * max_mem_span_len)
-            print("all_ - k * max_mem_span_len + k * (num_comp + 2) ", all_ - k * max_mem_span_len + k * (num_comp + 2))
-            return max(0, k * max_mem_span_len)
-        
-        
-        # if self._fill_decoder_prefix_embeds is True, we need to compute the needed comp slots for the decoder prefix
-        def compute_needed_comp_slots(prompt_tokens: List[int],cont_len: int) -> int:
-            max_len = self.max_length
-            total_spans = len(prompt_tokens) // max_mem_span_len
-            if total_spans * (num_comp + 2) + static_count > max_len:
-                return prompt_tokens, []
-            
-            raw_comp_len = max_x(len(prompt_tokens), max_len, num_comp, max_mem_span_len, static_count, cont_len)
-            
-            suffix_tokens = prompt_tokens[raw_comp_len:]
-            return prompt_tokens[:raw_comp_len],suffix_tokens
+
+        # Decide how much of the context to compress (prefix) vs keep raw (suffix),
+        # without ever truncating continuation tokens.
+        def _split_ctx_for_compression(ctx_tokens: List[int], cont_len: int) -> Tuple[List[int], List[int]]:
+            if not ctx_tokens:
+                return [], []
+            max_len = int(self.max_length)
+            span_cost = num_comp + 2  # decoder cost per span: BOM + slots + EOM
+            saving = max_mem_span_len - span_cost
+            if saving <= 0:
+                # No compression benefit; let the span selector drop old spans.
+                return ctx_tokens, []
+
+            raw_len = len(ctx_tokens)
+            total_spans = math.ceil(raw_len / max_mem_span_len)
+            # If even compressing all spans can't fit, keep no suffix and let the builder drop spans.
+            if total_spans * span_cost + cont_len > max_len:
+                return ctx_tokens, []
+
+            # Need k spans compressed so that:
+            #   raw_len + cont_len - k*(max_mem_span_len - (num_comp+2)) <= max_len
+            need = raw_len + cont_len - max_len
+            if need <= 0:
+                k = raw_len // max_mem_span_len  # compress all full spans; keep remainder as suffix
+            else:
+                k = int(math.ceil(need / float(saving)))
+            k = max(0, min(k, raw_len // max_mem_span_len))
+            raw_comp_len = k * max_mem_span_len
+            return ctx_tokens[:raw_comp_len], ctx_tokens[raw_comp_len:]
         
         
 
@@ -1669,13 +1781,12 @@ class NativeCausalLM(TemplateLM):
             # then score only the continuation tokens.
             prompt_tokens_override: List[List[int]] = [ctx for (_, ctx, _) in chunk]
             cont_tokens_list: List[List[int]] = [cont for (_, _, cont) in chunk]
-            # breakpoint()
             
-            prompt_tokens_list, suffix_tokens_list = zip(*[compute_needed_comp_slots(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)])
-            
-            # breakpoint()
-            if self._fill_decoder_prefix_embeds is True:
-                prompt_tokens_override = prompt_tokens_list
+            if self._fill_decoder_prefix_embeds:
+                prompt_tokens_list, suffix_tokens_list = zip(
+                    *[_split_ctx_for_compression(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)]
+                )
+                prompt_tokens_override = list(prompt_tokens_list)
 
 
             # prompt_tokens, suffix_tokens = compute_needed_comp_slots(prompt_tokens_override[0])
@@ -1690,7 +1801,6 @@ class NativeCausalLM(TemplateLM):
 
             if not nonempty_idxs:
                 res.extend(chunk_results)
-                print("no nonempty_idxs")
                 continue
 
             dummy_prompts = [""] * len(chunk)
@@ -1710,18 +1820,23 @@ class NativeCausalLM(TemplateLM):
             
             # Suffix tokens (uncompressed tail of the prompt) can be ragged across the batch.
             # Embed per-sample to avoid creating a rectangular tensor.
+            d_model = int(getattr(self.model.args, "d_model", 0))
             suffix_embeds_list: List[torch.Tensor] = []
             for suffix in suffix_tokens_list:
                 if suffix:
-                    st = torch.tensor(suffix, device=self.device, dtype=torch.long)
+                    st = torch.tensor(list(suffix), device=self.device, dtype=torch.long)
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
                         se = self.model.tok_embeddings(st).to(dtype=self._dtype)
                     suffix_embeds_list.append(se)
                 else:
-                    suffix_embeds_list.append(None)
-                    # suffix_embeds_list.append(torch.empty((0, self.model.args.d_model), device=self.device, dtype=self._dtype))
+                    suffix_embeds_list.append(torch.empty((0, d_model), device=self.device, dtype=self._dtype))
+
+            meta_n_spans = metainfo.get("n_spans", [1] * len(chunk)) if metainfo else [1] * len(chunk)
 
             seq_embeds: List[torch.Tensor] = []
+            seq_targets: List[torch.Tensor] = []
+            seq_loss_masks: List[torch.Tensor] = []
+            seq_comp_masks: List[torch.Tensor] = []
             prefix_lens: List[int] = []
             cont_lens: List[int] = []
             cont_targets: List[torch.Tensor] = []
@@ -1731,8 +1846,11 @@ class NativeCausalLM(TemplateLM):
                 pe0 = prefix_embeds_list[i]
                 if pe0 is None:
                     continue
+
+                # Prefix consists of memory blocks + raw suffix tokens (kept uncompressed).
                 suffix_e = suffix_embeds_list[i]
                 pe = torch.cat([pe0, suffix_e], dim=0) if suffix_e.numel() else pe0
+
                 cont = cont_tokens_list[i]
                 cont_len = len(cont)
                 if cont_len <= 0:
@@ -1746,7 +1864,38 @@ class NativeCausalLM(TemplateLM):
                 cont_t = torch.tensor(cont, device=self.device, dtype=torch.long)
                 with torch.autocast(device_type="cuda", dtype=self._dtype):
                     cont_e = self.model.tok_embeddings(cont_t).to(dtype=self._dtype)
-                seq_embeds.append(torch.cat([pe, cont_e], dim=0))
+
+                full_embeds = torch.cat([pe, cont_e], dim=0)
+                total_len = int(full_embeds.shape[0])
+
+                # Decoder token ids (for shifting/targets). Memory placeholders use a valid vocab id.
+                n_spans = int(meta_n_spans[i]) if i < len(meta_n_spans) else 1
+                prefix_ids = ([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX]) * n_spans
+                suffix_ids = list(suffix_tokens_list[i]) if suffix_tokens_list[i] else []
+                token_ids = prefix_ids + suffix_ids + list(cont)
+                if len(token_ids) != total_len:
+                    continue
+
+                targets_ids = token_ids[1:] + [int(self.eos_token_id)]
+                targets_t = torch.tensor(targets_ids, device=self.device, dtype=torch.long)
+
+                # Score only continuation: first continuation token is predicted at position prefix_len-1.
+                score_start = prefix_len - 1
+                score_end = score_start + cont_len
+                if score_start < 0 or score_end > total_len:
+                    continue
+                loss_mask = torch.zeros(total_len, device=self.device, dtype=torch.bool)
+                loss_mask[score_start:score_end] = True
+
+                # compression_token_mask: True for placeholder slots in memory blocks, False elsewhere.
+                comp_mask_prefix = ([False] + ([True] * num_comp) + [False]) * n_spans
+                comp_mask = comp_mask_prefix + ([False] * (total_len - len(comp_mask_prefix)))
+                comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+
+                seq_embeds.append(full_embeds)
+                seq_targets.append(targets_t)
+                seq_loss_masks.append(loss_mask)
+                seq_comp_masks.append(comp_mask_t)
                 prefix_lens.append(prefix_len)
                 cont_lens.append(cont_len)
                 cont_targets.append(cont_t)
@@ -1754,22 +1903,23 @@ class NativeCausalLM(TemplateLM):
 
             if not seq_embeds:
                 res.extend(chunk_results)
-                print("no seq_embeds")
                 continue
 
             dec_lens = [int(t.shape[0]) for t in seq_embeds]
             dec_cu = torch.tensor([0] + list(torch.tensor(dec_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
             max_dec = max(dec_lens) if dec_lens else 0
             dec_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens], dim=0)
+            comp_mask_flat = torch.cat(seq_comp_masks, dim=0)
             dec_ctx = {
                 "cu_seqlens_q": dec_cu,
                 "cu_seqlens_k": dec_cu,
                 "max_seqlen_q": max_dec,
                 "max_seqlen_k": max_dec,
                 "positions": dec_positions,
-                # Not used by attention; kept for completeness.
-                "compression_token_mask": torch.zeros(sum(dec_lens), device=self.device, dtype=torch.bool),
+                "compression_token_mask": comp_mask_flat,
             }
+            
+            
             embeds_flat = torch.cat(seq_embeds, dim=0)
             with torch.autocast(device_type="cuda", dtype=self._dtype):
                 h = embeds_flat
@@ -1782,10 +1932,6 @@ class NativeCausalLM(TemplateLM):
                 from distributed.tensor_parallel import gather_from_model_parallel_region
 
                 logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
-                
-            breakpoint()
-            self.shutdown_vllm_manager()
-            breakpoint()
 
             logprobs = F.log_softmax(logits.float(), dim=-1)
 
@@ -1808,7 +1954,7 @@ class NativeCausalLM(TemplateLM):
                 token_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
                 logprob = float(token_lp.sum().item()) if token_lp.numel() > 0 else float("-inf")
                 greedy = bool((lp.argmax(dim=-1) == tgt).all().item()) if token_lp.numel() > 0 else False
-                chunk_results[orig_idx] = (logprob, False)
+                chunk_results[orig_idx] = (logprob, greedy)
 
             res.extend(chunk_results)
         # Safety: if we somehow produced fewer responses than requests, pad with -inf.
@@ -2054,6 +2200,13 @@ class NativeCausalLM(TemplateLM):
                 recon_tokens_list[i] = recon_tokens
                 recon_infos[i] = {"bor_count": bor_count, "stop_reason": stop_reason or "max_recon"}
 
+
+            breakpoint()
+            if self._vllm_manager is not None:
+                # self._vllm_manager.unload()
+                # breakpoint()
+                self.shutdown_vllm_manager()
+                # breakpoint()
             # Build decoder with recon + continuation; defer scoring so we can batch PPL computation.
             dec_tokens_full: List[torch.Tensor] = []
             comp_masks_full: List[torch.Tensor] = []
@@ -2161,49 +2314,90 @@ class NativeCausalLM(TemplateLM):
                         for layer in self.model.layers:
                             h = layer(h, context=dec_ctx_sub)
                         h = self.model.norm(h)
-                        logits = self.model.output(h).float()
                     else:
-                        logits = self.model(
-                            encoder_tokens=enc_tokens_flat_sub,
-                            encoder_context=enc_ctx_sub,
-                            decoder_tokens=dec_tokens_flat_sub,
-                            decoder_context=dec_ctx_sub,
-                            last_hidden_only=False,
-                        )
+                        raise NotImplementedError("reconstruct_first loglikelihood only supports compression models in this harness.")
 
-                if self._model_parallel_group is not None:
-                    from distributed.tensor_parallel import gather_from_model_parallel_region
+                # Build packed targets + loss masks to score only the continuation segment.
+                sub_targets = [targets_full[k] for k in idxs]
+                targets_flat_sub = torch.cat(sub_targets, dim=0) if sub_targets else torch.empty(0, device=self.device, dtype=torch.long)
 
-                    logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
-
-                logprobs = F.log_softmax(logits.float(), dim=-1)
-
+                loss_masks_sub: List[torch.Tensor] = []
                 for j, sample_idx in enumerate(idxs):
-                    dec_start = int(dec_cu_sub[j].item())
                     dec_len = int(dec_lens_sub[j])
                     cont_off = int(cont_offsets[sample_idx])
                     cont_len = int(cont_lengths[sample_idx])
-                    tgt = targets_full[sample_idx]
+                    mask = torch.zeros(dec_len, device=self.device, dtype=torch.bool)
+                    if cont_len > 0 and cont_off > 0:
+                        rel_start = cont_off - 1
+                        rel_end = rel_start + cont_len
+                        if 0 <= rel_start < rel_end <= dec_len:
+                            mask[rel_start:rel_end] = True
+                    loss_masks_sub.append(mask)
+                loss_mask_flat_sub = torch.cat(loss_masks_sub, dim=0) if loss_masks_sub else torch.empty(0, device=self.device, dtype=torch.bool)
 
-                    rel_start = cont_off - 1
-                    rel_end = rel_start + cont_len
-                    if cont_len <= 0 or cont_off <= 0 or rel_end > dec_len:
-                        chunk_results[sample_idx] = (float("-inf"), False)
+                # The fused CE kernel requires `n_rows % cross_entropy_chunk == 0`.
+                ce_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 1))
+                pad = (-int(h.shape[0])) % ce_chunk if ce_chunk > 1 else 0
+                if pad:
+                    h = torch.cat([h, torch.zeros((pad, h.shape[1]), device=h.device, dtype=h.dtype)], dim=0)
+                    targets_flat_sub = torch.cat(
+                        [targets_flat_sub, torch.full((pad,), int(self.eot_token_id), device=self.device, dtype=torch.long)], dim=0
+                    )
+                    loss_mask_flat_sub = torch.cat(
+                        [loss_mask_flat_sub, torch.zeros((pad,), device=self.device, dtype=torch.bool)], dim=0
+                    )
+
+                sample_ranges_sub: List[Tuple[int, int]] = [
+                    (int(dec_cu_sub[j].item()), int(dec_cu_sub[j + 1].item())) for j in range(len(idxs))
+                ]
+
+                with torch.autocast(device_type="cuda", dtype=self._dtype):
+                    loss_sum, n_tok, per_stats = self.model.compute_loss(
+                        h,
+                        targets_flat_sub,
+                        loss_mask_flat_sub,
+                        sample_ranges_sub,
+                        process_group=self._model_parallel_group,
+                    )
+
+                per_losses = (per_stats or {}).get("losses", [])
+                per_tokens = (per_stats or {}).get("tokens", [])
+
+                # Best-effort greedy check (skip under tensor-parallel).
+                greedy_flags: List[bool] = [False] * len(idxs)
+                if self._model_parallel_group is None:
+                    for j, sample_idx in enumerate(idxs):
+                        cont_off = int(cont_offsets[sample_idx])
+                        cont_len = int(cont_lengths[sample_idx])
+                        if cont_len <= 0 or cont_off <= 0:
+                            greedy_flags[j] = True
+                            continue
+                        rel_start = cont_off - 1
+                        rel_end = rel_start + cont_len
+                        start, end = sample_ranges_sub[j]
+                        if rel_start < 0 or rel_end > (end - start):
+                            greedy_flags[j] = False
+                            continue
+                        h_pred = h[start + rel_start : start + rel_end]
+                        tgt_slice = targets_full[sample_idx][rel_start:rel_end]
+                        ok = True
+                        step = 64
+                        for k in range(0, int(h_pred.shape[0]), step):
+                            hk = h_pred[k : k + step]
+                            tk = tgt_slice[k : k + step]
+                            logits_k = self.model.output(hk).float()
+                            pred_k = logits_k.argmax(dim=-1)
+                            if not bool((pred_k == tk).all().item()):
+                                ok = False
+                                break
+                        greedy_flags[j] = ok
+
+                for j, sample_idx in enumerate(idxs):
+                    if j >= len(per_losses):
                         continue
-
-                    lp_start = dec_start + rel_start
-                    lp_end = lp_start + cont_len
-                    lp_slice = logprobs[lp_start:lp_end]
-                    tgt_slice = tgt[rel_start:rel_end]
-
-                    if lp_slice.ndim != 2 or lp_slice.shape[0] != tgt_slice.numel() or tgt_slice.numel() == 0:
-                        chunk_results[sample_idx] = (float("-inf"), False)
-                        continue
-
-                    token_lp = lp_slice.gather(-1, tgt_slice.unsqueeze(-1)).squeeze(-1)
-                    logprob = float(token_lp.sum().item())
-                    greedy = bool((lp_slice.argmax(dim=-1) == tgt_slice).all().item())
-                    chunk_results[sample_idx] = (logprob, greedy)
+                    sample_loss = per_losses[j]
+                    logprob = -float(sample_loss.item()) if hasattr(sample_loss, "item") else float("-inf")
+                    chunk_results[sample_idx] = (logprob, bool(greedy_flags[j]))
 
             for i in range(len(dec_tokens_full)):
                 logprob, greedy = chunk_results[i]
