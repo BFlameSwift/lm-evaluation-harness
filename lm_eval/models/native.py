@@ -131,7 +131,7 @@ class NativeCausalLM(TemplateLM):
         vllm_gpu_memory_utilization: float = 0.4,
         vllm_output_root: Optional[str] = None,
         # for reconstruction related
-        vllm_reconstruct_batch_size: int = 4000,
+        vllm_reconstruct_batch_size: int = 20,
         ppl_batch_size: Optional[int] = 8,
         # for compression related
         compress_threshold: int = 8192,
@@ -589,6 +589,42 @@ class NativeCausalLM(TemplateLM):
         return self._tokenizer.decode(tokens)
     def tok_decode_w_special_tokens(self, tokens: List[int]) -> str:
         return self._tokenizer.decode_w_special_tokens(tokens)
+
+    @torch.no_grad()
+    def _chunked_logprob_and_greedy(
+        self,
+        hidden: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        chunk_size: int = 32,
+    ) -> Tuple[float, bool]:
+        """
+        Compute sum log-prob and greedy-match for token targets, using chunked full-vocab
+        projection to avoid OOM.
+
+        hidden: [N, d_model] (already normalized)
+        targets: [N] (token ids)
+        """
+        n = int(targets.numel())
+        if n == 0:
+            return 0.0, True
+        chunk_size = max(1, int(chunk_size))
+        total_lp = 0.0
+        greedy_ok = True
+        for s in range(0, n, chunk_size):
+            e = min(s + chunk_size, n)
+            h = hidden[s:e]
+            t = targets[s:e]
+            logits = self.model.output(h).float()
+            if self._model_parallel_group is not None:
+                from distributed.tensor_parallel import gather_from_model_parallel_region
+
+                logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
+            logprobs = F.log_softmax(logits, dim=-1)
+            total_lp += float(logprobs.gather(-1, t.unsqueeze(-1)).squeeze(-1).sum().item())
+            if greedy_ok:
+                greedy_ok = bool((logprobs.argmax(dim=-1) == t).all().item())
+        return total_lp, greedy_ok
     
     def get_full_text_apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
         
@@ -981,9 +1017,21 @@ class NativeCausalLM(TemplateLM):
     ) -> List[Tuple[float, bool]]:
         # Optional mode: compress the context into memory first, then score the answer.
         if self._mode == "compress_answer" and hasattr(self.model, "compression_embeddings"):
-            return self._loglikelihood_tokens_compress_answer(requests, disable_tqdm, override_bs)
+            out = self._loglikelihood_tokens_compress_answer(requests, disable_tqdm, override_bs)
+            if getattr(self, "_shutdown_vllm_after_loglikelihood", False) and getattr(self, "_vllm_manager", None) is not None:
+                self.shutdown_vllm_manager(
+                    verbose=bool(getattr(self, "_shutdown_vllm_verbose", True)),
+                    terminate_children=bool(getattr(self, "_shutdown_vllm_kill_children", False)),
+                )
+            return out
         if self._mode == "reconstruct_first" and hasattr(self.model, "compression_embeddings"):
-            return self._loglikelihood_tokens_reconstruct_first(requests, disable_tqdm)
+            out = self._loglikelihood_tokens_reconstruct_first(requests, disable_tqdm)
+            if getattr(self, "_shutdown_vllm_after_loglikelihood", False) and getattr(self, "_vllm_manager", None) is not None:
+                self.shutdown_vllm_manager(
+                    verbose=bool(getattr(self, "_shutdown_vllm_verbose", True)),
+                    terminate_children=bool(getattr(self, "_shutdown_vllm_kill_children", False)),
+                )
+            return out
 
         res: List[Tuple[float, bool]] = []
         bs = override_bs or self.batch_size
@@ -1781,12 +1829,14 @@ class NativeCausalLM(TemplateLM):
             # then score only the continuation tokens.
             prompt_tokens_override: List[List[int]] = [ctx for (_, ctx, _) in chunk]
             cont_tokens_list: List[List[int]] = [cont for (_, _, cont) in chunk]
+            suffix_tokens_list: List[List[int]] = [[] for _ in range(len(chunk))]
             
             if self._fill_decoder_prefix_embeds:
-                prompt_tokens_list, suffix_tokens_list = zip(
+                prompt_tokens_list, suffix_tokens_list_t = zip(
                     *[_split_ctx_for_compression(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)]
                 )
                 prompt_tokens_override = list(prompt_tokens_list)
+                suffix_tokens_list = list(suffix_tokens_list_t)
 
 
             # prompt_tokens, suffix_tokens = compute_needed_comp_slots(prompt_tokens_override[0])
@@ -1926,35 +1976,76 @@ class NativeCausalLM(TemplateLM):
                 for layer in self.model.layers:
                     h = layer(h, context=dec_ctx)
                 h = self.model.norm(h)
-                logits = self.model.output(h).float()
-
-            if self._model_parallel_group is not None:
-                from distributed.tensor_parallel import gather_from_model_parallel_region
-
-                logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
-
-            logprobs = F.log_softmax(logits.float(), dim=-1)
-
+            # Avoid materializing [total_tokens, vocab] logits/logprobs which can OOM for large vocab.
+            # Instead, project only the hidden states that correspond to continuation predictions.
+            score_pos_chunks: List[torch.Tensor] = []
+            score_tgt_chunks: List[torch.Tensor] = []
+            score_ranges: List[Tuple[int, int, int]] = []  # (flat_start, flat_end, orig_idx)
+            running = 0
             for j, orig_idx in enumerate(valid_map):
                 start = int(dec_cu[j].item())
-                end = int(dec_cu[j + 1].item())
                 dec_len = dec_lens[j]
                 pref_len = prefix_lens[j]
                 cont_len = cont_lens[j]
-                tgt = cont_targets[j]
-
-                sample_logprobs = logprobs[start : end - 1, :]
                 rel_start = pref_len - 1
                 rel_end = rel_start + cont_len
-                if rel_start < 0 or rel_end > dec_len - 1 or sample_logprobs.numel() == 0:
+                if rel_start < 0 or rel_end > dec_len - 1 or cont_len <= 0:
+                    score_ranges.append((running, running, orig_idx))
                     continue
-                lp = sample_logprobs[rel_start:rel_end]
-                if lp.shape[0] != cont_len:
+                pos0 = start + rel_start
+                pos1 = pos0 + cont_len
+                score_pos_chunks.append(torch.arange(pos0, pos1, device=self.device, dtype=torch.long))
+                score_tgt_chunks.append(cont_targets[j])
+                score_ranges.append((running, running + cont_len, orig_idx))
+                running += cont_len
+
+            if running == 0:
+                res.extend(chunk_results)
+                continue
+
+            score_pos = torch.cat(score_pos_chunks, dim=0)
+            score_targets = torch.cat(score_tgt_chunks, dim=0)
+            if score_targets.numel() != running or score_pos.numel() != running:
+                res.extend(chunk_results)
+                continue
+
+            h_score = h.index_select(0, score_pos)
+            del h
+            del embeds_flat
+
+            token_logprob = torch.empty(running, device=self.device, dtype=torch.float32)
+            token_greedy_ok = torch.empty(running, device=self.device, dtype=torch.bool)
+
+            rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
+            rows_per_chunk = max(8, min(rows_per_chunk, 512))
+            for off in range(0, running, rows_per_chunk):
+                off2 = min(off + rows_per_chunk, running)
+                h_chunk = h_score[off:off2]
+                tgt_chunk = score_targets[off:off2]
+
+                with torch.autocast(device_type="cuda", dtype=self._dtype):
+                    logits_chunk = self.model.output(h_chunk)
+
+                if self._model_parallel_group is not None:
+                    from distributed.tensor_parallel import gather_from_model_parallel_region
+
+                    logits_chunk = gather_from_model_parallel_region(logits_chunk, self._model_parallel_group)
+
+                token_greedy_ok[off:off2] = logits_chunk.argmax(dim=-1).to(torch.long).eq(tgt_chunk)
+
+                logits_f = logits_chunk.float()
+                lse = torch.logsumexp(logits_f, dim=-1)
+                tgt_logits = logits_f.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1)
+                token_logprob[off:off2] = (tgt_logits - lse)
+                del logits_chunk, logits_f, lse, tgt_logits
+
+            # Reduce back to per-request outputs.
+            for (s0, s1, orig_idx) in score_ranges:
+                if s1 <= s0:
                     continue
-                token_lp = lp.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-                logprob = float(token_lp.sum().item()) if token_lp.numel() > 0 else float("-inf")
-                greedy = bool((lp.argmax(dim=-1) == tgt).all().item()) if token_lp.numel() > 0 else False
-                chunk_results[orig_idx] = (logprob, greedy)
+                lp_sum = float(token_logprob[s0:s1].sum().item())
+                greedy = bool(token_greedy_ok[s0:s1].all().item())
+                chunk_results[orig_idx] = (lp_sum, greedy)
 
             res.extend(chunk_results)
         # Safety: if we somehow produced fewer responses than requests, pad with -inf.
@@ -2125,6 +2216,8 @@ class NativeCausalLM(TemplateLM):
             # Reconstruction: vLLM prompt_embeds batch if available, else per-sample greedy
             recon_tokens_list: List[List[int]] = [[] for _ in dec_prefix_list]
             recon_infos: List[dict] = [{"stop_reason": None} for _ in dec_prefix_list]
+            
+            breakpoint()
             if self._vllm_manager is not None:
                 valid_indices = [
                     i
@@ -2201,7 +2294,6 @@ class NativeCausalLM(TemplateLM):
                 recon_infos[i] = {"bor_count": bor_count, "stop_reason": stop_reason or "max_recon"}
 
 
-            breakpoint()
             if self._vllm_manager is not None:
                 # self._vllm_manager.unload()
                 # breakpoint()
