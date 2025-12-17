@@ -131,7 +131,7 @@ class NativeCausalLM(TemplateLM):
         vllm_gpu_memory_utilization: float = 0.4,
         vllm_output_root: Optional[str] = None,
         # for reconstruction related
-        vllm_reconstruct_batch_size: int = 20,
+        vllm_reconstruct_batch_size: int = 40,
         ppl_batch_size: Optional[int] = 8,
         # for compression related
         compress_threshold: int = 8192,
@@ -167,7 +167,8 @@ class NativeCausalLM(TemplateLM):
         self._vllm_manager = None
         self._vllm_output_root = vllm_output_root
         self._last_generate_debug: List[dict] = []
-        self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
+        # self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
+        self._vllm_reconstruct_batch_size = self._batch_size
         self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
@@ -474,12 +475,12 @@ class NativeCausalLM(TemplateLM):
                 except Exception:
                     pass
 
-    def __del__(self) -> None:
-        # Never raise from a destructor.
-        try:
-            self.shutdown_vllm_manager()
-        except Exception as e:
-            print(f"WARNING: Failed to shutdown vLLM in destructor, Error: {e}", file=sys.stderr)
+    # def __del__(self) -> None:
+    #     # Never raise from a destructor.
+    #     try:
+    #         self.shutdown_vllm_manager()
+    #     except Exception as e:
+    #         print(f"WARNING: Failed to shutdown vLLM in destructor, Error: {e}", file=sys.stderr)
 
     # ---- Required TemplateLM properties ----
     @property
@@ -641,99 +642,7 @@ class NativeCausalLM(TemplateLM):
         tensor = torch.tensor(padded, device=self.device, dtype=torch.long)
         return tensor, tensor  # attention mask not used
 
-    def _compress_tokens(
-        self,
-        enc_tokens_flat: torch.Tensor,
-        enc_cu: torch.Tensor,
-        enc_mem_mask_flat: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compress packed encoder tokens into compression vectors.
 
-        Important:
-        - We must never create a single encoder sequence whose `positions` exceed the model max length
-          (e.g. 8192), otherwise rotary embedding indexing will fail.
-        - We also must not split a (span_tokens + placeholders) unit across chunks, or the placeholder
-          tokens would not attend to their corresponding span.
-
-        Strategy:
-        - For each packed sample, drop placeholder tokens (mask=True) to recover raw span tokens.
-        - Chunk raw tokens by `max_mem_span_len`, append `num_comp` placeholders per chunk, and run
-          `compress_multi_batches` (preferred) on those per-span micro-batches.
-        """
-        num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
-        if num_comp <= 0:
-            return torch.empty(0, device=self.device, dtype=self._dtype)
-
-        span_limit = getattr(self.model.args, "max_mem_span_len", None)
-        if span_limit is None or span_limit <= 0:
-            span_limit = self._max_mem_span_len_override or self.max_length
-        span_limit = max(1, int(span_limit))
-
-        has_multi = hasattr(self.model, "compress_multi_batches")
-
-        enc_tokens_mb: List[torch.Tensor] = []
-        enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
-
-        # Build per-span micro-batches (each <= max_mem_span_len + num_comp tokens).
-        for i in range(max(0, int(enc_cu.numel()) - 1)):
-            s = int(enc_cu[i].item())
-            e = int(enc_cu[i + 1].item())
-            seq_tokens = enc_tokens_flat[s:e]
-            seq_mask = enc_mem_mask_flat[s:e]
-
-            # Recover raw tokens (drop placeholder positions).
-            if seq_tokens.numel() == 0:
-                raw = torch.empty(0, device=self.device, dtype=torch.long)
-            else:
-                raw = seq_tokens[~seq_mask]
-
-            # Ensure at least one span so downstream slot accounting stays consistent.
-            span_chunks: List[torch.Tensor]
-            if raw.numel() == 0:
-                span_chunks = [raw]
-            else:
-                span_chunks = [raw[j : j + span_limit] for j in range(0, raw.numel(), span_limit)]
-
-            for chunk in span_chunks:
-                # tokens + placeholders
-                enc_seq = torch.cat(
-                    [chunk.to(dtype=torch.long), torch.full((num_comp,), 0, device=self.device, dtype=torch.long)],
-                    dim=0,
-                )
-                enc_mask_seq = torch.cat(
-                    [
-                        torch.zeros(int(chunk.numel()), device=self.device, dtype=torch.bool),
-                        torch.ones(num_comp, device=self.device, dtype=torch.bool),
-                    ],
-                    dim=0,
-                )
-                clen = int(enc_seq.numel())
-                cu = torch.tensor([0, clen], device=self.device, dtype=torch.int32)
-                enc_tokens_mb.append(enc_seq)
-                enc_ctx_mb.append(
-                    {
-                        "cu_seqlens_q": cu,
-                        "cu_seqlens_k": cu,
-                        "max_seqlen_q": clen,
-                        "max_seqlen_k": clen,
-                        "positions": torch.arange(clen, device=self.device, dtype=torch.int32),
-                        "encoder_mem_mask": enc_mask_seq,
-                    }
-                )
-
-        if not enc_tokens_mb:
-            return torch.empty(0, device=self.device, dtype=self._dtype)
-
-        with torch.autocast(device_type="cuda", dtype=self._dtype):
-            if has_multi:
-                return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
-
-            # Fallback: run per-span compression sequentially to keep positions valid.
-            outs: List[torch.Tensor] = []
-            for t, ctx in zip(enc_tokens_mb, enc_ctx_mb):
-                outs.append(self.model.compress(encoder_tokens=t, encoder_context=ctx))
-            return torch.cat(outs, dim=0) if outs else torch.empty(0, device=self.device, dtype=self._dtype)
 
     def _compress_plain_sequence(self, tokens: torch.Tensor, num_comp: Optional[int] = None) -> torch.Tensor:
         """
@@ -792,20 +701,7 @@ class NativeCausalLM(TemplateLM):
                 outs.append(self.model.compress(encoder_tokens=t, encoder_context=ctx))
             return torch.cat(outs, dim=0) if outs else torch.empty(0, device=self.device, dtype=self._dtype)
 
-    # def _build_prompt_embeds(
-    #     self,
-    #     encoder_tokens: torch.Tensor,
-    #     encoder_context: dict,
-    #     decoder_prefix: torch.Tensor,
-    #     compression_mask: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     """Encode compression slots and return embeddings with slots filled."""
-    #     with torch.inference_mode():
-    #         compression_vectors = self._compress_tokens(encoder_tokens, encoder_context["cu_seqlens_q"], encoder_context["encoder_mem_mask"])
-    #     prompt_embeds = self.model.tok_embeddings(decoder_prefix.to(self.device))
-    #     prompt_embeds = prompt_embeds.to(compression_vectors.dtype)
-    #     prompt_embeds[compression_mask] = compression_vectors
-    #     return prompt_embeds
+
 
     # ---- Core model calls ----
     @torch.no_grad()
@@ -1421,6 +1317,7 @@ class NativeCausalLM(TemplateLM):
         until: Optional[List[str]],
     ) -> str:
         """
+        mode not = "compress_answer" or "reconstruct_first", but 
         Iterative vLLM decoding with on-the-fly compression of generated tokens.
         Compress only generated tokens; prompt tokens stay uncompressed.
         """
@@ -1719,7 +1616,12 @@ class NativeCausalLM(TemplateLM):
                 max_chunks = 1
             if max_chunks < len(ctx_spans):
                 ctx_spans = ctx_spans[-max_chunks:]
+                print("need chunk spans,", max_chunks,"total spans ",len(ctx_spans))
+            else:
+                print("no need chunk spans,",max_chunks,"total spans ",len(ctx_spans),"available spaces",max_comp_tokens-len(ctx_spans)*span_cost)
                 
+            print("max_length,",self.max_length,"total_static,",total_static,"glen,",glen,"max_comp_tokens,",max_comp_tokens,"max_chunks,",max_chunks)
+
 
             n_spans = len(ctx_spans)
             selected_spans_list.append(n_spans)
@@ -2340,6 +2242,9 @@ class NativeCausalLM(TemplateLM):
             # Build base embeds per group: prefix_embeds + recon_embeds (+ optional query suffix).
             group_base_embeds: List[Optional[torch.Tensor]] = [None] * n_groups
             group_base_lens: List[int] = [0] * n_groups
+            group_dec_tokens: List[torch.Tensor] = [None] * n_groups
+            
+            
             for gi, pe in enumerate(prefix_embeds_list):
                 if pe is None:
                     continue
@@ -2353,6 +2258,10 @@ class NativeCausalLM(TemplateLM):
                 qe = group_query_embeds[gi]
                 base = torch.cat([pe, re, qe], dim=0) if (re.numel() or qe.numel()) else pe
                 group_base_embeds[gi] = base
+                group_dec_tokens[gi] = torch.cat([torch.tensor([0]*len(pe), device=self.device, dtype=torch.long), torch.tensor(recon, device=self.device, dtype=torch.long), torch.tensor(group_query_tokens[gi], device=self.device, dtype=torch.long)], dim=0)
+                # print(group_dec_tokens[gi].shape)
+                # print(group_base_embeds[gi].shape)
+                # breakpoint()
                 group_base_lens[gi] = int(base.shape[0])
 
             # Collect all (request_idx, group_idx) pairs that we need to score.
@@ -2407,7 +2316,10 @@ class NativeCausalLM(TemplateLM):
 
             for score_start in range(0, len(score_pairs), score_bs):
                 pairs = score_pairs[score_start : score_start + score_bs]
-
+                
+                print("pairs,",pairs,"score_start,",score_start,"score_bs,",score_bs)
+                # breakpoint()
+                
                 seq_embeds: List[torch.Tensor] = []
                 dec_lens: List[int] = []
                 pref_lens: List[int] = []
@@ -2415,6 +2327,8 @@ class NativeCausalLM(TemplateLM):
                 cont_targets: List[torch.Tensor] = []
                 orig_req_idxs: List[int] = []
                 group_for_req: List[int] = []
+                
+                dec_tokens: List[torch.Tensor] = []
 
                 # Build packed batch embeddings.
                 for req_idx, gi in pairs:
@@ -2427,12 +2341,22 @@ class NativeCausalLM(TemplateLM):
                         cont_e = self.model.tok_embeddings(cont_t).to(dtype=self._dtype)
                     seq = torch.cat([base, cont_e], dim=0)
                     seq_embeds.append(seq)
+                    
+
+                    
                     dec_lens.append(int(seq.shape[0]))
                     pref_lens.append(int(group_base_lens[gi]))
                     cont_lens.append(int(len(cont)))
                     cont_targets.append(cont_t)
                     orig_req_idxs.append(req_idx)
                     group_for_req.append(gi)
+                    
+                    dec_token = torch.cat([group_dec_tokens[gi], cont_t], dim=0)
+                    dec_tokens.append(dec_token)
+                    
+                    # breakpoint()
+                    
+                    
 
                 if not seq_embeds:
                     continue
@@ -2480,6 +2404,7 @@ class NativeCausalLM(TemplateLM):
                     score_tgt_chunks.append(cont_targets[j])
                     score_ranges.append((running, running + cont_len, req_idx))
                     running += cont_len
+                    # breakpoint()
 
                 if running == 0:
                     continue
@@ -2494,7 +2419,7 @@ class NativeCausalLM(TemplateLM):
                 token_greedy_ok = torch.empty(running, device=self.device, dtype=torch.bool)
 
                 rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
-                rows_per_chunk = max(8, min(rows_per_chunk, 512))
+                rows_per_chunk = max(16, min(rows_per_chunk, 512))
                 for off in range(0, running, rows_per_chunk):
                     off2 = min(off + rows_per_chunk, running)
                     h_chunk = h_score[off:off2]
@@ -2537,7 +2462,7 @@ class NativeCausalLM(TemplateLM):
                         "max_recon_len": group_max_recon_lens[gi],
                         "recon_tokens_len": len(group_recon_tokens[gi]),
                         "recon_stop_reason": info.get("stop_reason"),
-                        "recon_text_preview": self.tok_decode_w_special_tokens(group_recon_tokens[gi][:512])
+                        "recon_text_preview": self.tok_decode_w_special_tokens(group_recon_tokens[gi])
                         if group_recon_tokens[gi]
                         else "",
                         "query_len": len(group_query_tokens[gi]),
