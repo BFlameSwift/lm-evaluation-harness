@@ -167,6 +167,11 @@ class NativeCausalLM(TemplateLM):
         self._vllm_manager = None
         self._vllm_output_root = vllm_output_root
         self._last_generate_debug: List[dict] = []
+        # Populated by our overridden `loglikelihood()` so `_loglikelihood_tokens_*` can
+        # access structured dataset fields via `Instance.doc` when needed.
+        self._active_loglikelihood_docs: Optional[List[Optional[dict]]] = None
+        self._active_loglikelihood_task_names: Optional[List[Optional[str]]] = None
+        self._active_loglikelihood_doc_ids: Optional[List[Optional[int]]] = None
         # self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
         self._vllm_reconstruct_batch_size = self._batch_size
         self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
@@ -963,6 +968,53 @@ class NativeCausalLM(TemplateLM):
                 greedy = bool((tail_logprobs.argmax(dim=-1) == tgt_tensor[-cont_len:]).all().item())
                 res.append((logprob, greedy))
         return res
+
+    # ---------------------------------------------------------------------
+    # Harness integration: keep access to structured `Instance.doc` fields.
+    # ---------------------------------------------------------------------
+    def loglikelihood(self, requests, disable_tqdm: bool = False):  # type: ignore[override]
+        """
+        Override TemplateLM.loglikelihood so we can access `Instance.doc` for
+        structured prompt parts (e.g., `doc["context"]`, `doc["question"]`,
+        `doc["choices"]`) inside our custom loglikelihood implementations.
+
+        Upstream TemplateLM.loglikelihood discards Instance.doc and only forwards
+        (context_str, continuation_str) + tokenized ids into `_loglikelihood_tokens`.
+        """
+        self._active_loglikelihood_docs = [getattr(r, "doc", None) for r in requests]
+        self._active_loglikelihood_task_names = [getattr(r, "task_name", None) for r in requests]
+        self._active_loglikelihood_doc_ids = [getattr(r, "doc_id", None) for r in requests]
+        # breakpoint()
+        try:
+            new_reqs: List[Tuple[Tuple[str, str], List[int], List[int]]] = []
+            for req in requests:
+                args = req.args
+                if not isinstance(args, tuple) or len(args) < 2:
+                    raise ValueError(f"Unexpected loglikelihood Instance.args: {args!r}")
+                context = args[0]
+                continuation = args[1]
+
+                if context == "":
+                    continuation_enc = self.tok_encode(continuation, add_special_tokens=False)
+                    if not continuation_enc:
+                        context_enc, continuation_enc = ([self.prefix_token_id], [])
+                    else:
+                        context_enc, continuation_enc = (
+                            ([self.prefix_token_id], continuation_enc)
+                            if self.prefix_token_id != continuation_enc[0]
+                            else (continuation_enc[:1], continuation_enc[1:])
+                        )
+                else:
+                    context_enc, continuation_enc = self._encode_pair(context, continuation)
+
+                new_reqs.append(((context, continuation), context_enc, continuation_enc))
+
+            return self._loglikelihood_tokens(new_reqs, disable_tqdm=disable_tqdm)
+        finally:
+            # Clear to avoid accidental reuse across evaluations.
+            self._active_loglikelihood_docs = None
+            self._active_loglikelihood_task_names = None
+            self._active_loglikelihood_doc_ids = None
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> List[float]:
         results: List[float] = []
