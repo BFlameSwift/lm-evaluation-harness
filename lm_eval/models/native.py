@@ -204,7 +204,7 @@ class NativeCausalLM(TemplateLM):
 
         add_boq_index: bool = False,
         remove_eot_token: bool = True,
-        fill_decoder_prefix_embeds: bool = True,
+        fill_decoder_prefix_embeds: bool = False,
         
     ) -> None:
         super().__init__()
@@ -2296,28 +2296,7 @@ class NativeCausalLM(TemplateLM):
         max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", self.max_length))
         include_bor = False
 
-        # Decide how much of the context to compress (prefix) vs keep raw (suffix),
-        # without ever truncating continuation tokens.
-        def _get_doc_and_context(self, ctx_tokens_list: List[List[int]]) -> Dict[str, List[str]]:
-        
-            doc_key, question_key = get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["doc_key"], get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["question_key"]
-            
-            # decoded original context
-            prompt_list = [self._tokenizer.decode_w_special_tokens(ctx) for ctx in ctx_tokens_list]
-                
-            split_doc_and_query_results = _split_doc_and_query(active_lg_docs=self._active_loglikelihood_docs, active_tasks_names=self._active_loglikelihood_task_names,prompt_list=prompt_list,doc_key=doc_key, question_key=question_key)
-            
-            # len(context_list) == group_size * num_groups
-            context_list, question_list, query_list = split_doc_and_query_results["context_list"], split_doc_and_query_results["question_list"], split_doc_and_query_results["query_list"]
-            
-            return {
-                "context_list": context_list,
-                "question_list": question_list,
-                "query_list": query_list,
-                "prompt_list": prompt_list,
-                "doc_key": doc_key,
-                "question_key": question_key,
-            }
+ 
         
         
             
@@ -2388,7 +2367,7 @@ class NativeCausalLM(TemplateLM):
             dummy_prompts = [""] * len(chunk)
             gen_lens = [len(c) for c in cont_tokens_list]
             if not self._chat_use_template:
-                prefix_embeds_list, metainfo = self._build_compress_prompt_embeds_batch(
+                prefix_embeds_list, meta = self._build_compress_prompt_embeds_batch(
                     dummy_prompts,
                     gen_lens,
                     include_bor=False,
@@ -2398,14 +2377,15 @@ class NativeCausalLM(TemplateLM):
                     return_meta=True,
                     # for do not add boq index for decoder prefix
                     not_add_boq_index=True,
+                    
                 )
             else:
                 # get doc and context
-                doc_and_context = _get_doc_and_context(ctx_tokens_list=prompt_tokens_override)
+                doc_and_context = self._get_doc_and_context(ctx_tokens_list=prompt_tokens_override)
                 context_list, question_list, query_list = doc_and_context["context_list"], doc_and_context["question_list"], doc_and_context["query_list"]
                 prompt_list = doc_and_context["prompt_list"]
                 
-                context_tokens_list = [self._tokenizer.encode_w_special_tokens(context) for context in context_list]
+                context_tokens_list = [self._tokenizer.encode(context) for context in context_list]
                 prefix_embeds_list, meta = self._build_compress_prompt_embeds_batch(
                     dummy_prompts,
                     gen_lens,
@@ -2433,7 +2413,7 @@ class NativeCausalLM(TemplateLM):
                 else:
                     suffix_embeds_list.append(torch.empty((0, d_model), device=self.device, dtype=self._dtype))
 
-            meta_n_spans = metainfo.get("n_spans", [1] * len(chunk)) if metainfo else [1] * len(chunk)
+            meta_n_spans = meta.get("n_spans", [1] * len(chunk)) if meta else [1] * len(chunk)
 
             seq_embeds: List[torch.Tensor] = []
             seq_targets: List[torch.Tensor] = []
@@ -2606,6 +2586,29 @@ class NativeCausalLM(TemplateLM):
             res.extend([(float("-inf"), False)] * missing)
         return res
 
+
+        # Decide how much of the context to compress (prefix) vs keep raw (suffix),
+        # without ever truncating continuation tokens.
+    def _get_doc_and_context(self, ctx_tokens_list: List[List[int]]) -> Dict[str, List[str]]:
+    
+        doc_key, question_key = get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["doc_key"], get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["question_key"]
+        
+        # decoded original context
+        prompt_list = [self._tokenizer.decode_w_special_tokens(ctx) for ctx in ctx_tokens_list]
+            
+        split_doc_and_query_results = _split_doc_and_query(active_lg_docs=self._active_loglikelihood_docs, active_tasks_names=self._active_loglikelihood_task_names,prompt_list=prompt_list,doc_key=doc_key, question_key=question_key)
+        
+        # len(context_list) == group_size * num_groups
+        context_list, question_list, query_list = split_doc_and_query_results["context_list"], split_doc_and_query_results["question_list"], split_doc_and_query_results["query_list"]
+        
+        return {
+            "context_list": context_list,
+            "question_list": question_list,
+            "query_list": query_list,
+            "prompt_list": prompt_list,
+            "doc_key": doc_key,
+            "question_key": question_key,
+        }
 
 
     @torch.no_grad()
