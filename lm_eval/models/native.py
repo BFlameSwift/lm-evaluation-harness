@@ -318,19 +318,30 @@ class NativeCausalLM(TemplateLM):
 
         # Optional vLLM init for reconstruction speedup or decoder fast path (decoder-only, prompt_embeds)
         need_vllm = self._use_vllm_reconstruct or self._use_vllm_decoder or self._use_vllm_answer
+        
+        
         if self._mode == "vllm_decoding_with_compress":
             need_vllm = True
+        self._use_vllm = need_vllm
+        self._vllm_model_path = vllm_model_path
+        self._vllm_max_model_len = vllm_max_model_len
+        self._vllm_tensor_parallel = vllm_tensor_parallel
+        self._vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        self._vllm_tokenizer_path = tokenizer_path
+        self._vllm_checkpoint_dir = checkpoint_dir
+        self._vllm_dtype = dtype
         # breakpoint()
 
-        if need_vllm:
+        # if need_vllm:
+    def init_vllm(self) -> None:
             # Prepare decoder-only safetensors if path not provided
-            model_path = vllm_model_path
+            model_path = self._vllm_model_path
             # breakpoint()
             if model_path is None:
                 # HF checkpoints: vLLM can load directly from checkpoint_dir (already a transformers directory).
-                is_native_ckpt = checkpoint_dir is not None and os.path.exists(os.path.join(checkpoint_dir, "metadata.json"))
+                is_native_ckpt = self._vllm_checkpoint_dir is not None and os.path.exists(os.path.join(self._vllm_checkpoint_dir, "metadata.json"))
                 if not is_native_ckpt:
-                    model_path = checkpoint_dir
+                    model_path = self._vllm_checkpoint_dir
                 else:
                     base_dir = self._vllm_output_root or checkpoint_dir
                     if base_dir is None:
@@ -343,12 +354,12 @@ class NativeCausalLM(TemplateLM):
                     if need_convert:
                         os.makedirs(safedir, exist_ok=True)
                         convert_checkpoint(
-                            checkpoint_dir=checkpoint_dir,
+                            checkpoint_dir=self._vllm_checkpoint_dir,
                             output_dir=safedir,
-                            tokenizer_path=tokenizer_path,
+                            tokenizer_path=self._vllm_tokenizer_path,
                             dtype=str(self._dtype).replace("torch.", ""),
                             additional_kwargs={
-                                "max_position_embeddings": self._max_seq_length,
+                                "max_position_embeddings": self._vllm_max_model_len,
                                 "eos_token_id": self.eos_token_id,
                                 "pad_token_id": self.pad_token_id,
                                 "bos_token_id": getattr(self._tokenizer, "bos_id", None),
@@ -2287,6 +2298,30 @@ class NativeCausalLM(TemplateLM):
 
         # Decide how much of the context to compress (prefix) vs keep raw (suffix),
         # without ever truncating continuation tokens.
+        def _get_doc_and_context(self, ctx_tokens_list: List[List[int]]) -> Dict[str, List[str]]:
+        
+            doc_key, question_key = get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["doc_key"], get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["question_key"]
+            
+            # decoded original context
+            prompt_list = [self._tokenizer.decode_w_special_tokens(ctx) for ctx in ctx_tokens_list]
+                
+            split_doc_and_query_results = _split_doc_and_query(active_lg_docs=self._active_loglikelihood_docs, active_tasks_names=self._active_loglikelihood_task_names,prompt_list=prompt_list,doc_key=doc_key, question_key=question_key)
+            
+            # len(context_list) == group_size * num_groups
+            context_list, question_list, query_list = split_doc_and_query_results["context_list"], split_doc_and_query_results["question_list"], split_doc_and_query_results["query_list"]
+            
+            return {
+                "context_list": context_list,
+                "question_list": question_list,
+                "query_list": query_list,
+                "prompt_list": prompt_list,
+                "doc_key": doc_key,
+                "question_key": question_key,
+            }
+        
+        
+            
+        
         def _split_ctx_for_compression(ctx_tokens: List[int], cont_len: int) -> Tuple[List[int], List[int]]:
             if not ctx_tokens:
                 return [], []
@@ -2327,6 +2362,9 @@ class NativeCausalLM(TemplateLM):
             cont_tokens_list: List[List[int]] = [cont for (_, _, cont) in chunk]
             suffix_tokens_list: List[List[int]] = [[] for _ in range(len(chunk))]
             
+            
+            # fill decoder prefix embeds, only compress old context and keep new context uncompressed
+            # TODO temp close this feature
             if self._fill_decoder_prefix_embeds:
                 prompt_tokens_list, suffix_tokens_list_t = zip(
                     *[_split_ctx_for_compression(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)]
@@ -2336,8 +2374,6 @@ class NativeCausalLM(TemplateLM):
 
 
             # prompt_tokens, suffix_tokens = compute_needed_comp_slots(prompt_tokens_override[0])
-
-
             # Fast path: empty continuations
             chunk_results: List[Tuple[float, bool]] = [(float("-inf"), False)] * len(chunk)
             nonempty_idxs = [i for i, c in enumerate(cont_tokens_list) if len(c) > 0]
@@ -2351,17 +2387,37 @@ class NativeCausalLM(TemplateLM):
 
             dummy_prompts = [""] * len(chunk)
             gen_lens = [len(c) for c in cont_tokens_list]
-            prefix_embeds_list, metainfo = self._build_compress_prompt_embeds_batch(
-                dummy_prompts,
-                gen_lens,
-                include_bor=False,
-                decoder_include_prompt_tokens=False,
-                decoder_memory_layout="per_span",
-                prompt_tokens_override=prompt_tokens_override,
-                return_meta=True,
-                # for do not add boq index for decoder prefix
-                not_add_boq_index=True,
-            )
+            if not self._chat_use_template:
+                prefix_embeds_list, metainfo = self._build_compress_prompt_embeds_batch(
+                    dummy_prompts,
+                    gen_lens,
+                    include_bor=False,
+                    decoder_include_prompt_tokens=False,
+                    decoder_memory_layout="per_span",
+                    prompt_tokens_override=prompt_tokens_override,
+                    return_meta=True,
+                    # for do not add boq index for decoder prefix
+                    not_add_boq_index=True,
+                )
+            else:
+                # get doc and context
+                doc_and_context = _get_doc_and_context(ctx_tokens_list=prompt_tokens_override)
+                context_list, question_list, query_list = doc_and_context["context_list"], doc_and_context["question_list"], doc_and_context["query_list"]
+                prompt_list = doc_and_context["prompt_list"]
+                
+                context_tokens_list = [self._tokenizer.encode_w_special_tokens(context) for context in context_list]
+                prefix_embeds_list, meta = self._build_compress_prompt_embeds_batch(
+                    dummy_prompts,
+                    gen_lens,
+                    include_bor=False,
+                    decoder_include_prompt_tokens=False,
+                    decoder_memory_layout="per_span",
+                    prompt_tokens_override=context_tokens_list,
+                    return_meta=True,
+                    not_add_boq_index=False,
+                    context_list=context_list,
+                    query_list=query_list,
+                )
             # breakpoint()
             
             # Suffix tokens (uncompressed tail of the prompt) can be ragged across the batch.
