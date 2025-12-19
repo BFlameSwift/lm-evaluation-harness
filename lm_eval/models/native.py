@@ -93,6 +93,57 @@ def _default_distributed_args() -> DistributedArgs:
 
 
 
+def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_names: List[Optional[str]],prompt_list: List[str] = [],doc_key: str = "context", question_key: str = "question") -> Dict[str, List[str]]:
+    """
+    Split a rendered prompt into:
+        - doc_tokens: everything up to and including the closing `</text>` marker
+        - query_tokens: everything after (question/choices/Answer:)
+
+    We use tokenizer offset_mapping on the *full prompt string* to find the token boundary,
+    because BPE boundaries mean that encoding `</text>` in isolation often does not match a
+    subsequence of the full prompt token ids.
+    """
+    if not active_lg_docs or not active_tasks_names:
+        return [], []
+    
+    ret_context_list = []
+    ret_question_list = []
+    ret_query_list = []
+    # breakpoint()
+    for doc, task_name, prompt in zip(active_lg_docs, active_tasks_names, prompt_list):
+        if doc is None or task_name is None:
+            continue
+        if "longbench2" in task_name:
+            context_text = doc[doc_key]
+            question_text = doc[question_key]
+            real_query_text = prompt.split("\n</text>\n\n")[1].strip()
+            
+            ret_question_list.append(question_text)
+            ret_query_list.append(real_query_text)
+            ret_context_list.append(context_text)
+
+        else:
+            raise ValueError(f"Unsupported task: {task_name}")
+
+    return {
+        "context_list": ret_context_list,
+        "question_list": ret_question_list,
+        "query_list": ret_query_list,
+    }
+
+def get_doc_query_keys_by_task_name(task_name: str) -> Dict[str, str]:
+    if "longbench2" in task_name:
+        return {
+            "doc_key": "context",
+            "question_key": "question",
+        }
+    else:
+        print(f"Unsupported task: {task_name}")
+        return {
+            "doc_key": "context",
+            "question_key": "question",
+        }
+
 
 @register_model("native")
 class NativeCausalLM(TemplateLM):
@@ -141,6 +192,7 @@ class NativeCausalLM(TemplateLM):
         temperature: float = 1.0,
         # chat template related， also load from yaml task
         use_chat_template: bool = False, 
+        chat_template_version: str = "v3",
         chat_add_generation_prompt: bool = True,
         add_thinking_tokens: bool = False,
         # reconstruct_first (loglikelihood) controls
@@ -150,7 +202,7 @@ class NativeCausalLM(TemplateLM):
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
 
-        add_boq_index: bool = True,
+        add_boq_index: bool = False,
         remove_eot_token: bool = True,
         fill_decoder_prefix_embeds: bool = True,
         
@@ -172,6 +224,10 @@ class NativeCausalLM(TemplateLM):
         self._active_loglikelihood_docs: Optional[List[Optional[dict]]] = None
         self._active_loglikelihood_task_names: Optional[List[Optional[str]]] = None
         self._active_loglikelihood_doc_ids: Optional[List[Optional[int]]] = None
+        
+        self._active_context_key = "context"
+        self._active_question_key = "question"
+        
         # self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
         self._vllm_reconstruct_batch_size = self._batch_size
         self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
@@ -182,6 +238,7 @@ class NativeCausalLM(TemplateLM):
         self._add_boq_index = bool(add_boq_index)
         self._fill_decoder_prefix_embeds = bool(fill_decoder_prefix_embeds)
         self._remove_eot_token = bool(remove_eot_token)
+
         
         if compress_start_tokens:
             for t in compress_start_tokens.split(","):
@@ -189,6 +246,7 @@ class NativeCausalLM(TemplateLM):
                 if t:
                     self._compress_start_tokens.append(t)
         self._chat_use_template = bool(use_chat_template)
+        self._chat_template_version = chat_template_version
         self._chat_add_generation_prompt = bool(chat_add_generation_prompt)
         self._add_thinking_tokens = bool(add_thinking_tokens)
         self._temperature = temperature
@@ -198,6 +256,11 @@ class NativeCausalLM(TemplateLM):
         self._save_loglikelihood_debug = bool(save_loglikelihood_debug)
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
+        
+        
+        self._decoder_budget = max(max_seq_length, 8192)
+        
+        
 
         distributed_args = _default_distributed_args()
         torch.cuda.set_device(distributed_args.local_rank)
@@ -249,6 +312,9 @@ class NativeCausalLM(TemplateLM):
             # Respect override for compression-aware paths
             if hasattr(self.model, "args"):
                 self.model.args.max_mem_span_len = self._max_mem_span_len_override
+                
+        self._max_mem_span_len = self.model.args.max_mem_span_len if hasattr(self.model, "args") else self._max_mem_span_len_override
+        self._num_compression_tokens = self.model.args.num_compression_tokens if hasattr(self.model, "args") else None
 
         # Optional vLLM init for reconstruction speedup or decoder fast path (decoder-only, prompt_embeds)
         need_vllm = self._use_vllm_reconstruct or self._use_vllm_decoder or self._use_vllm_answer
@@ -495,6 +561,10 @@ class NativeCausalLM(TemplateLM):
     @property
     def max_length(self) -> int:
         return self._max_seq_length
+    
+    @property
+    def decoder_budget(self) -> int:
+        return self._decoder_budget or self._max_seq_length
 
     @property
     def max_gen_toks(self) -> int:
@@ -574,24 +644,100 @@ class NativeCausalLM(TemplateLM):
         else:
             return self._tokenizer.encode(string, bos=False, eos=False)
 
-    def _format_chat(self, user_text: str, assistant_text: Optional[str] = None, add_generation_prompt: Optional[bool] = None) -> str:
+    def _format_chat(self, user_text: str, assistant_text: Optional[str] = None, add_generation_prompt: Optional[bool] = None,contexts: Optional[List[str]] = None) -> str:
         """
-        Optionally wrap text with chat template. If assistant_text is None, will
-        produce a prompt that expects model generation; otherwise returns a full
-        conversation with assistant content included.
+            Optionally wrap text with chat template. If assistant_text is None, will
+            produce a prompt that expects model generation; otherwise returns a full
+            conversation with assistant content included.
         """
+        
         if not self._chat_use_template:
-            return user_text if assistant_text is None else user_text + "\n" + assistant_text
-        try:
-            add_gen = self._chat_add_generation_prompt if add_generation_prompt is None else add_generation_prompt
-            messages = [{"role": "user", "content": user_text}]
-            if assistant_text is not None:
-                messages.append({"role": "assistant", "content": assistant_text})
-                add_gen = False if add_generation_prompt is None else add_generation_prompt
-            return self._tokenizer.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen)
-        except Exception:
-            # fallback to raw text on any failure
-            return user_text if assistant_text is None else user_text + "\n" + assistant_text
+            return {"n_spans": 0, "available": 0,"decoder_prefix": user_text if assistant_text is None else user_text + "\n" + assistant_text}
+            # return user_text if assistant_text is None else user_text + "\n" + assistant_text
+        
+        if self._chat_template_version == "v2":
+            try:
+                add_gen = self._chat_add_generation_prompt if add_generation_prompt is None else add_generation_prompt
+                messages = [{"role": "user", "content": user_text}]
+                if assistant_text is not None:
+                    messages.append({"role": "assistant", "content": assistant_text})
+                    add_gen = False if add_generation_prompt is None else add_generation_prompt
+                return {"n_spans": 0, "available": 0,"decoder_prefix": self._tokenizer.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen)}
+                # return self._tokenizer.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_gen)
+            except Exception as e:
+                print(f"WARNING: Failed to apply chat template, Error: {e}", file=sys.stderr)
+                
+                # fallback to raw text on any failure
+                # return user_text if assistant_text is None else user_text + "\n" + assistant_text
+            return {"n_spans": 0, "available": 0,"decoder_prefix": user_text if assistant_text is None else user_text + "\n" + assistant_text}
+        elif self._chat_template_version == "v3":
+            """
+            V3 chat template layout:
+                <|im_start|>memory\n[BOM comp_slots EOM]*n<|im_end|>\n
+                <|im_start|>user\n[query_tokens]<|im_end|>\n
+                <|im_start|>assistant\n[generation...]<|im_end|>
+                
+            Each span takes (2 + num_compression_tokens) tokens in decoder:
+                1 (BOM) + num_comp + 1 (EOM) = 2 + num_comp
+                
+            """
+            bom_id = BEGIN_OF_MEMORY_INDEX
+            eom_id = END_OF_MEMORY_INDEX
+            bor_id = BEGIN_OF_RECONSTRUCTION_INDEX
+            eor_id = END_OF_RECONSTRUCTION_INDEX
+            eos_id = self._tokenizer.eos_id
+            memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
+            user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
+            assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
+            im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
+            query_tokens = self._tokenizer.encode(user_text, bos=False, eos=False)
+            n_slots = 0
+            comp_tokens = []
+            comp_mask = []
+            
+            comp_mask.extend([False] * len(memory_start))
+            
+            if isinstance(contexts, str):
+                contexts = [contexts]
+            
+            for context in contexts:
+                toks_full = self._tokenizer.encode(context, bos=False, eos=False)
+                spans = [toks_full[i : i + self._max_mem_span_len] for i in range(0, len(toks_full), self._max_mem_span_len)]
+                
+                for sp in spans:
+                    comp_tokens.append(bom_id)
+                    comp_tokens.extend([0] * self._compress_chunk)
+                    comp_tokens.append(eom_id)
+                    n_slots += 1
+                    comp_mask.append(False)
+                    comp_mask.extend([True] * self._compress_chunk)
+                    comp_mask.append(False)
+            
+            memory_tokens = memory_start + comp_tokens + im_end
+            comp_mask.extend([False] * len(memory_tokens))
+            user_tokens = user_start + query_tokens + im_end
+            comp_mask.extend([False] * len(user_tokens))
+            
+            ret_assistant_tokens = assistant_start 
+            comp_mask.extend([False] * len(ret_assistant_tokens))
+            
+            
+            total_comp_slots = n_slots * self._num_compression_tokens
+            available = self.decoder_budget - 1 - n_slots * (self._num_compression_tokens + 2) - len(user_tokens) - len(ret_assistant_tokens)
+            total_encoder_tokens = n_slots * self._max_mem_span_len
+            
+        # breakpoint()
+            
+        return {
+            "n_spans": n_slots,
+            "total_comp_slots": total_comp_slots,
+            "total_encoder_tokens": total_encoder_tokens,
+            "available": available,
+            "decoder_prefix": memory_tokens + user_tokens + ret_assistant_tokens,
+            "comp_mask": comp_mask,
+        }
+            
+            
 
     def tok_decode(self, tokens: List[int]) -> str:
         return self._tokenizer.decode(tokens)
@@ -633,6 +779,208 @@ class NativeCausalLM(TemplateLM):
             if greedy_ok:
                 greedy_ok = bool((logprobs.argmax(dim=-1) == t).all().item())
         return total_lp, greedy_ok
+
+    @torch.no_grad()
+    def _forward_score_token_ranges(
+        self,
+        *,
+        seq_embeds: List[torch.Tensor],
+        seq_token_ids: List[torch.Tensor],
+        score_token_ranges: List[Tuple[int, int]],
+        normalize_lengths: Optional[List[float]] = None,
+        comp_mask_list: Optional[List[torch.Tensor]] = None,
+        rows_per_chunk: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Forward a ragged batch (provided as per-sample decoder embeddings) and compute
+        log-likelihood over *specified target token ranges*.
+
+        This is intended as a reusable building block for:
+        - multi-choice scoring where you reuse a shared prefix,
+        - scoring only parts of a long continuation,
+        - cases where you want to inject extra query text before likelihood.
+
+        Alignment rule:
+          Given `token_ids` aligned with `embeds`, scoring target tokens
+          `token_ids[t0:t1]` uses logits at positions `[t0-1 : t1-1]`
+          (standard next-token prediction).
+
+        Args:
+          seq_embeds: list of [L_i, d_model] tensors on CUDA (or will be moved)
+          seq_token_ids: list of [L_i] token-id tensors aligned with seq_embeds
+          score_token_ranges: list of (t0, t1) ranges in token indices, per sample
+            - scores tokens token_ids[t0:t1]
+            - requires t0 >= 1
+          normalize_lengths: optional per-sample denominators for length-normalized ll
+            (if None, uses #scored tokens)
+          comp_mask_list: optional per-sample boolean masks for placeholder positions
+            (not used by attention layers, kept for compatibility/debug)
+          rows_per_chunk: chunk size for projecting hidden -> vocab (controls peak memory)
+
+        Returns:
+          {
+            "per_sample": [
+              {"ll": float, "ll_norm": float, "loss": float, "ppl": float|None,
+               "tokens": int, "greedy": bool},
+              ...
+            ],
+            "total": {"ll": float, "tokens": int, "loss": float|None, "ppl": float|None}
+          }
+        """
+        n = len(seq_embeds)
+        if len(seq_token_ids) != n or len(score_token_ranges) != n:
+            raise ValueError(
+                f"seq_embeds/seq_token_ids/score_token_ranges must have same length; "
+                f"got {n}/{len(seq_token_ids)}/{len(score_token_ranges)}"
+            )
+        if normalize_lengths is not None and len(normalize_lengths) != n:
+            raise ValueError(f"normalize_lengths must have length {n}, got {len(normalize_lengths)}")
+        if comp_mask_list is not None and len(comp_mask_list) != n:
+            raise ValueError(f"comp_mask_list must have length {n}, got {len(comp_mask_list)}")
+
+        dec_lens: List[int] = []
+        for i in range(n):
+            e = seq_embeds[i]
+            t = seq_token_ids[i]
+            if e.ndim != 2:
+                raise ValueError(f"seq_embeds[{i}] must be 2D [L,d]; got shape {tuple(e.shape)}")
+            if t.ndim != 1:
+                raise ValueError(f"seq_token_ids[{i}] must be 1D [L]; got shape {tuple(t.shape)}")
+            if int(e.shape[0]) != int(t.numel()):
+                raise ValueError(
+                    f"seq_embeds[{i}] length {int(e.shape[0])} != seq_token_ids[{i}] length {int(t.numel())}"
+                )
+            dec_lens.append(int(e.shape[0]))
+
+        if not dec_lens or sum(dec_lens) == 0:
+            return {
+                "per_sample": [
+                    {"ll": 0.0, "ll_norm": 0.0, "loss": 0.0, "ppl": None, "tokens": 0, "greedy": True}
+                    for _ in range(n)
+                ],
+                "total": {"ll": 0.0, "tokens": 0, "loss": None, "ppl": None},
+            }
+
+        dec_cu = torch.tensor([0] + list(torch.tensor(dec_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+        max_dec = max(dec_lens)
+        dec_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens], dim=0)
+
+        if comp_mask_list is not None:
+            comp_mask_flat = torch.cat(comp_mask_list, dim=0).to(device=self.device, dtype=torch.bool)
+        else:
+            comp_mask_flat = torch.zeros(sum(dec_lens), device=self.device, dtype=torch.bool)
+
+        dec_ctx = {
+            "cu_seqlens_q": dec_cu,
+            "cu_seqlens_k": dec_cu,
+            "max_seqlen_q": max_dec,
+            "max_seqlen_k": max_dec,
+            "positions": dec_positions,
+            "compression_token_mask": comp_mask_flat,
+        }
+
+        embeds_flat = torch.cat([e.to(device=self.device, dtype=self._dtype) for e in seq_embeds], dim=0)
+        with torch.autocast(device_type="cuda", dtype=self._dtype):
+            h = embeds_flat
+            for layer in self.model.layers:
+                h = layer(h, context=dec_ctx)
+            h = self.model.norm(h)
+
+        # Build flattened score positions and targets.
+        score_pos_chunks: List[torch.Tensor] = []
+        score_tgt_chunks: List[torch.Tensor] = []
+        score_ranges_flat: List[Tuple[int, int]] = []
+        running = 0
+        for i, (t0, t1) in enumerate(score_token_ranges):
+            t0 = int(t0)
+            t1 = int(t1)
+            if t1 <= t0:
+                score_ranges_flat.append((running, running))
+                continue
+            if t0 < 1:
+                raise ValueError(
+                    f"score_token_ranges[{i}] starts at {t0}, but must be >= 1 because logits at position t0-1 "
+                    "are needed to score token_ids[t0]."
+                )
+            if t1 > dec_lens[i]:
+                raise ValueError(f"score_token_ranges[{i}] ends at {t1}, exceeds sequence length {dec_lens[i]}")
+
+            base = int(dec_cu[i].item())
+            pos0 = base + (t0 - 1)
+            length = t1 - t0
+            pos1 = pos0 + length
+
+            score_pos_chunks.append(torch.arange(pos0, pos1, device=self.device, dtype=torch.long))
+            score_tgt_chunks.append(seq_token_ids[i][t0:t1].to(device=self.device, dtype=torch.long))
+            score_ranges_flat.append((running, running + length))
+            running += length
+
+        token_logprob = torch.empty(running, device=self.device, dtype=torch.float32)
+        token_greedy_ok = torch.empty(running, device=self.device, dtype=torch.bool)
+
+        if running > 0:
+            score_pos = torch.cat(score_pos_chunks, dim=0)
+            score_targets = torch.cat(score_tgt_chunks, dim=0)
+            h_score = h.index_select(0, score_pos)
+
+            if rows_per_chunk is None:
+                rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
+                rows_per_chunk = max(16, min(rows_per_chunk, 512))
+            rows_per_chunk = max(8, int(rows_per_chunk))
+
+            for off in range(0, running, rows_per_chunk):
+                off2 = min(off + rows_per_chunk, running)
+                h_chunk = h_score[off:off2]
+                tgt_chunk = score_targets[off:off2]
+
+                with torch.autocast(device_type="cuda", dtype=self._dtype):
+                    logits_chunk = self.model.output(h_chunk)
+
+                if self._model_parallel_group is not None:
+                    from distributed.tensor_parallel import gather_from_model_parallel_region
+
+                    logits_chunk = gather_from_model_parallel_region(logits_chunk, self._model_parallel_group)
+
+                token_greedy_ok[off:off2] = logits_chunk.argmax(dim=-1).to(torch.long).eq(tgt_chunk)
+
+                logits_f = logits_chunk.float()
+                lse = torch.logsumexp(logits_f, dim=-1)
+                tgt_logits = logits_f.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1)
+                token_logprob[off:off2] = (tgt_logits - lse)
+
+        # Reduce to per-sample stats.
+        per_sample: List[Dict[str, Any]] = []
+        total_ll = 0.0
+        total_toks = 0
+        for i, (s, e) in enumerate(score_ranges_flat):
+            s = int(s)
+            e = int(e)
+            nt = e - s
+            if nt <= 0:
+                ll = 0.0
+                greedy = True
+                ll_norm = 0.0
+                loss = 0.0
+                ppl = None
+            else:
+                ll = float(token_logprob[s:e].sum().item())
+                greedy = bool(token_greedy_ok[s:e].all().item())
+                denom = float(normalize_lengths[i]) if normalize_lengths is not None else float(nt)
+                ll_norm = ll / denom if denom > 0 else ll
+                loss = -ll / float(nt)
+                ppl = float(math.exp(loss))
+                total_ll += ll
+                total_toks += nt
+            per_sample.append({"ll": ll, "ll_norm": ll_norm, "loss": loss, "ppl": ppl, "tokens": nt, "greedy": greedy})
+
+        if total_toks > 0:
+            total_loss = -total_ll / float(total_toks)
+            total_ppl = float(math.exp(total_loss))
+        else:
+            total_loss = None
+            total_ppl = None
+
+        return {"per_sample": per_sample, "total": {"ll": total_ll, "tokens": total_toks, "loss": total_loss, "ppl": total_ppl}}
     
     def get_full_text_apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
         
@@ -984,7 +1332,6 @@ class NativeCausalLM(TemplateLM):
         self._active_loglikelihood_docs = [getattr(r, "doc", None) for r in requests]
         self._active_loglikelihood_task_names = [getattr(r, "task_name", None) for r in requests]
         self._active_loglikelihood_doc_ids = [getattr(r, "doc_id", None) for r in requests]
-        # breakpoint()
         try:
             new_reqs: List[Tuple[Tuple[str, str], List[int], List[int]]] = []
             for req in requests:
@@ -1054,7 +1401,7 @@ class NativeCausalLM(TemplateLM):
             ):
 
                 if self._chat_use_template:
-                    prompts = [self._format_chat(c, add_generation_prompt=True) for c, _ in chunk]
+                    prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
                 else:
                     prompts = [c for c, _ in chunk]
 
@@ -1079,7 +1426,7 @@ class NativeCausalLM(TemplateLM):
                 gkwargs = []
                 for c, gk in chunk:
                     if self._chat_use_template:
-                        prompt_c = self._format_chat(c, add_generation_prompt=True)
+                        prompt_c = self._format_chat(c, add_generation_prompt=True)["decoder_prefix"]
                     else:
                         prompt_c = c
                     tokens = self.tok_encode(prompt_c)
@@ -1118,7 +1465,7 @@ class NativeCausalLM(TemplateLM):
                     # breakpoint()
                     for context_str, gk in chunk:
 
-                        context_str = self._format_chat(context_str, add_generation_prompt=True)
+                        context_str = self._format_chat(context_str, add_generation_prompt=True)["decoder_prefix"]
                         text = self._generate_vllm_with_compress(
                             prompt=context_str,
                             max_gen_len=gk.get("max_generation_length", self.max_gen_toks),
@@ -1129,7 +1476,7 @@ class NativeCausalLM(TemplateLM):
 
                         results.append(text)
                     continue
-                prompts = [self._format_chat(c, add_generation_prompt=True) for c, _ in chunk]
+                prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
                 gkwargs = [g for _, g in chunk]
                 gen_lens = [g.get("max_generation_length", self.max_gen_toks) for g in gkwargs]
                 embeds = self._build_compress_prompt_embeds_batch(prompts, gen_lens, include_bor)
@@ -1169,7 +1516,7 @@ class NativeCausalLM(TemplateLM):
                     results.append(text)
                     continue
 
-                context_str = self._format_chat(context_str, add_generation_prompt=True)
+                context_str = self._format_chat(context_str, add_generation_prompt=True)["decoder_prefix"]  
                 ctx_tokens, _ = self.tok_batch_encode([context_str])
                 # breakpoint()
                 max_len = min(self.max_length, ctx_tokens.size(1) + max_gen_len)
@@ -1583,6 +1930,9 @@ class NativeCausalLM(TemplateLM):
         return_meta: bool = False,
         prompt_tokens_override: Optional[List[List[int]]] = None,
         not_add_boq_index: bool = False,
+        query_list: Optional[List[str]] = None,
+        context_list: Optional[List[str]] = None,
+        
     ) -> Tuple[List[Optional[torch.Tensor]], Optional[Dict[str, List[Any]]]]:
         """
         Batch build prompt embeddings for compress_answer/reconstruct_first with optional BOR.
@@ -1752,26 +2102,38 @@ class NativeCausalLM(TemplateLM):
             if not prefix:
                 embeds[i] = None
                 continue
+            
+            if self._chat_use_template:
+                ret = self._format_chat(user_text=query_list[i], contexts=context_list[i])
+                
+                prefix = ret["decoder_prefix"]
+                comp_mask = ret["comp_mask"]
+                available = ret["available"]
+                n_spans = ret["n_spans"]
+                total_comp_slots = ret["total_comp_slots"]
+                
 
             prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
             comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+            
             pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
 
-            if slots > 0:
+            if total_comp_slots > 0:
                 mask_slots = int(comp_mask_t.sum().item())
-                if mask_slots != slots:
+                if mask_slots != total_comp_slots:
                     raise RuntimeError(
-                        f"Internal error: comp_mask slots ({mask_slots}) != expected slots ({slots}) "
+                        f"Internal error: comp_mask slots ({mask_slots}) != expected slots ({total_comp_slots}) "
                         f"for sample {i}."
                     )
                 v0, v1 = int(comp_offsets[i]), int(comp_offsets[i + 1])
                 vec = compression_vectors[v0:v1]
                 # breakpoint()
-                if int(vec.shape[0]) != slots:
+                if int(vec.shape[0]) != total_comp_slots:
                     raise RuntimeError(
-                        f"Internal error: compression slice rows ({int(vec.shape[0])}) != slots ({slots}) "
+                        f"Internal error: compression slice rows ({int(vec.shape[0])}) != slots ({total_comp_slots}) "
                         f"for sample {i}."
                     )
+                assert len(comp_mask_t) == len(vec), f"comp_mask_t: {len(comp_mask_t)}, vec: {len(vec)}"
                 pe[comp_mask_t] = vec.to(dtype=self._dtype)
 
             embeds[i] = pe
@@ -2099,48 +2461,7 @@ class NativeCausalLM(TemplateLM):
         max_bor = int(self._reconstruct_max_bor)
         add_query = bool(getattr(self, "_add_query_before_likelihood", False))
 
-        def _split_doc_and_query(ctx_str: str, ctx_tokens: List[int]) -> Tuple[List[int], List[int]]:
-            """
-            Split a rendered prompt into:
-              - doc_tokens: everything up to and including the closing `</text>` marker
-              - query_tokens: everything after (question/choices/Answer:)
 
-            We use tokenizer offset_mapping on the *full prompt string* to find the token boundary,
-            because BPE boundaries mean that encoding `</text>` in isolation often does not match a
-            subsequence of the full prompt token ids.
-            """
-            if not add_query:
-                return ctx_tokens, []
-            if not ctx_str:
-                return ctx_tokens, []
-            # LongBench-style prompts wrap the long context with `<text> ... </text>`.
-            close_str = "</text>"
-            end_char = ctx_str.rfind(close_str)
-            if end_char == -1:
-                return ctx_tokens, []
-            split_char = end_char + len(close_str)
-            try:
-                enc = self._tokenizer.tok(  # type: ignore[attr-defined]
-                    ctx_str,
-                    add_special_tokens=False,
-                    return_offsets_mapping=True,
-                )
-                ids = enc.get("input_ids", None)
-                offsets = enc.get("offset_mapping", None)
-                if not isinstance(ids, list) or not isinstance(offsets, list) or len(ids) != len(offsets):
-                    return ctx_tokens, []
-                # Find first token that starts at/after split_char; everything before is doc_tokens.
-                split_tok = len(ids)
-                for i, (s, _e) in enumerate(offsets):
-                    if s >= split_char:
-                        split_tok = i
-                        break
-                # Prefer the original token ids passed by harness if they match.
-                if len(ctx_tokens) == len(ids) and all(int(a) == int(b) for a, b in zip(ctx_tokens, ids)):
-                    return ctx_tokens[:split_tok], ctx_tokens[split_tok:]
-                return ids[:split_tok], ids[split_tok:]
-            except Exception:
-                return ctx_tokens, []
 
         def _postprocess_recon(tokens: List[int], max_len: int) -> Tuple[List[int], dict]:
             out: List[int] = []
@@ -2185,7 +2506,7 @@ class NativeCausalLM(TemplateLM):
         
         for batch_start in pbar:
             chunk = requests[batch_start : batch_start + bs]
-            ctx_str_list: List[str] = [pair[0] for (pair, _, _) in chunk]
+            # ctx_str_list: List[str] = [ctx_str for (ctx_str, _, _) in chunk]
             ctx_tokens_list: List[List[int]] = [ctx for (_, ctx, _) in chunk]
             cont_tokens_list: List[List[int]] = [cont for (_, _, cont) in chunk]
 
@@ -2201,27 +2522,86 @@ class NativeCausalLM(TemplateLM):
                 groups.setdefault(tuple(ctx), []).append(i)
 
             group_keys = list(groups.keys())
+            # breakpoint()
             n_groups = len(group_keys)
             if n_groups == 0:
                 res.extend(chunk_results)
                 continue
 
-            group_doc_tokens: List[List[int]] = []
-            group_query_tokens: List[List[int]] = []
-            group_max_cont_lens: List[int] = []
-            group_suffix_lens: List[int] = []
-            group_indices: List[List[int]] = []
-
-            for gk in group_keys:
+            group_doc_list: List[str] = [None for _ in range(n_groups)]
+            group_query_list: List[str] = [None for _ in range(n_groups)]
+            group_max_cont_lens: List[int] = [0 for _ in range(n_groups)]
+            group_suffix_lens: List[int] = [0 for _ in range(n_groups)]
+            group_indices: List[List[int]] = [[] for _ in range(n_groups)]
+            
+            doc_key, question_key = get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["doc_key"], get_doc_query_keys_by_task_name(self._active_loglikelihood_task_names[0])["question_key"]
+            
+            split_doc_and_query_results = _split_doc_and_query(active_lg_docs=self._active_loglikelihood_docs, active_tasks_names=self._active_loglikelihood_task_names,prompt_list=[self._tokenizer.decode_w_special_tokens(ctx) for ctx in ctx_tokens_list],doc_key=doc_key, question_key=question_key)
+            
+            # len(context_list) == group_size * num_groups
+            context_list, question_list, query_list = split_doc_and_query_results["context_list"], split_doc_and_query_results["question_list"], split_doc_and_query_results["query_list"]
+            
+            # context_list_group = [[] for _ in range(n_groups)]
+            # question_list_group = [[] for _ in range(n_groups)]
+            # query_list_group = [[] for _ in range(n_groups)]
+            # ctx_tokens_list_group = [[] for _ in range(n_groups)]
+            
+            
+            for group_idx,gk in enumerate(group_keys):
                 idxs = groups[gk]
+                # group_idx is the index of the group
+                # idxs is the indices of the requests in the group
                 rep = idxs[0]
-                doc_tokens, query_tokens = _split_doc_and_query(ctx_str_list[rep], ctx_tokens_list[rep])
-                group_doc_tokens.append(doc_tokens)
-                group_query_tokens.append(query_tokens)
+
                 max_cont = max((len(cont_tokens_list[i]) for i in idxs), default=0)
-                group_max_cont_lens.append(max_cont)
-                group_suffix_lens.append(len(query_tokens) + max_cont)
-                group_indices.append(idxs)
+                # group_max_cont_lens.append(max_cont)
+
+                # group_indices.append(idxs)
+                
+                # context_list_group[group_idx] = context_list[rep]
+                # question_list_group[group_idx] = question_list[rep]
+                # query_list_group[group_idx] = query_list[rep]
+                # ctx_tokens_list_group[group_idx] = ctx_tokens_list[rep]
+                
+                context = context_list[rep]
+                question = question_list[rep]
+                query = query_list[rep]
+                ctx_tokens = ctx_tokens_list[rep]
+                query_tokens = self._tokenizer.encode(query)
+                
+                group_doc_list[group_idx] = context
+                group_query_list[group_idx] = query
+                group_max_cont_lens[group_idx] = max_cont
+                
+                group_suffix_lens[group_idx] = len(query_tokens) + max_cont
+                if self._add_query_before_likelihood:
+                    group_suffix_lens[group_idx] += len(query_tokens)
+                    
+                group_indices[group_idx] = idxs
+                
+                
+                #
+            
+            
+            # for i, (all_prompt_tokens ,context, question, query) in enumerate(zip(ctx_tokens_list_group, context_list_group, question_list_group, query_list_group)):  
+                
+            #     group_idx = [i for i in range(len(group_keys)) if group_keys[i] == tuple(all_prompt_tokens)][0]
+            #     if group_doc_tokens[group_idx] is not None:
+            #         continue
+                
+                
+            #     group_doc_tokens[group_idx] = self._tokenizer.encode(context)
+            #     group_query_tokens[group_idx] = self._tokenizer.encode(query)
+            #     # group_query_tokens[group_idx] = query
+            #     group_max_cont_lens[group_idx] = max((len(cont_tokens_list[i]) for i in groups[group_keys[group_idx]]), default=0)
+            #     group_suffix_lens[group_idx] = len(query) + group_max_cont_lens[group_idx]
+                
+            #     if self._add_query_before_likelihood:
+            #         group_suffix_lens[group_idx] += len(query)
+
+            group_query_tokens = [self._tokenizer.encode(query) for query in group_query_list]
+            breakpoint()
+            
 
             # Build compression prefix prompt_embeds per unique context (once per group).
             dummy_prompts = [""] * n_groups
@@ -2232,8 +2612,9 @@ class NativeCausalLM(TemplateLM):
                 decoder_include_prompt_tokens=False,
                 decoder_memory_layout="per_span",
                 return_meta=True,
-                prompt_tokens_override=group_doc_tokens,
                 not_add_boq_index=False,
+                context_list=group_doc_list,
+                query_list=group_query_list,
             )
             
             meta_n_spans = (meta or {}).get("n_spans", [1] * n_groups)
@@ -2283,11 +2664,13 @@ class NativeCausalLM(TemplateLM):
             d_model = int(getattr(self.model.args, "d_model", 0))
             group_query_embeds: List[torch.Tensor] = []
             for qtoks in group_query_tokens:
-                if qtoks:
+                if qtoks and self.add_query_before_likelihood:
                     q = torch.tensor(qtoks, device=self.device, dtype=torch.long)
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
                         qe = self.model.tok_embeddings(q).to(dtype=self._dtype)
                     group_query_embeds.append(qe)
+                    
+                # if not add_query_before_likelihood, just use the query tokens as the query suffix
                 else:
                     group_query_embeds.append(torch.empty((0, d_model), device=self.device, dtype=self._dtype))
 
