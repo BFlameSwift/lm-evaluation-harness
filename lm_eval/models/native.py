@@ -725,8 +725,9 @@ class NativeCausalLM(TemplateLM):
             query_tokens = self._tokenizer.encode(user_text, bos=False, eos=False)
             spans = self._split_contexts_to_spans(contexts, self._max_mem_span_len)
             if max_spans is not None and max_spans > 0 and len(spans) > max_spans:
-                print(f"Truncating memory spans from {len(spans)} to {max_spans}")
-                print("budget:", self.decoder_budget, "span occupancy:", (2 + self._num_compression_tokens)* max_spans)
+                if bool(getattr(self, "_verbose_compress", False)):
+                    print(f"Truncating memory spans from {len(spans)} to {max_spans}")
+                    print("budget:", self.decoder_budget, "span occupancy:", (2 + self._num_compression_tokens) * max_spans)
                 spans = spans[-max_spans:]
             n_spans = len(spans)
             comp_tokens: List[int] = []
@@ -2168,6 +2169,7 @@ class NativeCausalLM(TemplateLM):
 
         enc_tokens_mb: List[torch.Tensor] = []
         enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
+        verbose_compress = bool(getattr(self, "_verbose_compress", False))
 
         for i, (p, glen) in enumerate(zip(prompts, gen_lens)):
             p_tokens = prompt_tokens_override[i] if prompt_tokens_override is not None else self.tok_encode(p)
@@ -2190,11 +2192,32 @@ class NativeCausalLM(TemplateLM):
                 max_chunks = 1
             if max_chunks < len(ctx_spans):
                 ctx_spans = ctx_spans[-max_chunks:]
-                print("need chunk spans,", max_chunks,"total spans ",len(ctx_spans))
+                if verbose_compress:
+                    print("need chunk spans,", max_chunks, "total spans ", len(ctx_spans))
             else:
-                print("no need chunk spans,",max_chunks,"total spans ",len(ctx_spans),"available spaces",max_comp_tokens-len(ctx_spans)*span_cost)
-                
-            print("max_length,",decoder_budget,"total_static,",total_static,"glen,",glen,"max_comp_tokens,",max_comp_tokens,"max_chunks,",max_chunks)
+                if verbose_compress:
+                    print(
+                        "no need chunk spans,",
+                        max_chunks,
+                        "total spans ",
+                        len(ctx_spans),
+                        "available spaces",
+                        max_comp_tokens - len(ctx_spans) * span_cost,
+                    )
+
+            if verbose_compress:
+                print(
+                    "max_length,",
+                    decoder_budget,
+                    "total_static,",
+                    total_static,
+                    "glen,",
+                    glen,
+                    "max_comp_tokens,",
+                    max_comp_tokens,
+                    "max_chunks,",
+                    max_chunks,
+                )
 
 
             n_spans = len(ctx_spans)
@@ -2391,44 +2414,140 @@ class NativeCausalLM(TemplateLM):
                 if len(cont_tokens_list[i]) == 0:
                     chunk_results[i] = (0.0, True)
 
+            def _append_compress_debug_rows(
+                prefix_embeds_list: Optional[List[Optional[torch.Tensor]]] = None,
+                meta_n_spans: Optional[List[int]] = None,
+            ) -> None:
+                if not self._save_loglikelihood_debug or self._distributed_args.rank != 0:
+                    return
+                rows: List[dict] = []
+                for i in range(len(chunk_results)):
+                    cont_len = len(cont_tokens_list[i])
+                    logprob, greedy = chunk_results[i]
+                    loss = None
+                    ppl = None
+                    if cont_len > 0 and math.isfinite(logprob):
+                        loss = -float(logprob) / float(cont_len)
+                        try:
+                            ppl = math.exp(loss)
+                        except OverflowError:
+                            ppl = float("inf")
+                    row = {
+                        "request_index": batch_start + i,
+                        "mode": "compress_answer",
+                        "cont_len": cont_len,
+                        "logprob": logprob,
+                        "greedy": greedy,
+                        "ppl": ppl,
+                    }
+                    if loss is not None:
+                        row["loss"] = loss
+                    if meta_n_spans is not None:
+                        n_spans = int(meta_n_spans[i]) if i < len(meta_n_spans) else 0
+                        row["n_spans"] = n_spans
+                        row["total_comp_slots"] = n_spans * int(num_comp)
+                    if suffix_tokens_list is not None:
+                        row["suffix_len"] = len(suffix_tokens_list[i])
+                    if prefix_embeds_list is not None:
+                        pe = prefix_embeds_list[i]
+                        if pe is not None:
+                            prefix_len = int(pe.shape[0]) + (len(suffix_tokens_list[i]) if suffix_tokens_list is not None else 0)
+                            row["prefix_len"] = prefix_len
+                    rows.append(row)
+                self._append_loglikelihood_debug_rows(rows)
+
             if not nonempty_idxs:
+                _append_compress_debug_rows()
                 res.extend(chunk_results)
                 continue
 
             dummy_prompts = [""] * len(chunk)
             gen_lens = [len(c) for c in cont_tokens_list]
-            if not self._chat_use_template:
-                prefix_embeds_list, meta = self._build_compress_prompt_embeds_batch(
-                    dummy_prompts,
-                    gen_lens,
+            if not getattr(self, "_chat_use_template", False):
+                key_to_group: Dict[Tuple[int, ...], int] = {}
+                group_prompt_tokens: List[List[int]] = []
+                group_gen_lens: List[int] = []
+                group_indices: List[List[int]] = []
+                for i in range(len(chunk)):
+                    key = tuple(prompt_tokens_override[i])
+                    gidx = key_to_group.get(key)
+                    if gidx is None:
+                        gidx = len(group_prompt_tokens)
+                        key_to_group[key] = gidx
+                        group_prompt_tokens.append(prompt_tokens_override[i])
+                        group_gen_lens.append(int(gen_lens[i]))
+                        group_indices.append([i])
+                    else:
+                        if int(gen_lens[i]) > group_gen_lens[gidx]:
+                            group_gen_lens[gidx] = int(gen_lens[i])
+                        group_indices[gidx].append(i)
+
+                group_dummy_prompts = [""] * len(group_prompt_tokens)
+                group_prefix_embeds, meta = self._build_compress_prompt_embeds_batch(
+                    group_dummy_prompts,
+                    group_gen_lens,
                     include_bor=False,
                     decoder_include_prompt_tokens=False,
                     decoder_memory_layout="per_span",
-                    prompt_tokens_override=prompt_tokens_override,
+                    prompt_tokens_override=group_prompt_tokens,
                     return_meta=True,
                     # for do not add boq index for decoder prefix
                     not_add_boq_index=True,
-                    
                 )
+                meta_group_n_spans = meta.get("n_spans", [1] * len(group_prompt_tokens)) if meta else [1] * len(group_prompt_tokens)
+                prefix_embeds_list: List[Optional[torch.Tensor]] = [None] * len(chunk)
+                meta_n_spans: List[int] = [1] * len(chunk)
+                for gidx, idxs in enumerate(group_indices):
+                    for i in idxs:
+                        prefix_embeds_list[i] = group_prefix_embeds[gidx]
+                        meta_n_spans[i] = int(meta_group_n_spans[gidx]) if gidx < len(meta_group_n_spans) else 1
             else:
-                # get doc and context
                 doc_and_context = self._get_doc_and_context(ctx_tokens_list=prompt_tokens_override)
-                context_list, question_list, query_list = doc_and_context["context_list"], doc_and_context["question_list"], doc_and_context["query_list"]
-                prompt_list = doc_and_context["prompt_list"]
-                
-                context_tokens_list = [self._tokenizer.encode(context) for context in context_list]
-                prefix_embeds_list, meta = self._build_compress_prompt_embeds_batch(
-                    dummy_prompts,
-                    gen_lens,
+                context_list, question_list, query_list = (
+                    doc_and_context["context_list"],
+                    doc_and_context["question_list"],
+                    doc_and_context["query_list"],
+                )
+
+                key_to_group: Dict[Tuple[str, str], int] = {}
+                group_contexts: List[str] = []
+                group_queries: List[str] = []
+                group_gen_lens: List[int] = []
+                group_indices: List[List[int]] = []
+                for i in range(len(chunk)):
+                    key = (context_list[i], query_list[i])
+                    gidx = key_to_group.get(key)
+                    if gidx is None:
+                        gidx = len(group_contexts)
+                        key_to_group[key] = gidx
+                        group_contexts.append(context_list[i])
+                        group_queries.append(query_list[i])
+                        group_gen_lens.append(int(gen_lens[i]))
+                        group_indices.append([i])
+                    else:
+                        if int(gen_lens[i]) > group_gen_lens[gidx]:
+                            group_gen_lens[gidx] = int(gen_lens[i])
+                        group_indices[gidx].append(i)
+
+                group_dummy_prompts = [""] * len(group_contexts)
+                group_prefix_embeds, meta = self._build_compress_prompt_embeds_batch(
+                    group_dummy_prompts,
+                    group_gen_lens,
                     include_bor=False,
                     decoder_include_prompt_tokens=False,
                     decoder_memory_layout="per_span",
-                    prompt_tokens_override=context_tokens_list,
                     return_meta=True,
                     not_add_boq_index=False,
-                    context_list=context_list,
-                    query_list=query_list,
+                    context_list=group_contexts,
+                    query_list=group_queries,
                 )
+                meta_group_n_spans = meta.get("n_spans", [1] * len(group_contexts)) if meta else [1] * len(group_contexts)
+                prefix_embeds_list = [None] * len(chunk)
+                meta_n_spans = [1] * len(chunk)
+                for gidx, idxs in enumerate(group_indices):
+                    for i in idxs:
+                        prefix_embeds_list[i] = group_prefix_embeds[gidx]
+                        meta_n_spans[i] = int(meta_group_n_spans[gidx]) if gidx < len(meta_group_n_spans) else 1
             # breakpoint()
             
             # Suffix tokens (uncompressed tail of the prompt) can be ragged across the batch.
@@ -2444,7 +2563,7 @@ class NativeCausalLM(TemplateLM):
                 else:
                     suffix_embeds_list.append(torch.empty((0, d_model), device=self.device, dtype=self._dtype))
 
-            meta_n_spans = meta.get("n_spans", [1] * len(chunk)) if meta else [1] * len(chunk)
+            # meta_n_spans is now pre-mapped per sample for grouped compression
 
             seq_embeds: List[torch.Tensor] = []
             seq_targets: List[torch.Tensor] = []
@@ -2515,6 +2634,7 @@ class NativeCausalLM(TemplateLM):
                 valid_map.append(i)
 
             if not seq_embeds:
+                _append_compress_debug_rows(prefix_embeds_list, meta_n_spans)
                 res.extend(chunk_results)
                 continue
 
@@ -2563,12 +2683,14 @@ class NativeCausalLM(TemplateLM):
                 running += cont_len
 
             if running == 0:
+                _append_compress_debug_rows(prefix_embeds_list, meta_n_spans)
                 res.extend(chunk_results)
                 continue
 
             score_pos = torch.cat(score_pos_chunks, dim=0)
             score_targets = torch.cat(score_tgt_chunks, dim=0)
             if score_targets.numel() != running or score_pos.numel() != running:
+                _append_compress_debug_rows(prefix_embeds_list, meta_n_spans)
                 res.extend(chunk_results)
                 continue
 
@@ -2610,6 +2732,7 @@ class NativeCausalLM(TemplateLM):
                 greedy = bool(token_greedy_ok[s0:s1].all().item())
                 chunk_results[orig_idx] = (lp_sum, greedy)
 
+            _append_compress_debug_rows(prefix_embeds_list, meta_n_spans)
             res.extend(chunk_results)
         # Safety: if we somehow produced fewer responses than requests, pad with -inf.
         if len(res) < len(requests):
