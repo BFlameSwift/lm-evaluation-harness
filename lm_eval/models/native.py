@@ -714,6 +714,8 @@ class NativeCausalLM(TemplateLM):
             query_tokens = self._tokenizer.encode(user_text, bos=False, eos=False)
             spans = self._split_contexts_to_spans(contexts, self._max_mem_span_len)
             if max_spans is not None and max_spans > 0 and len(spans) > max_spans:
+                print(f"Truncating memory spans from {len(spans)} to {max_spans}")
+                print("budget:", self.decoder_budget, "span occupancy:", (2 + self._num_compression_tokens)* max_spans)
                 spans = spans[-max_spans:]
             n_spans = len(spans)
             comp_tokens: List[int] = []
@@ -2609,6 +2611,8 @@ class NativeCausalLM(TemplateLM):
         add_query = bool(getattr(self, "_add_query_before_likelihood", False))
         decoder_budget = int(self.decoder_budget)
         stop_id_set = set(self.stop_ids)
+        newline_ids = self._tokenizer.encode("\n", bos=False, eos=False)
+        newline_id = newline_ids[0] if newline_ids else None
 
         def _postprocess_recon(tokens: List[int], max_len: int) -> Tuple[List[int], dict]:
             out: List[int] = []
@@ -2644,9 +2648,52 @@ class NativeCausalLM(TemplateLM):
             # Strip trailing EOS/EOT just in case.
             while out and out[-1] in (eos_id, eot_id):
                 out.pop()
-            while out and out[-1] in stop_id_set:
+            # Strip trailing stop_ids.
+            while out and (out[-1] in stop_id_set or (newline_id is not None and out[-1] == newline_id)):
                 out.pop()
+
+            
             return out, {"stop_reason": stop_reason, "bor_count": bor_count, "eor_count": eor_count}
+
+        def _build_pre_output_tokens(
+            gi: int,
+            group_query_tokens: List[List[int]],
+            group_suffix_lens: List[int],
+            group_n_spans: List[int],
+        ) -> Tuple[List[int], List[int]]:
+            chat_enabled = bool(getattr(self, "_chat_use_template", False))
+            if chat_enabled:
+                memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
+                user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
+                assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
+                im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
+                span_cost = num_comp + 2
+                query_tokens = group_query_tokens[gi]
+                fixed_len = len(memory_start) + len(im_end) + len(user_start) + len(query_tokens) + len(im_end) + len(assistant_start)
+                max_spans = (decoder_budget - fixed_len - int(group_suffix_lens[gi])) // max(1, span_cost)
+                if max_spans <= 0:
+                    max_spans = 1
+                ret = self._format_chat(
+                    user_text=group_query_list[gi],
+                    contexts=group_doc_list[gi],
+                    max_spans=max_spans,
+                )
+                prefix_tokens = ret["decoder_prefix"]
+                if isinstance(prefix_tokens, str):
+                    prefix_tokens = self._tokenizer.encode(prefix_tokens, bos=False, eos=False)
+            else:
+                prefix_tokens = []
+                for _ in range(int(group_n_spans[gi])):
+                    prefix_tokens.extend([BEGIN_OF_MEMORY_INDEX] + ([0] * num_comp) + [END_OF_MEMORY_INDEX])
+                if self._add_boq_index:
+                    prefix_tokens.append(BEGIN_OF_QUERY_INDEX)
+                if add_bor:
+                    prefix_tokens.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+
+            pre_output_tokens = list(prefix_tokens) + list(group_recon_tokens[gi])
+            if add_query:
+                pre_output_tokens.extend(group_query_tokens[gi])
+            return pre_output_tokens, list(prefix_tokens)
 
         res: List[Tuple[float, bool]] = []
         bs = max(1, int(self._vllm_reconstruct_batch_size))
@@ -2876,10 +2923,15 @@ class NativeCausalLM(TemplateLM):
                 # Still write debug rows for reconstruction groups.
                 debug_rows: List[dict] = []
                 for gi in range(n_groups):
+                    pre_tokens_full, _ = _build_pre_output_tokens(gi, group_query_tokens, group_suffix_lens, group_n_spans)
+                    pre_tokens_no_prefix = list(group_recon_tokens[gi])
+                    if add_query:
+                        pre_tokens_no_prefix.extend(group_query_tokens[gi])
                     info = group_recon_infos[gi]
+                    group_first_idx = group_indices[gi][0] if group_indices[gi] else 0
                     debug_rows.append(
                         {
-                            "request_index": batch_start,
+                            "request_index": batch_start + group_first_idx,
                             "mode": "reconstruct_first",
                             "add_query_before_likelihood": add_query,
                             "reconstruct_add_bor": add_bor,
@@ -2895,9 +2947,23 @@ class NativeCausalLM(TemplateLM):
                             "recon_text_preview": self.tok_decode_w_special_tokens(group_recon_tokens[gi][:512])
                             if group_recon_tokens[gi]
                             else "",
+                            "recon_text": self.tok_decode_w_special_tokens(group_recon_tokens[gi]) if group_recon_tokens[gi] else "",
+                            "pre_output_text": self.tok_decode_w_special_tokens(pre_tokens_full) if pre_tokens_full else "",
+                            "pre_output_text_no_prefix": self.tok_decode_w_special_tokens(pre_tokens_no_prefix) if pre_tokens_no_prefix else "",
                             "query_len": len(group_query_tokens[gi]),
                         }
                     )
+                    for req_idx in group_indices[gi]:
+                        debug_rows.append(
+                            {
+                                "request_index": batch_start + req_idx,
+                                "mode": "reconstruct_first_option",
+                                "add_query_before_likelihood": add_query,
+                                "cont_len": len(cont_tokens_list[req_idx]),
+                                "logprob": chunk_results[req_idx][0],
+                                "greedy": chunk_results[req_idx][1],
+                            }
+                        )
                 self._append_loglikelihood_debug_rows(debug_rows)
                 res.extend(chunk_results)
                 continue
@@ -3036,12 +3102,17 @@ class NativeCausalLM(TemplateLM):
                     greedy = bool(token_greedy_ok[s0:s1].all().item())
                     chunk_results[req_idx] = (lp_sum, greedy)
 
-            # Debug rows: one per group + one per request scored.
+            # Debug rows: interleave group summary with its options.
             for gi in range(n_groups):
+                pre_tokens_full, _ = _build_pre_output_tokens(gi, group_query_tokens, group_suffix_lens, group_n_spans)
+                pre_tokens_no_prefix = list(group_recon_tokens[gi])
+                if add_query:
+                    pre_tokens_no_prefix.extend(group_query_tokens[gi])
                 info = group_recon_infos[gi]
+                group_first_idx = group_indices[gi][0] if group_indices[gi] else 0
                 debug_rows.append(
                     {
-                        "request_index": batch_start,
+                        "request_index": batch_start + group_first_idx,
                         "mode": "reconstruct_first",
                         "add_query_before_likelihood": add_query,
                         "reconstruct_add_bor": add_bor,
@@ -3057,21 +3128,24 @@ class NativeCausalLM(TemplateLM):
                         "recon_text_preview": self.tok_decode_w_special_tokens(group_recon_tokens[gi])
                         if group_recon_tokens[gi]
                         else "",
+                        "recon_text": self.tok_decode_w_special_tokens(group_recon_tokens[gi]) if group_recon_tokens[gi] else "",
+                        "pre_output_text": self.tok_decode_w_special_tokens(pre_tokens_full) if pre_tokens_full else "",
+                        "pre_output_text_no_prefix": self.tok_decode_w_special_tokens(pre_tokens_no_prefix) if pre_tokens_no_prefix else "",
                         "query_len": len(group_query_tokens[gi]),
                         "group_max_cont_len": group_max_cont_lens[gi],
                     }
                 )
-            for i in range(len(chunk)):
-                debug_rows.append(
-                    {
-                        "request_index": batch_start + i,
-                        "mode": "reconstruct_first_option",
-                        "add_query_before_likelihood": add_query,
-                        "cont_len": len(cont_tokens_list[i]),
-                        "logprob": chunk_results[i][0],
-                        "greedy": chunk_results[i][1],
-                    }
-                )
+                for req_idx in group_indices[gi]:
+                    debug_rows.append(
+                        {
+                            "request_index": batch_start + req_idx,
+                            "mode": "reconstruct_first_option",
+                            "add_query_before_likelihood": add_query,
+                            "cont_len": len(cont_tokens_list[req_idx]),
+                            "logprob": chunk_results[req_idx][0],
+                            "greedy": chunk_results[req_idx][1],
+                        }
+                    )
             self._append_loglikelihood_debug_rows(debug_rows)
 
             res.extend(chunk_results)
