@@ -571,11 +571,12 @@ class NativeCausalLM(TemplateLM):
 
     @property
     def max_length(self) -> int:
-        return self._max_seq_length
+        return self.decoder_budget
     
     @property
     def decoder_budget(self) -> int:
-        return self._decoder_budget or self._max_seq_length
+        budget = getattr(self, "_decoder_budget", None)
+        return budget or self._max_seq_length
 
     @property
     def max_gen_toks(self) -> int:
@@ -671,7 +672,14 @@ class NativeCausalLM(TemplateLM):
             spans.extend([toks_full[i : i + span_len] for i in range(0, len(toks_full), span_len)])
         return spans
 
-    def _format_chat(self, user_text: str, assistant_text: Optional[str] = None, add_generation_prompt: Optional[bool] = None,contexts: Optional[List[str]] = None) -> str:
+    def _format_chat(
+        self,
+        user_text: str,
+        assistant_text: Optional[str] = None,
+        add_generation_prompt: Optional[bool] = None,
+        contexts: Optional[List[str]] = None,
+        max_spans: Optional[int] = None,
+    ) -> str:
         """
             Optionally wrap text with chat template. If assistant_text is None, will
             produce a prompt that expects model generation; otherwise returns a full
@@ -716,6 +724,8 @@ class NativeCausalLM(TemplateLM):
             im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
             query_tokens = self._tokenizer.encode(user_text, bos=False, eos=False)
             spans = self._split_contexts_to_spans(contexts, self._max_mem_span_len)
+            if max_spans is not None and max_spans > 0 and len(spans) > max_spans:
+                spans = spans[-max_spans:]
             n_spans = len(spans)
             comp_tokens: List[int] = []
             comp_mask: List[bool] = []
@@ -1963,7 +1973,10 @@ class NativeCausalLM(TemplateLM):
         embeds: List[Optional[torch.Tensor]] = [None] * len(prompts)
         if decoder_memory_layout not in {"single", "per_span"}:
             raise ValueError(f"Unsupported decoder_memory_layout: {decoder_memory_layout}")
-        use_chat = bool(self._chat_use_template)
+        chat_enabled = bool(getattr(self, "_chat_use_template", False))
+        use_chat = bool(chat_enabled and context_list is not None and query_list is not None)
+        if chat_enabled and (context_list is None) != (query_list is None):
+            raise ValueError("chat template requires both context_list and query_list when using chat contexts")
         if use_chat:
             if context_list is None or query_list is None:
                 raise ValueError("chat template requires context_list and query_list in _build_compress_prompt_embeds_batch")
@@ -1971,6 +1984,7 @@ class NativeCausalLM(TemplateLM):
                 raise ValueError(
                     f"context_list/query_list must match prompts length; got {len(context_list)}/{len(query_list)} vs {len(prompts)}"
                 )
+        decoder_budget = int(self.decoder_budget)
 
         # --------------------------
         # Fast path: no compression
@@ -2019,8 +2033,8 @@ class NativeCausalLM(TemplateLM):
         # --------------------------
         # Compression-aware path
         # --------------------------
-        max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", self.max_length))
-        model_max_len = int(getattr(self.model.args, "max_seq_len", self.max_length))
+        max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", decoder_budget))
+        model_max_len = int(getattr(self.model.args, "max_seq_len", self._max_seq_length))
         if model_max_len <= num_comp:
             raise ValueError(
                 f"Invalid config: model_max_len={model_max_len} <= num_compression_tokens={num_comp}. "
@@ -2041,12 +2055,27 @@ class NativeCausalLM(TemplateLM):
             selected_flat_lens: List[int] = []
             total_comp_slots_list: List[int] = []
             comp_offsets: List[int] = [0]
+            max_spans_list: List[int] = []
 
             enc_tokens_mb: List[torch.Tensor] = []
             enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
 
-            for contexts in context_list:
+            memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
+            user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
+            assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
+            im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
+            span_cost = num_comp + 2
+
+            for i, contexts in enumerate(context_list):
                 spans = self._split_contexts_to_spans(contexts, span_len)
+                query_tokens = self._tokenizer.encode(query_list[i], bos=False, eos=False)
+                fixed_len = len(memory_start) + len(im_end) + len(user_start) + len(query_tokens) + len(im_end) + len(assistant_start)
+                max_spans = (decoder_budget - fixed_len - int(gen_lens[i])) // max(1, span_cost)
+                if max_spans <= 0:
+                    max_spans = 1
+                if max_spans < len(spans):
+                    spans = spans[-max_spans:]
+                max_spans_list.append(max_spans)
                 n_spans = len(spans)
                 selected_spans_list.append(n_spans)
                 selected_flat_lens.append(sum(len(sp) for sp in spans))
@@ -2090,7 +2119,7 @@ class NativeCausalLM(TemplateLM):
                     compression_vectors = compression_vectors.to(dtype=self._dtype)
 
             for i in range(len(prompts)):
-                ret = self._format_chat(user_text=query_list[i], contexts=context_list[i])
+                ret = self._format_chat(user_text=query_list[i], contexts=context_list[i], max_spans=max_spans_list[i])
                 prefix = ret["decoder_prefix"]
                 comp_mask = ret["comp_mask"]
                 total_comp_slots = int(ret.get("total_comp_slots", 0))
@@ -2152,7 +2181,7 @@ class NativeCausalLM(TemplateLM):
             total_static = prompt_in_dec_len + boq_extra + bor_extra + (2 if decoder_memory_layout == "single" else 0)
             
             span_cost = num_comp if decoder_memory_layout == "single" else (num_comp + 2)
-            max_comp_tokens = max(0, int(self.max_length) - int(total_static) - int(glen))
+            max_comp_tokens = max(0, int(decoder_budget) - int(total_static) - int(glen))
             
             max_chunks = max_comp_tokens // max(1, int(span_cost))
             if max_chunks <= 0:
@@ -2163,7 +2192,7 @@ class NativeCausalLM(TemplateLM):
             else:
                 print("no need chunk spans,",max_chunks,"total spans ",len(ctx_spans),"available spaces",max_comp_tokens-len(ctx_spans)*span_cost)
                 
-            print("max_length,",self.max_length,"total_static,",total_static,"glen,",glen,"max_comp_tokens,",max_comp_tokens,"max_chunks,",max_chunks)
+            print("max_length,",decoder_budget,"total_static,",total_static,"glen,",glen,"max_comp_tokens,",max_comp_tokens,"max_chunks,",max_chunks)
 
 
             n_spans = len(ctx_spans)
@@ -2637,8 +2666,8 @@ class NativeCausalLM(TemplateLM):
         add_bor = bool(self._reconstruct_add_bor)
         max_bor = int(self._reconstruct_max_bor)
         add_query = bool(getattr(self, "_add_query_before_likelihood", False))
-
-
+        decoder_budget = int(self.decoder_budget)
+        stop_id_set = set(self.stop_ids)
 
         def _postprocess_recon(tokens: List[int], max_len: int) -> Tuple[List[int], dict]:
             out: List[int] = []
@@ -2673,6 +2702,8 @@ class NativeCausalLM(TemplateLM):
                 stop_reason = "max_recon"
             # Strip trailing EOS/EOT just in case.
             while out and out[-1] in (eos_id, eot_id):
+                out.pop()
+            while out and out[-1] in stop_id_set:
                 out.pop()
             return out, {"stop_reason": stop_reason, "bor_count": bor_count, "eor_count": eor_count}
 
@@ -2749,10 +2780,15 @@ class NativeCausalLM(TemplateLM):
                 group_doc_list[group_idx] = context
                 group_query_list[group_idx] = query
                 group_max_cont_lens[group_idx] = max_cont
-                
-                group_suffix_lens[group_idx] = len(query_tokens) + max_cont
-                if self._add_query_before_likelihood:
-                    group_suffix_lens[group_idx] += len(query_tokens)
+                query_len = len(query_tokens)
+                if self._chat_use_template:
+                    group_suffix_lens[group_idx] = max_cont
+                    if self._add_query_before_likelihood:
+                        group_suffix_lens[group_idx] += query_len
+                else:
+                    group_suffix_lens[group_idx] = query_len + max_cont
+                    if self._add_query_before_likelihood:
+                        group_suffix_lens[group_idx] += query_len
                     
                 group_indices[group_idx] = idxs
                 
@@ -2814,7 +2850,7 @@ class NativeCausalLM(TemplateLM):
                 group_n_spans[gi] = n_spans
                 group_n_slots[gi] = num_comp * n_spans
                 # Reserve room for query suffix + the longest continuation option for this context.
-                budget_recon = max(0, int(self.max_length) - pl - int(group_suffix_lens[gi]))
+                budget_recon = max(0, decoder_budget - pl - int(group_suffix_lens[gi]))
                 flat_len = int(meta_flat_ctx[gi]) if gi < len(meta_flat_ctx) else budget_recon
                 group_max_recon_lens[gi] = min(flat_len, budget_recon)
 
@@ -2888,8 +2924,10 @@ class NativeCausalLM(TemplateLM):
                     cont = cont_tokens_list[req_idx]
                     if not cont:
                         continue
-                    if base_len + len(cont) > int(self.max_length):
+                    if base_len + len(cont) > decoder_budget:
                         # Cannot score without truncating continuation; return -inf for this option.
+                        print("base_len + len(cont) > decoder_budget,",base_len + len(cont),">",decoder_budget)
+                        print("we will skip this option")
                         continue
                     score_pairs.append((req_idx, gi))
 
