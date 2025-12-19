@@ -609,6 +609,7 @@ class NativeCausalLM(TemplateLM):
                 ids.append(token_ids[0])
             else:
                 print(f"Warning: token {token} has {len(token_ids)} ids: {token_ids}")
+        ids.append(self.eos_token_id)
         return ids
 
     def _append_loglikelihood_debug_rows(self, rows: List[dict]) -> None:
@@ -643,6 +644,21 @@ class NativeCausalLM(TemplateLM):
             return self._tokenizer.encode(string, bos=False, eos=False)
         else:
             return self._tokenizer.encode(string, bos=False, eos=False)
+
+    def _split_contexts_to_spans(self, contexts: Optional[List[str]], span_len: int) -> List[List[int]]:
+        if contexts is None:
+            return []
+        if isinstance(contexts, str):
+            contexts = [contexts]
+        spans: List[List[int]] = []
+        for ctx in contexts:
+            if not ctx:
+                continue
+            toks_full = self._tokenizer.encode(ctx, bos=False, eos=False)
+            if not toks_full:
+                continue
+            spans.extend([toks_full[i : i + span_len] for i in range(0, len(toks_full), span_len)])
+        return spans
 
     def _format_chat(self, user_text: str, assistant_text: Optional[str] = None, add_generation_prompt: Optional[bool] = None,contexts: Optional[List[str]] = None) -> str:
         """
@@ -683,38 +699,28 @@ class NativeCausalLM(TemplateLM):
             """
             bom_id = BEGIN_OF_MEMORY_INDEX
             eom_id = END_OF_MEMORY_INDEX
-            bor_id = BEGIN_OF_RECONSTRUCTION_INDEX
-            eor_id = END_OF_RECONSTRUCTION_INDEX
-            eos_id = self._tokenizer.eos_id
             memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
             user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
             assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
             im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
             query_tokens = self._tokenizer.encode(user_text, bos=False, eos=False)
-            n_slots = 0
-            comp_tokens = []
-            comp_mask = []
-            
+            spans = self._split_contexts_to_spans(contexts, self._max_mem_span_len)
+            n_spans = len(spans)
+            comp_tokens: List[int] = []
+            comp_mask: List[bool] = []
+
             comp_mask.extend([False] * len(memory_start))
-            
-            if isinstance(contexts, str):
-                contexts = [contexts]
-            
-            for context in contexts:
-                toks_full = self._tokenizer.encode(context, bos=False, eos=False)
-                spans = [toks_full[i : i + self._max_mem_span_len] for i in range(0, len(toks_full), self._max_mem_span_len)]
-                
-                for sp in spans:
-                    comp_tokens.append(bom_id)
-                    comp_tokens.extend([0] * self._compress_chunk)
-                    comp_tokens.append(eom_id)
-                    n_slots += 1
-                    comp_mask.append(False)
-                    comp_mask.extend([True] * self._compress_chunk)
-                    comp_mask.append(False)
-            
+
+            for _ in spans:
+                comp_tokens.append(bom_id)
+                comp_tokens.extend([0] * self._num_compression_tokens)
+                comp_tokens.append(eom_id)
+                comp_mask.append(False)
+                comp_mask.extend([True] * self._num_compression_tokens)
+                comp_mask.append(False)
+
             memory_tokens = memory_start + comp_tokens + im_end
-            comp_mask.extend([False] * len(memory_tokens))
+            comp_mask.extend([False] * len(im_end))
             user_tokens = user_start + query_tokens + im_end
             comp_mask.extend([False] * len(user_tokens))
             
@@ -722,16 +728,18 @@ class NativeCausalLM(TemplateLM):
             comp_mask.extend([False] * len(ret_assistant_tokens))
             
             
-            total_comp_slots = n_slots * self._num_compression_tokens
-            available = self.decoder_budget - 1 - n_slots * (self._num_compression_tokens + 2) - len(user_tokens) - len(ret_assistant_tokens)
-            total_encoder_tokens = n_slots * self._max_mem_span_len
+            total_comp_slots = n_spans * self._num_compression_tokens
+            available = self.decoder_budget - 1 - n_spans * (self._num_compression_tokens + 2) - len(user_tokens) - len(ret_assistant_tokens)
+            total_encoder_tokens = sum(len(sp) for sp in spans)
+            comp_offsets = [i * self._num_compression_tokens for i in range(n_spans + 1)]
             
         # breakpoint()
             
         return {
-            "n_spans": n_slots,
+            "n_spans": n_spans,
             "total_comp_slots": total_comp_slots,
             "total_encoder_tokens": total_encoder_tokens,
+            "comp_offsets": comp_offsets,
             "available": available,
             "decoder_prefix": memory_tokens + user_tokens + ret_assistant_tokens,
             "comp_mask": comp_mask,
@@ -1944,11 +1952,40 @@ class NativeCausalLM(TemplateLM):
         embeds: List[Optional[torch.Tensor]] = [None] * len(prompts)
         if decoder_memory_layout not in {"single", "per_span"}:
             raise ValueError(f"Unsupported decoder_memory_layout: {decoder_memory_layout}")
+        use_chat = bool(self._chat_use_template)
+        if use_chat:
+            if context_list is None or query_list is None:
+                raise ValueError("chat template requires context_list and query_list in _build_compress_prompt_embeds_batch")
+            if len(context_list) != len(prompts) or len(query_list) != len(prompts):
+                raise ValueError(
+                    f"context_list/query_list must match prompts length; got {len(context_list)}/{len(query_list)} vs {len(prompts)}"
+                )
 
         # --------------------------
         # Fast path: no compression
         # --------------------------
         if num_comp <= 0:
+            if use_chat:
+                meta_n_spans: List[int] = []
+                meta_flat_lens: List[int] = []
+                meta_slots: List[int] = []
+                for i in range(len(prompts)):
+                    ret = self._format_chat(user_text=query_list[i], contexts=context_list[i])
+                    prefix = ret["decoder_prefix"]
+                    if not prefix:
+                        embeds[i] = None
+                        meta_n_spans.append(0)
+                        meta_flat_lens.append(0)
+                        meta_slots.append(0)
+                        continue
+                    tok_tensor = torch.tensor(prefix, device=self.device, dtype=torch.long)
+                    embeds[i] = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
+                    meta_n_spans.append(int(ret.get("n_spans", 0)))
+                    meta_flat_lens.append(int(ret.get("total_encoder_tokens", 0)))
+                    meta_slots.append(int(ret.get("total_comp_slots", 0)))
+                meta = {"n_spans": meta_n_spans, "flat_ctx_len": meta_flat_lens, "slots": meta_slots}
+                return (embeds, meta) if return_meta else embeds
+
             meta_n_spans = [0] * len(prompts)
             meta_flat_lens = [0] * len(prompts)
             meta_slots = [0] * len(prompts)
@@ -1987,6 +2024,99 @@ class NativeCausalLM(TemplateLM):
         add_boq = bool(self._add_boq_index and not not_add_boq_index)
         boq_extra = 1 if add_boq else 0
         bor_extra = 1 if include_bor else 0
+
+        if use_chat:
+            selected_spans_list: List[int] = []
+            selected_flat_lens: List[int] = []
+            total_comp_slots_list: List[int] = []
+            comp_offsets: List[int] = [0]
+
+            enc_tokens_mb: List[torch.Tensor] = []
+            enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
+
+            for contexts in context_list:
+                spans = self._split_contexts_to_spans(contexts, span_len)
+                n_spans = len(spans)
+                selected_spans_list.append(n_spans)
+                selected_flat_lens.append(sum(len(sp) for sp in spans))
+                slots = num_comp * n_spans
+                total_comp_slots_list.append(slots)
+                comp_offsets.append(comp_offsets[-1] + slots)
+
+                for sp in spans:
+                    enc_seq = torch.tensor(list(sp) + ([placeholder_id] * num_comp), device=self.device, dtype=torch.long)
+                    clen = int(enc_seq.numel())
+                    mem_mask = torch.zeros(clen, device=self.device, dtype=torch.bool)
+                    mem_mask[-num_comp:] = True
+                    cu = torch.tensor([0, clen], device=self.device, dtype=torch.int32)
+                    enc_tokens_mb.append(enc_seq)
+                    enc_ctx_mb.append(
+                        {
+                            "cu_seqlens_q": cu,
+                            "cu_seqlens_k": cu,
+                            "max_seqlen_q": clen,
+                            "max_seqlen_k": clen,
+                            "positions": torch.arange(clen, device=self.device, dtype=torch.int32),
+                            "encoder_mem_mask": mem_mask,
+                        }
+                    )
+
+            expected_total_slots = int(comp_offsets[-1])
+            d_model = int(getattr(self.model.args, "d_model", 0))
+            if expected_total_slots <= 0:
+                compression_vectors = torch.empty((0, d_model), device=self.device, dtype=self._dtype)
+            else:
+                if not hasattr(self.model, "compress_multi_batches"):
+                    raise RuntimeError("Compression model missing compress_multi_batches; expected MassiveCompressedMemoryModel.")
+                with torch.autocast(device_type="cuda", dtype=self._dtype):
+                    compression_vectors = self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
+                if int(compression_vectors.shape[0]) != expected_total_slots:
+                    raise RuntimeError(
+                        f"compress_multi_batches returned {int(compression_vectors.shape[0])} vectors, "
+                        f"expected {expected_total_slots} (= num_comp * total_spans)."
+                    )
+                if compression_vectors.dtype != self._dtype:
+                    compression_vectors = compression_vectors.to(dtype=self._dtype)
+
+            for i in range(len(prompts)):
+                ret = self._format_chat(user_text=query_list[i], contexts=context_list[i])
+                prefix = ret["decoder_prefix"]
+                comp_mask = ret["comp_mask"]
+                total_comp_slots = int(ret.get("total_comp_slots", 0))
+                if total_comp_slots != total_comp_slots_list[i]:
+                    raise RuntimeError(
+                        f"Internal error: chat template slots ({total_comp_slots}) != encoder slots "
+                        f"({total_comp_slots_list[i]}) for sample {i}."
+                    )
+
+                prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
+                comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+                if int(comp_mask_t.numel()) != int(prefix_t.numel()):
+                    raise RuntimeError(
+                        f"Internal error: comp_mask length ({int(comp_mask_t.numel())}) != prefix length "
+                        f"({int(prefix_t.numel())}) for sample {i}."
+                    )
+
+                pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+                if total_comp_slots > 0:
+                    mask_slots = int(comp_mask_t.sum().item())
+                    if mask_slots != total_comp_slots:
+                        raise RuntimeError(
+                            f"Internal error: comp_mask slots ({mask_slots}) != expected slots ({total_comp_slots}) "
+                            f"for sample {i}."
+                        )
+                    v0, v1 = int(comp_offsets[i]), int(comp_offsets[i + 1])
+                    vec = compression_vectors[v0:v1]
+                    if int(vec.shape[0]) != total_comp_slots:
+                        raise RuntimeError(
+                            f"Internal error: compression slice rows ({int(vec.shape[0])}) != slots ({total_comp_slots}) "
+                            f"for sample {i}."
+                        )
+                    pe[comp_mask_t] = vec.to(dtype=self._dtype)
+                embeds[i] = pe
+
+            meta = {"n_spans": selected_spans_list, "flat_ctx_len": selected_flat_lens, "slots": total_comp_slots_list}
+            return (embeds, meta) if return_meta else embeds
 
         prompt_tokens_list: List[List[int]] = []
         selected_spans_list: List[int] = []
@@ -2102,38 +2232,26 @@ class NativeCausalLM(TemplateLM):
             if not prefix:
                 embeds[i] = None
                 continue
-            
-            if self._chat_use_template:
-                ret = self._format_chat(user_text=query_list[i], contexts=context_list[i])
-                
-                prefix = ret["decoder_prefix"]
-                comp_mask = ret["comp_mask"]
-                available = ret["available"]
-                n_spans = ret["n_spans"]
-                total_comp_slots = ret["total_comp_slots"]
-                
 
             prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
             comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
             
             pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
 
-            if total_comp_slots > 0:
+            if slots > 0:
                 mask_slots = int(comp_mask_t.sum().item())
-                if mask_slots != total_comp_slots:
+                if mask_slots != slots:
                     raise RuntimeError(
-                        f"Internal error: comp_mask slots ({mask_slots}) != expected slots ({total_comp_slots}) "
+                        f"Internal error: comp_mask slots ({mask_slots}) != expected slots ({slots}) "
                         f"for sample {i}."
                     )
                 v0, v1 = int(comp_offsets[i]), int(comp_offsets[i + 1])
                 vec = compression_vectors[v0:v1]
-                # breakpoint()
-                if int(vec.shape[0]) != total_comp_slots:
+                if int(vec.shape[0]) != slots:
                     raise RuntimeError(
-                        f"Internal error: compression slice rows ({int(vec.shape[0])}) != slots ({total_comp_slots}) "
+                        f"Internal error: compression slice rows ({int(vec.shape[0])}) != slots ({slots}) "
                         f"for sample {i}."
                     )
-                assert len(comp_mask_t) == len(vec), f"comp_mask_t: {len(comp_mask_t)}, vec: {len(vec)}"
                 pe[comp_mask_t] = vec.to(dtype=self._dtype)
 
             embeds[i] = pe
@@ -2600,7 +2718,7 @@ class NativeCausalLM(TemplateLM):
             #         group_suffix_lens[group_idx] += len(query)
 
             group_query_tokens = [self._tokenizer.encode(query) for query in group_query_list]
-            breakpoint()
+            # breakpoint()
             
 
             # Build compression prefix prompt_embeds per unique context (once per group).
@@ -2611,6 +2729,7 @@ class NativeCausalLM(TemplateLM):
                 include_bor=add_bor,
                 decoder_include_prompt_tokens=False,
                 decoder_memory_layout="per_span",
+                prompt_tokens_override=[self._tokenizer.encode(doc) for doc in group_doc_list] if self._chat_use_template==True else ctx_tokens_list,
                 return_meta=True,
                 not_add_boq_index=False,
                 context_list=group_doc_list,
@@ -2664,7 +2783,7 @@ class NativeCausalLM(TemplateLM):
             d_model = int(getattr(self.model.args, "d_model", 0))
             group_query_embeds: List[torch.Tensor] = []
             for qtoks in group_query_tokens:
-                if qtoks and self.add_query_before_likelihood:
+                if qtoks and self._add_query_before_likelihood:
                     q = torch.tensor(qtoks, device=self.device, dtype=torch.long)
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
                         qe = self.model.tok_embeddings(q).to(dtype=self._dtype)
