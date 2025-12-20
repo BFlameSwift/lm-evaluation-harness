@@ -337,60 +337,62 @@ class NativeCausalLM(TemplateLM):
         # if need_vllm:
     def init_vllm(self) -> None:
             # Prepare decoder-only safetensors if path not provided
-            model_path = self._vllm_model_path
-            # breakpoint()
-            if model_path is None:
-                # HF checkpoints: vLLM can load directly from checkpoint_dir (already a transformers directory).
-                is_native_ckpt = self._vllm_checkpoint_dir is not None and os.path.exists(os.path.join(self._vllm_checkpoint_dir, "metadata.json"))
-                if not is_native_ckpt:
-                    model_path = self._vllm_checkpoint_dir
-                else:
-                    base_dir = self._vllm_output_root or checkpoint_dir
-                    if base_dir is None:
-                        raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
-                    safedir = os.path.join(base_dir, "safemodel")
-                    model_path = safedir
-                    need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
-                        os.path.join(safedir, "config.json")
+        model_path = self._vllm_model_path
+        # breakpoint()
+        if model_path is None:
+            # HF checkpoints: vLLM can load directly from checkpoint_dir (already a transformers directory).
+            is_native_ckpt = self._vllm_checkpoint_dir is not None and os.path.exists(os.path.join(self._vllm_checkpoint_dir, "metadata.json"))
+            if not is_native_ckpt:
+                model_path = self._vllm_checkpoint_dir
+            else:
+                base_dir = self._vllm_output_root or checkpoint_dir
+                if base_dir is None:
+                    raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
+                safedir = os.path.join(base_dir, "safemodel")
+                model_path = safedir
+                need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
+                    os.path.join(safedir, "config.json")
+                )
+                if need_convert:
+                    os.makedirs(safedir, exist_ok=True)
+                    convert_checkpoint(
+                        checkpoint_dir=self._vllm_checkpoint_dir,
+                        output_dir=safedir,
+                        tokenizer_path=self._vllm_tokenizer_path,
+                        dtype=str(self._dtype).replace("torch.", ""),
+                        additional_kwargs={
+                            "max_position_embeddings": self._vllm_max_model_len,
+                            "eos_token_id": self.eos_token_id,
+                            "pad_token_id": self.pad_token_id,
+                            "bos_token_id": getattr(self._tokenizer, "bos_id", None),
+                            "temperature": self._temperature,
+                            "max_seq_len": self._max_seq_length,
+                        },
                     )
-                    if need_convert:
-                        os.makedirs(safedir, exist_ok=True)
-                        convert_checkpoint(
-                            checkpoint_dir=self._vllm_checkpoint_dir,
-                            output_dir=safedir,
-                            tokenizer_path=self._vllm_tokenizer_path,
-                            dtype=str(self._dtype).replace("torch.", ""),
-                            additional_kwargs={
-                                "max_position_embeddings": self._vllm_max_model_len,
-                                "eos_token_id": self.eos_token_id,
-                                "pad_token_id": self.pad_token_id,
-                                "bos_token_id": getattr(self._tokenizer, "bos_id", None),
-                                "temperature": self._temperature,
-                                "max_seq_len": self._max_seq_length,
-                            },
-                        )
+        # breakpoint()
+        try:
             # breakpoint()
-            try:
-                # breakpoint()
-                cfg = VLLMEngineConfig(
-                    model_path=model_path,
-                    tensor_parallel_size=vllm_tensor_parallel,
-                    # dtype=str(self._dtype).replace("torch.", ""),
-                    max_model_len= vllm_max_model_len or self._max_seq_length,
-                    enable_prompt_embeds=True,
-                    tokenizer=tokenizer_path or checkpoint_dir,
-                    additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
-                )
-                # breakpoint()
-                engine = VLLMEngineWrapper(cfg)
-                # breakpoint()
-                self._vllm_manager = VLLMDecoderManager(
-                    engine_wrapper=engine,
-                )
-                # breakpoint()
-            except Exception as e:
-                print(f"WARNING: Failed to init vLLM, falling back to torch backend. Error: {e}", file=sys.stderr)
-                self._vllm_manager = None
+            cfg = VLLMEngineConfig(
+                model_path=model_path,
+                tensor_parallel_size=vllm_tensor_parallel,
+                # dtype=str(self._dtype).replace("torch.", ""),
+                max_model_len= vllm_max_model_len or self._max_seq_length,
+                enable_prompt_embeds=True,
+                tokenizer=tokenizer_path or checkpoint_dir,
+                additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
+            )
+            # breakpoint()
+            engine = VLLMEngineWrapper(cfg)
+            # breakpoint()
+            self._vllm_manager = VLLMDecoderManager(
+                engine_wrapper=engine,
+            )
+            # breakpoint()
+        except Exception as e:
+            print(f"WARNING: Failed to init vLLM, falling back to torch backend. Error: {e}", file=sys.stderr)
+            self._vllm_manager = None
+                
+        
 
     def shutdown_vllm_manager(
         self,
