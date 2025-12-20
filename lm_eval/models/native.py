@@ -333,7 +333,7 @@ class NativeCausalLM(TemplateLM):
         self._vllm_dtype = dtype
         
         # breakpoint()
-        if need_vllm or self._use_vllm:
+        if need_vllm or self._use_vllm or True:
             self._init_vllm()
         # breakpoint()
         
