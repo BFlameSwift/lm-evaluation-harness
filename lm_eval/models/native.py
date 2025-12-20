@@ -322,6 +322,7 @@ class NativeCausalLM(TemplateLM):
         
         if self._mode == "vllm_decoding_with_compress":
             need_vllm = True
+            
         self._use_vllm = need_vllm
         self._vllm_model_path = vllm_model_path
         self._vllm_max_model_len = vllm_max_model_len
@@ -330,14 +331,17 @@ class NativeCausalLM(TemplateLM):
         self._vllm_tokenizer_path = tokenizer_path
         self._vllm_checkpoint_dir = checkpoint_dir
         self._vllm_dtype = dtype
+        
         # breakpoint()
-        if need_vllm:
-            self.init_vllm()
-
+        if need_vllm or self._use_vllm:
+            self._init_vllm()
+        # breakpoint()
+        
         # if need_vllm:
-    def init_vllm(self) -> None:
+    def _init_vllm(self) -> None:
             # Prepare decoder-only safetensors if path not provided
         model_path = self._vllm_model_path
+        
         # breakpoint()
         if model_path is None:
             # HF checkpoints: vLLM can load directly from checkpoint_dir (already a transformers directory).
@@ -345,7 +349,7 @@ class NativeCausalLM(TemplateLM):
             if not is_native_ckpt:
                 model_path = self._vllm_checkpoint_dir
             else:
-                base_dir = self._vllm_output_root or checkpoint_dir
+                base_dir = self._vllm_output_root or self._vllm_checkpoint_dir
                 if base_dir is None:
                     raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
                 safedir = os.path.join(base_dir, "safemodel")
@@ -374,12 +378,12 @@ class NativeCausalLM(TemplateLM):
             # breakpoint()
             cfg = VLLMEngineConfig(
                 model_path=model_path,
-                tensor_parallel_size=vllm_tensor_parallel,
+                tensor_parallel_size=self._vllm_tensor_parallel,
                 # dtype=str(self._dtype).replace("torch.", ""),
-                max_model_len= vllm_max_model_len or self._max_seq_length,
+                max_model_len= self._vllm_max_model_len or self._max_seq_length,
                 enable_prompt_embeds=True,
-                tokenizer=tokenizer_path or checkpoint_dir,
-                additional_kwargs={"gpu_memory_utilization": vllm_gpu_memory_utilization},
+                tokenizer=self._vllm_tokenizer_path or self._vllm_checkpoint_dir,
+                additional_kwargs={"gpu_memory_utilization": self._vllm_gpu_memory_utilization},
             )
             # breakpoint()
             engine = VLLMEngineWrapper(cfg)
@@ -391,6 +395,8 @@ class NativeCausalLM(TemplateLM):
         except Exception as e:
             print(f"WARNING: Failed to init vLLM, falling back to torch backend. Error: {e}", file=sys.stderr)
             self._vllm_manager = None
+            
+    
                 
         
 
