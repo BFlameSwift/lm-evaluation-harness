@@ -363,7 +363,7 @@ class NativeCausalLM(TemplateLM):
                         checkpoint_dir=self._vllm_checkpoint_dir,
                         output_dir=safedir,
                         tokenizer_path=self._vllm_tokenizer_path,
-                        dtype=str(self._dtype).replace("torch.", ""),
+                        dtype=self._dtype,
                         additional_kwargs={
                             "max_position_embeddings": self._vllm_max_model_len,
                             "eos_token_id": self.eos_token_id,
