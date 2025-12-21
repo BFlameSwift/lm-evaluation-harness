@@ -104,6 +104,17 @@ def _coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional
         return default
 
 
+def _normalize_optional_text(value: Optional[Any]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw.lower() == "none":
+            return ""
+        return value
+    return str(value)
+
+
 def _default_distributed_args() -> DistributedArgs:
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -218,6 +229,8 @@ class NativeCausalLM(TemplateLM):
         reconstruct_add_bor: bool = False,
         reconstruct_max_bor: int = 3,
         add_query_before_likelihood: bool = False,
+        likelihood_prefix_reconstruct: Optional[str] = None,
+        likelihood_prefix_compress_answer: Optional[str] = None,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
 
@@ -273,6 +286,10 @@ class NativeCausalLM(TemplateLM):
         self._reconstruct_add_bor = bool(reconstruct_add_bor)
         self._reconstruct_max_bor = max(0, int(reconstruct_max_bor))
         self._add_query_before_likelihood = bool(add_query_before_likelihood)
+        self._likelihood_prefix_reconstruct = _normalize_optional_text(likelihood_prefix_reconstruct)
+        self._likelihood_prefix_compress_answer = _normalize_optional_text(likelihood_prefix_compress_answer)
+        self._likelihood_prefix_tokens_reconstruct: Optional[List[int]] = None
+        self._likelihood_prefix_tokens_compress_answer: Optional[List[int]] = None
         self._save_loglikelihood_debug = bool(save_loglikelihood_debug)
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
@@ -933,6 +950,23 @@ class NativeCausalLM(TemplateLM):
         return self._tokenizer.decode(tokens)
     def tok_decode_w_special_tokens(self, tokens: List[int]) -> str:
         return self._tokenizer.decode_w_special_tokens(tokens)
+
+    def _get_likelihood_prefix_tokens(self, mode: str) -> List[int]:
+        if mode == "reconstruct_first":
+            cached = getattr(self, "_likelihood_prefix_tokens_reconstruct", None)
+            if cached is None:
+                text = getattr(self, "_likelihood_prefix_reconstruct", "")
+                cached = self._tokenizer.encode(text, bos=False, eos=False) if text else []
+                setattr(self, "_likelihood_prefix_tokens_reconstruct", cached)
+            return cached
+        if mode == "compress_answer":
+            cached = getattr(self, "_likelihood_prefix_tokens_compress_answer", None)
+            if cached is None:
+                text = getattr(self, "_likelihood_prefix_compress_answer", "")
+                cached = self._tokenizer.encode(text, bos=False, eos=False) if text else []
+                setattr(self, "_likelihood_prefix_tokens_compress_answer", cached)
+            return cached
+        return []
 
     @torch.no_grad()
     def _chunked_logprob_and_greedy(
@@ -2920,6 +2954,9 @@ class NativeCausalLM(TemplateLM):
                 self._tokenizer.encode(pair[1], bos=False, eos=False) if pair and len(pair) > 1 else []
                 for (pair, _, _) in chunk
             ]
+            prefix_tokens = self._get_likelihood_prefix_tokens("compress_answer")
+            if prefix_tokens:
+                cont_tokens_list = [prefix_tokens + list(cont) for cont in cont_tokens_list]
             suffix_tokens_list: List[List[int]] = [[] for _ in range(len(chunk))]
 
             
@@ -3437,6 +3474,9 @@ class NativeCausalLM(TemplateLM):
                 self._tokenizer.encode(pair[1], bos=False, eos=False) if pair and len(pair) > 1 else []
                 for (pair, _, _) in chunk
             ]
+            prefix_tokens = self._get_likelihood_prefix_tokens("reconstruct_first")
+            if prefix_tokens:
+                cont_tokens_list = [prefix_tokens + list(cont) for cont in cont_tokens_list]
 
             # Per-request results in this chunk (keep order).
             chunk_results: List[Tuple[float, bool]] = [(float("-inf"), False)] * len(chunk)
