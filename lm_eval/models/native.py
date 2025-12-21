@@ -379,7 +379,7 @@ class NativeCausalLM(TemplateLM):
             cfg = VLLMEngineConfig(
                 model_path=model_path,
                 tensor_parallel_size=self._vllm_tensor_parallel,
-                # dtype=str(self._dtype).replace("torch.", ""),
+                dtype=self._dtype,
                 max_model_len= self._vllm_max_model_len or self._max_seq_length,
                 enable_prompt_embeds=True,
                 tokenizer=self._vllm_tokenizer_path or self._vllm_checkpoint_dir,
