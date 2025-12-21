@@ -358,7 +358,7 @@ class NativeCausalLM(TemplateLM):
         self._vllm_model_path = vllm_model_path
         self._vllm_max_model_len = _coerce_int(vllm_max_model_len, None)
         if self._vllm_max_model_len is None or self._vllm_max_model_len <= 0:
-            self._vllm_max_model_len = _coerce_int(self._max_seq_length, None) or 2048
+            self._vllm_max_model_len = _coerce_int(self._decoder_budget, None) or 2048
         self._vllm_tensor_parallel = vllm_tensor_parallel
         self._vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
         self._vllm_tokenizer_path = tokenizer_path
@@ -406,6 +406,7 @@ class NativeCausalLM(TemplateLM):
                             "max_seq_len": self._max_seq_length,
                         },
                     )
+                self._ensure_vllm_config(safedir)
         # breakpoint()
         try:
             # breakpoint()
@@ -431,7 +432,50 @@ class NativeCausalLM(TemplateLM):
             
     
                 
-        
+    def _ensure_vllm_config(self, safedir: str) -> None:
+        cfg_path = os.path.join(safedir, "config.json")
+        if not os.path.exists(cfg_path):
+            return
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            return
+
+        updated = False
+        target_len = int(self._vllm_max_model_len or self._max_seq_length or 2048)
+        for key in ("max_position_embeddings", "max_seq_len", "model_max_length"):
+            val = cfg.get(key)
+            if not isinstance(val, int) or val <= 0:
+                cfg[key] = target_len
+                updated = True
+
+        if updated:
+            try:
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2)
+            except Exception:
+                pass
+
+        gen_path = os.path.join(safedir, "generation_config.json")
+        if os.path.exists(gen_path):
+            try:
+                with open(gen_path, "r", encoding="utf-8") as f:
+                    gen_cfg = json.load(f)
+            except Exception:
+                gen_cfg = {}
+            gen_updated = False
+            max_len_val = gen_cfg.get("max_length")
+            if not isinstance(max_len_val, int) or max_len_val <= 0:
+                gen_cfg["max_length"] = target_len
+                gen_updated = True
+            if gen_updated:
+                try:
+                    with open(gen_path, "w", encoding="utf-8") as f:
+                        json.dump(gen_cfg, f, indent=2)
+                except Exception:
+                    pass
+
 
     def shutdown_vllm_manager(
         self,
