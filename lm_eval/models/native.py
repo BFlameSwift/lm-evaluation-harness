@@ -85,6 +85,25 @@ def _parse_mode(name: Optional[str]) -> str:
     return name
 
 
+def _coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional[int]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw.lower() == "none":
+            return default
+        try:
+            return int(raw)
+        except Exception:
+            return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 def _default_distributed_args() -> DistributedArgs:
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -258,7 +277,8 @@ class NativeCausalLM(TemplateLM):
         self._last_loglikelihood_debug: List[dict] = []
         
         
-        self._decoder_budget = max(max_seq_length, 8192)
+        max_seq_length_int = _coerce_int(max_seq_length, None)
+        self._decoder_budget = max(max_seq_length_int or 0, 8192)
         
         
 
@@ -299,15 +319,26 @@ class NativeCausalLM(TemplateLM):
         self._device_mesh = device_mesh
         self._model_parallel_group = device_mesh.get_group(1) if device_mesh is not None else None
 
-        if max_seq_length is not None:
-            self._max_seq_length = int(max_seq_length)
+        if max_seq_length_int is not None:
+            self._max_seq_length = max_seq_length_int
         else:
             if hasattr(self.model, "args"):
-                self._max_seq_length = int(self.model.args.max_seq_len)
+                self._max_seq_length = _coerce_int(getattr(self.model.args, "max_seq_len", None), None)
             else:
-                self._max_seq_length = int(
-                    getattr(getattr(self.model, "config", None), "max_position_embeddings", 2048) or 2048
+                self._max_seq_length = _coerce_int(
+                    getattr(getattr(self.model, "config", None), "max_position_embeddings", None), None
                 )
+                if self._max_seq_length is None:
+                    self._max_seq_length = _coerce_int(
+                        getattr(getattr(self.model, "config", None), "max_seq_len", None), None
+                    )
+                if self._max_seq_length is None:
+                    self._max_seq_length = _coerce_int(
+                        getattr(getattr(self.model, "config", None), "model_max_length", None), None
+                    )
+            if self._max_seq_length is None or self._max_seq_length <= 0:
+                self._max_seq_length = 2048
+        self._decoder_budget = max(self._decoder_budget, self._max_seq_length)
         if self._max_mem_span_len_override is not None:
             # Respect override for compression-aware paths
             if hasattr(self.model, "args"):
@@ -325,7 +356,9 @@ class NativeCausalLM(TemplateLM):
             
         self._use_vllm = need_vllm
         self._vllm_model_path = vllm_model_path
-        self._vllm_max_model_len = vllm_max_model_len
+        self._vllm_max_model_len = _coerce_int(vllm_max_model_len, None)
+        if self._vllm_max_model_len is None or self._vllm_max_model_len <= 0:
+            self._vllm_max_model_len = _coerce_int(self._max_seq_length, None) or 2048
         self._vllm_tensor_parallel = vllm_tensor_parallel
         self._vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
         self._vllm_tokenizer_path = tokenizer_path
