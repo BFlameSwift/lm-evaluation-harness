@@ -74,10 +74,29 @@ class GeneralConfigTracker:
             return args_after_key.split(",")[0]
 
         # order does matter, e.g. peft and delta are provided together with pretrained
-        prefixes = ["peft=", "delta=", "pretrained=", "model=", "path=", "engine="]
+        prefixes = [
+            "peft=",
+            "delta=",
+            "pretrained=",
+            # native-rag checkpoints typically pass `checkpoint_dir=...`
+            "checkpoint_dir=",
+            "model=",
+            "path=",
+            "engine=",
+        ]
         for prefix in prefixes:
             if prefix in model_args:
-                return extract_model_name(model_args, prefix)
+                name = extract_model_name(model_args, prefix)
+                if prefix == "checkpoint_dir=":
+                    # Shorten long filesystem paths to keep output directories readable:
+                    #   /.../<run_name>/updates_750 -> <run_name>/updates_750
+                    norm = name.rstrip("/\\")
+                    base = os.path.basename(norm)
+                    parent = os.path.basename(os.path.dirname(norm))
+                    if parent and parent != norm and parent != os.path.sep:
+                        return f"{parent}/{base}"
+                    return base or name
+                return name
         return ""
 
     def log_experiment_args(

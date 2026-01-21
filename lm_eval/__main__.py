@@ -304,6 +304,11 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         parser = setup_parser()
         args = parse_eval_args(parser)
 
+    # Expose output_path to model backends that need to colocate auxiliary debug
+    # artifacts with the evaluation outputs (e.g., NIAH prompt/response dumps).
+    if getattr(args, "output_path", None):
+        os.environ["LM_EVAL_OUTPUT_PATH"] = str(args.output_path)
+
     # defer loading `lm_eval` submodules for faster CLI load
     from lm_eval import evaluator, utils
     from lm_eval.evaluator import request_caching_arg_to_dict

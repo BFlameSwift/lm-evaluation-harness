@@ -178,7 +178,15 @@ def _split_niah_input(input_text: str) -> Tuple[str, str]:
 
 
 
-def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_names: List[Optional[str]],prompt_list: List[str] = [],doc_key: str = "context", question_key: str = "question") -> Dict[str, List[str]]:
+def _split_doc_and_query(
+    active_lg_docs: List[Optional[dict]],
+    active_tasks_names: List[Optional[str]],
+    prompt_list: List[str] = [],
+    doc_key: str = "context",
+    question_key: str = "question",
+    *,
+    niah_use_bor: bool = False,
+) -> Dict[str, List[str]]:
     """
     Split a rendered prompt into:
         - doc_tokens: everything up to and including the closing `</text>` marker
@@ -232,7 +240,7 @@ def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_name
             # question, and prefill the assistant with `gen_prefix` so generation
             # continues with the expected answer format.
             query_text = question_text.strip()
-            assistant_prefix = gen_prefix
+            assistant_prefix = "" if niah_use_bor else gen_prefix
 
             ret_question_list.append(question_text)
             ret_query_list.append(query_text)
@@ -336,7 +344,8 @@ class NativeCausalLM(TemplateLM):
         niah_use_bor: bool = False,
         # NIAH generate_until debugging (write JSONL cases)
         niah_debug_dir: Optional[str] = None,
-        niah_debug_max_cases: int = 50,
+        # 0 disables, <0 means "unlimited"
+        niah_debug_max_cases: int = -1,
         niah_debug_max_prompt_chars: int = 8000,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
@@ -402,7 +411,28 @@ class NativeCausalLM(TemplateLM):
         self._last_loglikelihood_debug: List[dict] = []
         self._niah_use_bor = bool(niah_use_bor)
         self._niah_debug_dir = _normalize_optional_text(niah_debug_dir)
-        self._niah_debug_max_cases = max(0, int(niah_debug_max_cases))
+        if not self._niah_debug_dir:
+            # By default, colocate NIAH debug artifacts with lm-eval outputs.
+            out_path = _normalize_optional_text(os.environ.get("LM_EVAL_OUTPUT_PATH", ""))
+            if out_path:
+                ext = os.path.splitext(out_path)[1].lower()
+                if ext in (".json", ".jsonl"):
+                    self._niah_debug_dir = os.path.dirname(out_path) or "."
+                else:
+                    # Match lm-eval's default directory layout: output_path/<model_name_sanitized>/...
+                    # For native, the model name is derived from checkpoint_dir where possible.
+                    model_tag = ""
+                    if checkpoint_dir:
+                        norm = str(checkpoint_dir).rstrip("/\\")
+                        base = os.path.basename(norm)
+                        parent = os.path.basename(os.path.dirname(norm))
+                        model_tag = f"{parent}/{base}" if parent and parent != norm else base
+                    if not model_tag:
+                        model_tag = "native"
+                    model_dir = re.sub(r"[\"<>:/\|\\?\*\[\]]+", "__", model_tag)
+                    self._niah_debug_dir = os.path.join(out_path, model_dir)
+        # 0 disables, <0 means "unlimited", >0 caps number of written cases
+        self._niah_debug_max_cases = int(niah_debug_max_cases)
         self._niah_debug_max_prompt_chars = max(0, int(niah_debug_max_prompt_chars))
         self._niah_debug_dumped = 0
         
@@ -953,14 +983,15 @@ class NativeCausalLM(TemplateLM):
         if not debug_dir:
             return
         max_cases = int(getattr(self, "_niah_debug_max_cases", 0) or 0)
-        if max_cases <= 0:
+        # 0 disables, <0 means "unlimited"
+        if max_cases == 0:
             return
         dumped = int(getattr(self, "_niah_debug_dumped", 0) or 0)
-        if dumped >= max_cases:
+        if max_cases > 0 and dumped >= max_cases:
             return
         os.makedirs(debug_dir, exist_ok=True)
         out_path = os.path.join(debug_dir, "niah_debug_cases.jsonl")
-        to_write = rows[: max_cases - dumped]
+        to_write = rows if max_cases < 0 else rows[: max_cases - dumped]
         with open(out_path, "a", encoding="utf-8") as f:
             for row in to_write:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -2281,6 +2312,7 @@ class NativeCausalLM(TemplateLM):
                         prompt_list=[c for c, _ in chunk],
                         doc_key=keys["doc_key"],
                         question_key=keys["question_key"],
+                        niah_use_bor=bool(getattr(self, "_niah_use_bor", False)),
                     )
                     prompts = [""] * len(chunk)
                     embeds = self._build_compress_prompt_embeds_batch(
@@ -2303,6 +2335,7 @@ class NativeCausalLM(TemplateLM):
                     )
                 valid_indices = [i for i, e in enumerate(embeds) if e is not None]
                 outs_text = [""] * len(chunk)
+                outs_token_ids: List[Optional[List[int]]] = [None] * len(chunk)
                 if valid_indices:
                     sampling_params = {
                         "max_tokens": max(gen_lens[i] for i in valid_indices),
@@ -2312,22 +2345,35 @@ class NativeCausalLM(TemplateLM):
                     batch_embeds = [embeds[i] for i in valid_indices]
                     outs = self._vllm_manager.generate_from_embeddings(batch_embeds, sampling_params=sampling_params)
                     for idx, out in zip(valid_indices, outs):
-                        text = out.outputs[0].text if out.outputs else ""
+                        choice0 = out.outputs[0] if getattr(out, "outputs", None) else None
+                        text = choice0.text if choice0 is not None else ""
                         outs_text[idx] = self._truncate_until(text, gkwargs[idx].get("until"))
+                        try:
+                            token_ids = getattr(choice0, "token_ids", None) if choice0 is not None else None
+                            outs_token_ids[idx] = list(token_ids) if token_ids is not None else None
+                        except Exception:
+                            outs_token_ids[idx] = None
                 results.extend(outs_text)
 
-                # NIAH: dump one debug case per batch (rank0), including special-token prompt.
+                # NIAH: dump debug cases (rank0), including special-token prompt/response.
                 if (
                     split_data is not None
                     and "niah" in task0.lower()
                     and getattr(self, "_niah_debug_dir", "")
-                    and int(getattr(self, "_niah_debug_max_cases", 0) or 0) > 0
+                    and int(getattr(self, "_niah_debug_max_cases", 0) or 0) != 0
                 ):
-                    dbg_idx = valid_indices[0] if valid_indices else 0
-                    if 0 <= dbg_idx < len(chunk_docs) and chunk_docs[dbg_idx] is not None:
+                    debug_rows: List[dict] = []
+                    for dbg_idx in valid_indices or list(range(len(chunk_docs))):
+                        if not (0 <= dbg_idx < len(chunk_docs)):
+                            continue
+                        if chunk_docs[dbg_idx] is None:
+                            continue
                         doc = chunk_docs[dbg_idx] or {}
                         ctx_text = split_data["context_list"][dbg_idx] if dbg_idx < len(split_data["context_list"]) else ""
                         query_text = split_data["query_list"][dbg_idx] if dbg_idx < len(split_data["query_list"]) else ""
+                        question_text = (
+                            split_data["question_list"][dbg_idx] if dbg_idx < len(split_data.get("question_list", [])) else ""
+                        )
                         assistant_prefix = ""
                         if "assistant_prefix_list" in split_data and dbg_idx < len(split_data["assistant_prefix_list"]):
                             assistant_prefix = split_data["assistant_prefix_list"][dbg_idx] or ""
@@ -2371,9 +2417,6 @@ class NativeCausalLM(TemplateLM):
                             max_spans=max_spans,
                         )
                         prefix_tokens = list(chat_ret.get("decoder_prefix_tokens") or [])
-                        # For `reconstruct_first`, the actual generation path appends a BOR token
-                        # right after the assistant prefix. Include it in debug dumps so users
-                        # can inspect BOR/EOR behavior in the saved prompt string.
                         if include_bor:
                             prefix_tokens.append(BEGIN_OF_RECONSTRUCTION_INDEX)
                         prompt_special = self.tok_decode_w_special_tokens(prefix_tokens)
@@ -2382,23 +2425,33 @@ class NativeCausalLM(TemplateLM):
                             prompt_special = prompt_special[:max_chars] + "\n...[truncated]..."
 
                         raw_out = outs_text[dbg_idx] if dbg_idx < len(outs_text) else ""
+                        resp_token_ids = outs_token_ids[dbg_idx] if dbg_idx < len(outs_token_ids) else None
+                        resp_special = (
+                            self.tok_decode_w_special_tokens(resp_token_ids) if resp_token_ids else raw_out
+                        )
+
                         needle_type = _infer_niah_needle_type(doc.get("outputs", []))
                         extracted = _extract_niah_needles(raw_out, needle_type) if needle_type else []
-                        row = {
-                            "task": task0,
-                            "idx_in_batch": dbg_idx,
-                            "doc_index": doc.get("index"),
-                            "max_length": doc.get("max_length"),
-                            "include_bor": bool(include_bor),
-                            "niah_use_bor": bool(getattr(self, "_niah_use_bor", False)),
-                            "needle_type": needle_type,
-                            "gold_outputs": doc.get("outputs"),
-                            "query": doc.get("gen_prefix"),
-                            "prompt_with_special_tokens": prompt_special,
-                            "response": raw_out,
-                            "extracted": extracted,
-                        }
-                        self._append_niah_debug_rows([row])
+                        debug_rows.append(
+                            {
+                                "task": task0,
+                                "idx_in_batch": dbg_idx,
+                                "doc_index": doc.get("index"),
+                                "max_length": doc.get("max_length"),
+                                "include_bor": bool(include_bor),
+                                "niah_use_bor": bool(getattr(self, "_niah_use_bor", False)),
+                                "needle_type": needle_type,
+                                "gold_outputs": doc.get("outputs"),
+                                "question": question_text,
+                                "query": query_text,
+                                "gen_prefix": doc.get("gen_prefix"),
+                                "prompt_with_special_tokens": prompt_special,
+                                "response": raw_out,
+                                "response_with_special_tokens": resp_special,
+                                "extracted": extracted,
+                            }
+                        )
+                    self._append_niah_debug_rows(debug_rows)
                 continue
 
             # Fallback: torch paths, process one by one within chunk
@@ -3719,7 +3772,12 @@ class NativeCausalLM(TemplateLM):
 
         prompt_list = [self._tokenizer.decode_w_special_tokens(ctx) for ctx in ctx_tokens_list]
         split_doc_and_query_results = _split_doc_and_query(
-            active_lg_docs=docs_slice, active_tasks_names=tasks_slice, prompt_list=prompt_list, doc_key=doc_key, question_key=question_key
+            active_lg_docs=docs_slice,
+            active_tasks_names=tasks_slice,
+            prompt_list=prompt_list,
+            doc_key=doc_key,
+            question_key=question_key,
+            niah_use_bor=False,
         )
         context_list = split_doc_and_query_results["context_list"]
         question_list = split_doc_and_query_results["question_list"]
