@@ -86,7 +86,7 @@ def _parse_mode(name: Optional[str]) -> str:
     if name is None:
         return "decoder"
     name = name.lower()
-    if name not in {"decoder", "compress_answer", "reconstruct_first", "vllm_decoding_with_compress"}:
+    if name not in {"decoder", "compress_answer", "reconstruct_first", "vllm_decoding_with_compress", "niah_generate"}:
         raise ValueError(f"Unsupported native model mode: {name}")
     return name
 
@@ -291,6 +291,7 @@ class NativeCausalLM(TemplateLM):
       - compress_answer: compress the context via encoder, then score the answer conditioned on memory.
       - reconstruct_first: reconstruct the context (optionally with vLLM prompt_embeds), then score continuation PPL.
       - vllm_decoding_with_compress: use vLLM to decode the context, then compress the context conditioned on memory.
+      - niah_generate: NIAH-focused generate-only path (no likelihood); uses compressed-memory decoding and optional BOR.
     """
 
     backend = "causal"
@@ -532,7 +533,7 @@ class NativeCausalLM(TemplateLM):
         need_vllm = self._use_vllm_reconstruct or self._use_vllm_decoder or self._use_vllm_answer
         
         
-        if self._mode == "vllm_decoding_with_compress":
+        if self._mode in {"vllm_decoding_with_compress", "niah_generate"}:
             need_vllm = True
             
         self._use_vllm = need_vllm
@@ -2256,25 +2257,13 @@ class NativeCausalLM(TemplateLM):
                 continue
 
             if (
-                self._mode in {"compress_answer", "reconstruct_first", "vllm_decoding_with_compress"}
+                self._mode in {"compress_answer", "reconstruct_first", "vllm_decoding_with_compress", "niah_generate"}
                 and self._vllm_manager is not None
                 and hasattr(self.model, "compression_embeddings")
             ):
                 include_bor = self._mode == "reconstruct_first"
-                # RULER NIAH tasks are `generate_until` and expect the model to output the
-                # needle value(s) (numbers/uuids). For many compressed-memory checkpoints,
-                # the `reconstruct_first` BOR behavior produces reconstruction text that is
-                # unlikely to include the needle within `max_gen_toks=128`. For NIAH we
-                # instead decode the answer directly from memory (no BOR), while still
-                # using the same compression prompt_embeds path.
-                if (
-                    include_bor
-                    and not getattr(self, "_niah_use_bor", False)
-                    and chunk_tasks
-                    and chunk_tasks[0]
-                    and "niah" in str(chunk_tasks[0]).lower()
-                ):
-                    include_bor = False
+                if self._mode == "niah_generate":
+                    include_bor = bool(getattr(self, "_niah_use_bor", False))
                 if self._mode == "vllm_decoding_with_compress":
                     # new iterative vLLM decode with compression
                     # breakpoint()
@@ -2342,6 +2331,11 @@ class NativeCausalLM(TemplateLM):
                         "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
                         "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
                     }
+                    # NIAH (BOR-enabled) can emit <EOR> then immediately EOS. By default vLLM
+                    # stops on EOS, which makes it *look* like generation stops at EOR.
+                    # `ignore_eos=True` ensures we honor the requested token budget.
+                    if self._mode == "niah_generate" and include_bor:
+                        sampling_params.setdefault("ignore_eos", True)
                     batch_embeds = [embeds[i] for i in valid_indices]
                     outs = self._vllm_manager.generate_from_embeddings(batch_embeds, sampling_params=sampling_params)
                     for idx, out in zip(valid_indices, outs):
@@ -2462,10 +2456,10 @@ class NativeCausalLM(TemplateLM):
                 temperature = gen_kwargs.get("temperature", self._temperature)
                 top_p = gen_kwargs.get("top_p", 1.0)
 
-                if self._mode in {"compress_answer", "reconstruct_first"} and hasattr(self.model, "compression_embeddings"):
+                if self._mode in {"compress_answer", "reconstruct_first", "niah_generate"} and hasattr(self.model, "compression_embeddings"):
                     include_bor = self._mode == "reconstruct_first"
-                    if include_bor and not getattr(self, "_niah_use_bor", False) and task_name and "niah" in str(task_name).lower():
-                        include_bor = False
+                    if self._mode == "niah_generate":
+                        include_bor = bool(getattr(self, "_niah_use_bor", False))
                     text = self._generate_compress_answer(
                         prompt=context_str,
                         max_gen_len=max_gen_len,
