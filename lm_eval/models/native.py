@@ -25,7 +25,12 @@ from data.ae_loader import (
 )
 from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
 from eval_func.model2safetensors import convert_checkpoint
-from eval_func.vllm_runner import VLLMEngineWrapper, VLLMEngineConfig, VLLMDecoderManager
+from eval_func.vllm_runner import (
+    VLLMEngineWrapper,
+    VLLMEngineConfig,
+    VLLMDecoderManager,
+    VLLMRemoteEngineWrapper,
+)
 from eval_func.utils import load_checkpoint_harness, _build_device_mesh
 import sys
 import math
@@ -139,6 +144,7 @@ def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_name
     ret_context_list = []
     ret_question_list = []
     ret_query_list = []
+    ret_assistant_prefix_list = []
     # breakpoint()
     for doc, task_name, prompt in zip(active_lg_docs, active_tasks_names, prompt_list):
         if doc is None or task_name is None:
@@ -151,6 +157,43 @@ def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_name
             ret_question_list.append(question_text)
             ret_query_list.append(real_query_text)
             ret_context_list.append(context_text)
+            ret_assistant_prefix_list.append("")
+
+        elif "niah" in task_name:
+            # RULER NIAH synthetic tasks:
+            # - doc["input"] contains a long haystack + a final question line.
+            # - harness appends doc["gen_prefix"] to the prompt as an answer prefix.
+            # We split input into:
+            #   context: everything before the last line (haystack + instructions)
+            #   question: last line ("What is/are ...?")
+            #   query: question (user), assistant_prefix: gen_prefix (assistant-prefill)
+            input_text = doc.get("input", "")
+            if not isinstance(input_text, str):
+                input_text = str(input_text)
+            gen_prefix = doc.get("gen_prefix", "")
+            if not isinstance(gen_prefix, str):
+                gen_prefix = str(gen_prefix)
+            gen_prefix = gen_prefix.strip()
+
+            parts = input_text.rsplit("\n", 1)
+            if len(parts) == 2:
+                context_text = parts[0].strip()
+                question_text = parts[1].strip()
+            else:
+                context_text = input_text.strip()
+                question_text = ""
+
+            # In lm-eval chat mode, `gen_prefix` is appended as an assistant message.
+            # For our native_rag chat template, keep the user message as *only* the
+            # question, and prefill the assistant with `gen_prefix` so generation
+            # continues with the expected answer format.
+            query_text = question_text.strip()
+            assistant_prefix = gen_prefix
+
+            ret_question_list.append(question_text)
+            ret_query_list.append(query_text)
+            ret_context_list.append(context_text)
+            ret_assistant_prefix_list.append(assistant_prefix)
 
         else:
             raise ValueError(f"Unsupported task: {task_name}")
@@ -159,6 +202,7 @@ def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_name
         "context_list": ret_context_list,
         "question_list": ret_question_list,
         "query_list": ret_query_list,
+        "assistant_prefix_list": ret_assistant_prefix_list,
     }
 
 def get_doc_query_keys_by_task_name(task_name: str) -> Dict[str, str]:
@@ -166,6 +210,13 @@ def get_doc_query_keys_by_task_name(task_name: str) -> Dict[str, str]:
         return {
             "doc_key": "context",
             "question_key": "question",
+        }
+    if "niah" in task_name:
+        # RULER NIAH docs store everything under `input` + `gen_prefix`.
+        # `_split_doc_and_query` handles the actual parsing.
+        return {
+            "doc_key": "input",
+            "question_key": "input",
         }
     else:
         print(f"Unsupported task: {task_name}")
@@ -211,6 +262,12 @@ class NativeCausalLM(TemplateLM):
         vllm_tensor_parallel: int = 1,
         vllm_gpu_memory_utilization: float = 0.4,
         vllm_output_root: Optional[str] = None,
+        # Optional remote vLLM server (persistent engine) support
+        vllm_server_host: Optional[str] = None,
+        vllm_server_port: Optional[int] = None,
+        vllm_server_auth: Optional[str] = None,
+        vllm_server_authkey: str = "native-rag",
+        vllm_server_timeout: Optional[float] = None,
         # for reconstruction related
         vllm_reconstruct_batch_size: int = 40,
         ppl_batch_size: Optional[int] = 8,
@@ -231,6 +288,8 @@ class NativeCausalLM(TemplateLM):
         add_query_before_likelihood: bool = False,
         likelihood_prefix_reconstruct: Optional[str] = None,
         likelihood_prefix_compress_answer: Optional[str] = None,
+        # NIAH generate_until defaults
+        niah_use_bor: bool = False,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
 
@@ -293,6 +352,7 @@ class NativeCausalLM(TemplateLM):
         self._save_loglikelihood_debug = bool(save_loglikelihood_debug)
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
+        self._niah_use_bor = bool(niah_use_bor)
         
         
         max_seq_length_int = _coerce_int(max_seq_length, None)
@@ -357,12 +417,33 @@ class NativeCausalLM(TemplateLM):
             if self._max_seq_length is None or self._max_seq_length <= 0:
                 self._max_seq_length = 2048
         self._decoder_budget = max(self._decoder_budget, self._max_seq_length)
-        if self._max_mem_span_len_override is not None:
-            # Respect override for compression-aware paths
-            if hasattr(self.model, "args"):
-                self.model.args.max_mem_span_len = self._max_mem_span_len_override
-                
-        self._max_mem_span_len = self.model.args.max_mem_span_len if hasattr(self.model, "args") else self._max_mem_span_len_override
+        if self._max_mem_span_len_override is not None and hasattr(self.model, "args"):
+            # `max_mem_span_len` is an eval-time knob; older checkpoints/configs may
+            # not declare it on `ModelArgs`, so we attach it dynamically.
+            try:
+                setattr(self.model.args, "max_mem_span_len", int(self._max_mem_span_len_override))
+            except Exception:
+                pass
+
+        # `arch.config.ModelArgs` may not have `max_mem_span_len`; fall back to the
+        # override or a conservative default.
+        if hasattr(self.model, "args"):
+            span_len = _coerce_int(getattr(self.model.args, "max_mem_span_len", None), None)
+        else:
+            span_len = None
+        if span_len is None:
+            span_len = _coerce_int(self._max_mem_span_len_override, None)
+        if span_len is None or span_len <= 0:
+            # Default span length for splitting long contexts into memory chunks.
+            span_len = 512
+        self._max_mem_span_len = int(span_len)
+        if hasattr(self.model, "args"):
+            # Keep a single source of truth for helper functions that still look at
+            # `model.args.max_mem_span_len` via getattr(...).
+            try:
+                setattr(self.model.args, "max_mem_span_len", int(self._max_mem_span_len))
+            except Exception:
+                pass
         self._num_compression_tokens = self.model.args.num_compression_tokens if hasattr(self.model, "args") else None
 
         # Optional vLLM init for reconstruction speedup or decoder fast path (decoder-only, prompt_embeds)
@@ -382,6 +463,17 @@ class NativeCausalLM(TemplateLM):
         self._vllm_tokenizer_path = tokenizer_path
         self._vllm_checkpoint_dir = checkpoint_dir
         self._vllm_dtype = dtype
+        self._vllm_server_host = _normalize_optional_text(vllm_server_host)
+        self._vllm_server_port = _coerce_int(vllm_server_port, None)
+        auth_override = _normalize_optional_text(vllm_server_auth)
+        self._vllm_server_authkey = auth_override or vllm_server_authkey
+        self._vllm_server_timeout = None
+        if vllm_server_timeout is not None:
+            try:
+                self._vllm_server_timeout = float(vllm_server_timeout)
+            except Exception:
+                self._vllm_server_timeout = None
+        self._use_remote_vllm = bool(self._vllm_server_host and self._vllm_server_port)
         
         # breakpoint()
         self._init_vllm_param()
@@ -390,6 +482,10 @@ class NativeCausalLM(TemplateLM):
         # breakpoint()
         
     def _init_vllm_param(self):
+        if getattr(self, "_use_remote_vllm", False):
+            # A remote/persistent vLLM server owns model weights/config; skip local
+            # safetensors conversion and config patching.
+            return
         model_path = self._vllm_model_path
         
         # breakpoint()
@@ -427,9 +523,26 @@ class NativeCausalLM(TemplateLM):
                     )
                 self._ensure_vllm_config(safedir)
         
-        # if need_vllm:
     def _init_vllm(self) -> None:
-            # Prepare decoder-only safetensors if path not provided
+        # Remote vLLM server path (no local engine init).
+        if getattr(self, "_use_remote_vllm", False):
+            try:
+                engine = VLLMRemoteEngineWrapper(
+                    host=self._vllm_server_host,
+                    port=self._vllm_server_port,
+                    authkey=self._vllm_server_authkey,
+                    timeout=self._vllm_server_timeout,
+                )
+                self._vllm_manager = VLLMDecoderManager(engine_wrapper=engine)
+            except Exception as e:
+                print(
+                    f"WARNING: Failed to init remote vLLM client, falling back to torch backend. Error: {e}",
+                    file=sys.stderr,
+                )
+                self._vllm_manager = None
+            return
+
+        # Prepare decoder-only safetensors if path not provided
         model_path = self._vllm_model_path or getattr(self, "_vllm_model_dir", None)
         if model_path is None:
             base_dir = self._vllm_output_root or self._vllm_checkpoint_dir
@@ -889,6 +1002,7 @@ class NativeCausalLM(TemplateLM):
             assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
             im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
             query_tokens = self._tokenizer.encode(user_text, bos=False, eos=False)
+            assistant_tokens = self._tokenizer.encode(assistant_text, bos=False, eos=False) if assistant_text else []
             spans = self._split_contexts_to_spans(contexts, self._max_mem_span_len)
             # max_spans == 0 means "no memory spans" (still emit the chat scaffold).
             if max_spans is not None and max_spans >= 0 and len(spans) > max_spans:
@@ -915,7 +1029,9 @@ class NativeCausalLM(TemplateLM):
             user_tokens = user_start + query_tokens + im_end
             comp_mask.extend([False] * len(user_tokens))
             
-            ret_assistant_tokens = assistant_start 
+            # Always open an assistant turn; if `assistant_text` is provided, prefill
+            # it so generation continues from that prefix (no <|im_end|> here).
+            ret_assistant_tokens = assistant_start + assistant_tokens
             comp_mask.extend([False] * len(ret_assistant_tokens))
             
             
@@ -987,8 +1103,25 @@ class NativeCausalLM(TemplateLM):
         if n == 0:
             return 0.0, True
         chunk_size = max(1, int(chunk_size))
-        total_lp = 0.0
+
+        # When the full [N, vocab] projection is small, doing it in one shot
+        # avoids tiny numeric drift from per-chunk reductions (and is faster).
+        try:
+            vocab = int(self.model.output.weight.shape[0])  # type: ignore[attr-defined]
+        except Exception:
+            vocab = 0
+        if self._model_parallel_group is None and vocab > 0:
+            # float32 logits would be ~4 bytes * N * vocab
+            max_full_elems = 2_000_000
+            if n * vocab <= max_full_elems:
+                logits = self.model.output(hidden).float()
+                logprobs = F.log_softmax(logits, dim=-1)
+                total_lp = float(logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1).sum().item())
+                greedy_ok = bool((logprobs.argmax(dim=-1) == targets).all().item())
+                return total_lp, greedy_ok
+
         greedy_ok = True
+        total_lp = 0.0
         for s in range(0, n, chunk_size):
             e = min(s + chunk_size, n)
             h = hidden[s:e]
@@ -1167,11 +1300,9 @@ class NativeCausalLM(TemplateLM):
 
                 token_greedy_ok[off:off2] = logits_chunk.argmax(dim=-1).to(torch.long).eq(tgt_chunk)
 
-                logits_f = logits_chunk.float()
-                lse = torch.logsumexp(logits_f, dim=-1)
-                tgt_logits = logits_f.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1)
-                token_logprob[off:off2] = (tgt_logits - lse)
-                del logits_f, lse, tgt_logits
+                logprobs = F.log_softmax(logits_chunk.float(), dim=-1)
+                token_logprob[off:off2] = logprobs.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1)
+                del logprobs
 
         # Reduce to per-sample stats.
         per_sample: List[Dict[str, Any]] = []
@@ -1919,10 +2050,35 @@ class NativeCausalLM(TemplateLM):
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         results: List[str] = []
-        req_args = [req.args for req in requests]
-        iterator = tqdm(range(0, len(req_args), self.batch_size), disable=disable_tqdm, desc=f"native generate ({self._mode})")
+
+        def _get_max_gen_tokens(gen_kwargs: dict) -> int:
+            # lm-eval passes `max_gen_toks` via `generation_kwargs`.
+            for key in ("max_gen_toks", "max_generation_length"):
+                if key in gen_kwargs and gen_kwargs.get(key) is not None:
+                    try:
+                        return int(gen_kwargs[key])
+                    except Exception:
+                        pass
+            try:
+                return int(self.max_gen_toks)
+            except Exception:
+                return 0
+
+        packed: List[Tuple[Tuple[str, dict], Optional[dict], Optional[str]]] = [
+            (req.args, getattr(req, "doc", None), getattr(req, "task_name", None)) for req in requests
+        ]
+
+        iterator = tqdm(
+            range(0, len(packed), self.batch_size),
+            disable=disable_tqdm,
+            desc=f"native generate ({self._mode})",
+        )
         for start in iterator:
-            chunk = req_args[start : start + self.batch_size]
+            packed_chunk = packed[start : start + self.batch_size]
+            chunk = [args for args, _, _ in packed_chunk]
+            chunk_docs = [doc for _, doc, _ in packed_chunk]
+            chunk_tasks = [task for _, _, task in packed_chunk]
+
             gkwargs = [g for _, g in chunk]
             if gkwargs[0].get("add_thinking_tokens", False):
                 self._add_thinking_tokens = True
@@ -1942,7 +2098,7 @@ class NativeCausalLM(TemplateLM):
                     prompts = [c for c, _ in chunk]
 
                 sampling_params = {
-                    "max_tokens": max(g.get("max_generation_length", self.max_gen_toks) for g in gkwargs),
+                    "max_tokens": max(_get_max_gen_tokens(g) for g in gkwargs),
                     "temperature": gkwargs[0].get("temperature", self._temperature),
                     "top_p": gkwargs[0].get("top_p", 1.0),
                 }
@@ -1978,7 +2134,7 @@ class NativeCausalLM(TemplateLM):
                 outs_text = [""] * len(chunk)
                 if valid_indices:
                     sampling_params = {
-                        "max_tokens": max(gkwargs[i].get("max_generation_length", self.max_gen_toks) for i in valid_indices),
+                        "max_tokens": max(_get_max_gen_tokens(gkwargs[i]) for i in valid_indices),
                         "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
                         "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
                     }
@@ -1996,6 +2152,20 @@ class NativeCausalLM(TemplateLM):
                 and hasattr(self.model, "compression_embeddings")
             ):
                 include_bor = self._mode == "reconstruct_first"
+                # RULER NIAH tasks are `generate_until` and expect the model to output the
+                # needle value(s) (numbers/uuids). For many compressed-memory checkpoints,
+                # the `reconstruct_first` BOR behavior produces reconstruction text that is
+                # unlikely to include the needle within `max_gen_toks=128`. For NIAH we
+                # instead decode the answer directly from memory (no BOR), while still
+                # using the same compression prompt_embeds path.
+                if (
+                    include_bor
+                    and not getattr(self, "_niah_use_bor", False)
+                    and chunk_tasks
+                    and chunk_tasks[0]
+                    and "niah" in str(chunk_tasks[0]).lower()
+                ):
+                    include_bor = False
                 if self._mode == "vllm_decoding_with_compress":
                     # new iterative vLLM decode with compression
                     # breakpoint()
@@ -2004,7 +2174,7 @@ class NativeCausalLM(TemplateLM):
                         context_str = self._format_chat(context_str, add_generation_prompt=True)["decoder_prefix"]
                         text = self._generate_vllm_with_compress(
                             prompt=context_str,
-                            max_gen_len=gk.get("max_generation_length", self.max_gen_toks),
+                            max_gen_len=_get_max_gen_tokens(gk),
                             temperature=gk.get("temperature", self._temperature),
                             top_p=gk.get("top_p", 1.0),
                             until=gk.get("until"),
@@ -2012,15 +2182,51 @@ class NativeCausalLM(TemplateLM):
 
                         results.append(text)
                     continue
-                prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
-                gkwargs = [g for _, g in chunk]
-                gen_lens = [g.get("max_generation_length", self.max_gen_toks) for g in gkwargs]
-                embeds = self._build_compress_prompt_embeds_batch(prompts, gen_lens, include_bor)
+
+                # If we have structured docs and a supported task, split (context, query) and
+                # use the native_rag chat template to ensure the query is *not* compressed away.
+                doc_split_ok = (
+                    bool(self._chat_use_template)
+                    and all(d is not None for d in chunk_docs)
+                    and all(t is not None for t in chunk_tasks)
+                )
+                task0 = str(chunk_tasks[0]) if chunk_tasks and chunk_tasks[0] is not None else ""
+                can_split = doc_split_ok and ("longbench2" in task0 or "niah" in task0)
+
+                gen_lens = [_get_max_gen_tokens(g) for g in gkwargs]
+                if can_split:
+                    keys = get_doc_query_keys_by_task_name(task0)
+                    split = _split_doc_and_query(
+                        active_lg_docs=chunk_docs,  # type: ignore[arg-type]
+                        active_tasks_names=chunk_tasks,  # type: ignore[arg-type]
+                        prompt_list=[c for c, _ in chunk],
+                        doc_key=keys["doc_key"],
+                        question_key=keys["question_key"],
+                    )
+                    prompts = [""] * len(chunk)
+                    embeds = self._build_compress_prompt_embeds_batch(
+                        prompts,
+                        gen_lens,
+                        include_bor,
+                        decoder_include_prompt_tokens=False,
+                        context_list=split["context_list"],
+                        query_list=split["query_list"],
+                        assistant_prefix_list=split.get("assistant_prefix_list"),
+                    )
+                else:
+                    prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
+                    embeds = self._build_compress_prompt_embeds_batch(
+                        prompts,
+                        gen_lens,
+                        include_bor,
+                        # Best-effort: include prompt tokens so the decoder sees the question.
+                        decoder_include_prompt_tokens=True,
+                    )
                 valid_indices = [i for i, e in enumerate(embeds) if e is not None]
                 outs_text = [""] * len(chunk)
                 if valid_indices:
                     sampling_params = {
-                        "max_tokens": max(gkwargs[i].get("max_generation_length", self.max_gen_toks) for i in valid_indices),
+                        "max_tokens": max(gen_lens[i] for i in valid_indices),
                         "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
                         "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
                     }
@@ -2034,20 +2240,23 @@ class NativeCausalLM(TemplateLM):
 
             # Fallback: torch paths, process one by one within chunk
             # generate for greedy decoding
-            for context_str, gen_kwargs in chunk:
+            for (context_str, gen_kwargs), task_name in zip(chunk, chunk_tasks):
                 until = gen_kwargs.get("until", None)
-                max_gen_len = gen_kwargs.get("max_generation_length", self.max_gen_toks)
+                max_gen_len = _get_max_gen_tokens(gen_kwargs)
                 temperature = gen_kwargs.get("temperature", self._temperature)
                 top_p = gen_kwargs.get("top_p", 1.0)
 
                 if self._mode in {"compress_answer", "reconstruct_first"} and hasattr(self.model, "compression_embeddings"):
+                    include_bor = self._mode == "reconstruct_first"
+                    if include_bor and not getattr(self, "_niah_use_bor", False) and task_name and "niah" in str(task_name).lower():
+                        include_bor = False
                     text = self._generate_compress_answer(
                         prompt=context_str,
                         max_gen_len=max_gen_len,
                         temperature=temperature,
                         top_p=top_p,
                         until=until,
-                        include_bor=(self._mode == "reconstruct_first"),
+                        include_bor=include_bor,
                     )
                     results.append(text)
                     continue
@@ -2467,6 +2676,7 @@ class NativeCausalLM(TemplateLM):
         prompt_tokens_override: Optional[List[List[int]]] = None,
         not_add_boq_index: bool = False,
         query_list: Optional[List[str]] = None,
+        assistant_prefix_list: Optional[List[str]] = None,
         context_list: Optional[List[str]] = None,
         
     ) -> Tuple[List[Optional[torch.Tensor]], Optional[Dict[str, List[Any]]]]:
@@ -2490,6 +2700,10 @@ class NativeCausalLM(TemplateLM):
             if len(context_list) != len(prompts) or len(query_list) != len(prompts):
                 raise ValueError(
                     f"context_list/query_list must match prompts length; got {len(context_list)}/{len(query_list)} vs {len(prompts)}"
+                )
+            if assistant_prefix_list is not None and len(assistant_prefix_list) != len(prompts):
+                raise ValueError(
+                    f"assistant_prefix_list must match prompts length; got {len(assistant_prefix_list)} vs {len(prompts)}"
                 )
         decoder_budget = int(self.decoder_budget)
 
@@ -2600,6 +2814,14 @@ class NativeCausalLM(TemplateLM):
             for i, contexts in enumerate(context_list):
                 spans = self._split_contexts_to_spans(contexts, span_len)
                 query_tokens = self._tokenizer.encode(query_list[i], bos=False, eos=False)
+                assistant_prefix = ""
+                if assistant_prefix_list is not None:
+                    raw_prefix = assistant_prefix_list[i]
+                    if raw_prefix is not None:
+                        assistant_prefix = str(raw_prefix)
+                assistant_prefix_tokens = (
+                    self._tokenizer.encode(assistant_prefix, bos=False, eos=False) if assistant_prefix else []
+                )
                 fixed_len = (
                     len(memory_start)
                     + len(im_end)
@@ -2607,6 +2829,8 @@ class NativeCausalLM(TemplateLM):
                     + len(query_tokens)
                     + len(im_end)
                     + len(assistant_start)
+                    + len(assistant_prefix_tokens)
+                    + bor_extra
                 )
                 max_spans = (decoder_budget - fixed_len - int(gen_lens[i])) // max(1, span_cost)
                 if max_spans <= 0:
@@ -2657,9 +2881,20 @@ class NativeCausalLM(TemplateLM):
                     compression_vectors = compression_vectors.to(dtype=self._dtype)
 
             for i in range(len(prompts)):
-                ret = self._format_chat(user_text=query_list[i], contexts=context_list[i], max_spans=max_spans_list[i])
+                assistant_prefix = None
+                if assistant_prefix_list is not None:
+                    assistant_prefix = assistant_prefix_list[i]
+                ret = self._format_chat(
+                    user_text=query_list[i],
+                    assistant_text=assistant_prefix,
+                    contexts=context_list[i],
+                    max_spans=max_spans_list[i],
+                )
                 prefix_tokens = ret.get("decoder_prefix_tokens") or []
-                comp_mask = ret["comp_mask"]
+                comp_mask = list(ret["comp_mask"])
+                if include_bor:
+                    prefix_tokens = list(prefix_tokens) + [BEGIN_OF_RECONSTRUCTION_INDEX]
+                    comp_mask.append(False)
                 total_comp_slots = int(ret.get("total_comp_slots", 0))
                 if total_comp_slots != total_comp_slots_list[i]:
                     raise RuntimeError(

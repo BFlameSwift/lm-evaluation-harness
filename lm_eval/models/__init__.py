@@ -18,9 +18,14 @@ from . import (
     sglang_causallms,
     sglang_generate_API,
     textsynth,
-    vllm_causallms,
-    vllm_vlms,
 )
+
+# vLLM is an optional dependency. Importing it unconditionally can break
+# environments where CUDA runtime libs are unavailable or mismatched.
+try:
+    from . import vllm_causallms, vllm_vlms  # noqa: F401
+except Exception:
+    pass
 
 
 # TODO: implement __all__
