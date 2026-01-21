@@ -2551,6 +2551,18 @@ class NativeCausalLM(TemplateLM):
 
                         needle_type = _infer_niah_needle_type(doc.get("outputs", []))
                         extracted = _extract_niah_needles(raw_out, needle_type) if needle_type else []
+                        # Record effective generation settings (after model_args overrides).
+                        try:
+                            effective_gen = resolve_generation_kwargs(
+                                gkwargs[dbg_idx],
+                                default_temperature=self._temperature,
+                                default_top_p=1.0,
+                                override_do_sample=getattr(self, "_gen_do_sample_override", None),
+                                override_temperature=getattr(self, "_gen_temperature_override", None),
+                                override_top_p=getattr(self, "_gen_top_p_override", None),
+                            )
+                        except Exception:
+                            effective_gen = {}
                         debug_rows.append(
                             {
                                 "task": task0,
@@ -2564,6 +2576,13 @@ class NativeCausalLM(TemplateLM):
                                 "question": question_text,
                                 "query": query_text,
                                 "gen_prefix": doc.get("gen_prefix"),
+                                "task_generation_kwargs": gkwargs[dbg_idx],
+                                "effective_generation_kwargs": {
+                                    **(effective_gen or {}),
+                                    "max_gen_toks": int(gen_lens[dbg_idx]),
+                                }
+                                if isinstance(effective_gen, dict) and dbg_idx < len(gen_lens)
+                                else None,
                                 "prompt_with_special_tokens": prompt_special,
                                 "response": raw_out,
                                 "response_with_special_tokens": resp_special,
