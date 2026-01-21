@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from typing import List, Optional, Tuple
 
 import torch
@@ -127,6 +128,55 @@ def _default_distributed_args() -> DistributedArgs:
     return DistributedArgs(rank=rank, local_rank=local_rank, world_size=world_size)
 
 
+_NIAH_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}\b"
+)
+_NIAH_MAGIC_NUMBER_RE = re.compile(r"\b\d{7}\b")
+
+
+def _infer_niah_needle_type(outputs: Any) -> str:
+    """Infer needle type from references (numbers vs uuids)."""
+    if not outputs:
+        return ""
+    if isinstance(outputs, (list, tuple)):
+        sample = str(outputs[0]) if outputs else ""
+    else:
+        sample = str(outputs)
+    if _NIAH_UUID_RE.search(sample):
+        return "uuids"
+    if _NIAH_MAGIC_NUMBER_RE.search(sample):
+        return "numbers"
+    return ""
+
+
+def _extract_niah_needles(text: str, needle_type: str) -> List[str]:
+    if not text:
+        return []
+    if needle_type == "uuids":
+        return _NIAH_UUID_RE.findall(text)
+    if needle_type == "numbers":
+        return _NIAH_MAGIC_NUMBER_RE.findall(text)
+    return []
+
+
+def _split_niah_input(input_text: str) -> Tuple[str, str]:
+    """Split RULER NIAH `input` into (context, question) best-effort."""
+    if not input_text:
+        return "", ""
+    # The official template appends a final question line starting with "What are...".
+    marker = "\nWhat "
+    idx = input_text.rfind(marker)
+    if idx == -1:
+        return input_text, ""
+    context = input_text[:idx].rstrip()
+    question = input_text[idx + 1 :].strip()
+    return context, question
+
+
 
 def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_names: List[Optional[str]],prompt_list: List[str] = [],doc_key: str = "context", question_key: str = "question") -> Dict[str, List[str]]:
     """
@@ -175,13 +225,7 @@ def _split_doc_and_query(active_lg_docs: List[Optional[dict]], active_tasks_name
                 gen_prefix = str(gen_prefix)
             gen_prefix = gen_prefix.strip()
 
-            parts = input_text.rsplit("\n", 1)
-            if len(parts) == 2:
-                context_text = parts[0].strip()
-                question_text = parts[1].strip()
-            else:
-                context_text = input_text.strip()
-                question_text = ""
+            context_text, question_text = _split_niah_input(input_text)
 
             # In lm-eval chat mode, `gen_prefix` is appended as an assistant message.
             # For our native_rag chat template, keep the user message as *only* the
@@ -290,6 +334,10 @@ class NativeCausalLM(TemplateLM):
         likelihood_prefix_compress_answer: Optional[str] = None,
         # NIAH generate_until defaults
         niah_use_bor: bool = False,
+        # NIAH generate_until debugging (write JSONL cases)
+        niah_debug_dir: Optional[str] = None,
+        niah_debug_max_cases: int = 50,
+        niah_debug_max_prompt_chars: int = 8000,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
 
@@ -353,6 +401,10 @@ class NativeCausalLM(TemplateLM):
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
         self._niah_use_bor = bool(niah_use_bor)
+        self._niah_debug_dir = _normalize_optional_text(niah_debug_dir)
+        self._niah_debug_max_cases = max(0, int(niah_debug_max_cases))
+        self._niah_debug_max_prompt_chars = max(0, int(niah_debug_max_prompt_chars))
+        self._niah_debug_dumped = 0
         
         
         max_seq_length_int = _coerce_int(max_seq_length, None)
@@ -890,6 +942,32 @@ class NativeCausalLM(TemplateLM):
         if bool(getattr(self, "_verbose_compress", False)) or not bool(getattr(self, "_loglikelihood_debug_notified", False)):
             print(f"Saved loglikelihood debug rows to {out_path}")
             self._loglikelihood_debug_notified = True
+
+    def _append_niah_debug_rows(self, rows: List[dict]) -> None:
+        """Persist NIAH generate_until debug cases (rank0 only)."""
+        if not rows:
+            return
+        if self._distributed_args.rank != 0:
+            return
+        debug_dir = getattr(self, "_niah_debug_dir", "") or ""
+        if not debug_dir:
+            return
+        max_cases = int(getattr(self, "_niah_debug_max_cases", 0) or 0)
+        if max_cases <= 0:
+            return
+        dumped = int(getattr(self, "_niah_debug_dumped", 0) or 0)
+        if dumped >= max_cases:
+            return
+        os.makedirs(debug_dir, exist_ok=True)
+        out_path = os.path.join(debug_dir, "niah_debug_cases.jsonl")
+        to_write = rows[: max_cases - dumped]
+        with open(out_path, "a", encoding="utf-8") as f:
+            for row in to_write:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._niah_debug_dumped = dumped + len(to_write)
+        if not bool(getattr(self, "_niah_debug_notified", False)):
+            print(f"Saved NIAH debug cases to {out_path}")
+            self._niah_debug_notified = True
 
     # ---- Tokenization helpers ----
     def tok_encode(self, string: str, add_special_tokens: Optional[bool] = None,add_thinking_tokens: Optional[bool] = False, **kwargs) -> List[int]:
@@ -2194,9 +2272,10 @@ class NativeCausalLM(TemplateLM):
                 can_split = doc_split_ok and ("longbench2" in task0 or "niah" in task0)
 
                 gen_lens = [_get_max_gen_tokens(g) for g in gkwargs]
+                split_data: Optional[Dict[str, List[str]]] = None
                 if can_split:
                     keys = get_doc_query_keys_by_task_name(task0)
-                    split = _split_doc_and_query(
+                    split_data = _split_doc_and_query(
                         active_lg_docs=chunk_docs,  # type: ignore[arg-type]
                         active_tasks_names=chunk_tasks,  # type: ignore[arg-type]
                         prompt_list=[c for c, _ in chunk],
@@ -2209,9 +2288,9 @@ class NativeCausalLM(TemplateLM):
                         gen_lens,
                         include_bor,
                         decoder_include_prompt_tokens=False,
-                        context_list=split["context_list"],
-                        query_list=split["query_list"],
-                        assistant_prefix_list=split.get("assistant_prefix_list"),
+                        context_list=split_data["context_list"],
+                        query_list=split_data["query_list"],
+                        assistant_prefix_list=split_data.get("assistant_prefix_list"),
                     )
                 else:
                     prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
@@ -2236,6 +2315,90 @@ class NativeCausalLM(TemplateLM):
                         text = out.outputs[0].text if out.outputs else ""
                         outs_text[idx] = self._truncate_until(text, gkwargs[idx].get("until"))
                 results.extend(outs_text)
+
+                # NIAH: dump one debug case per batch (rank0), including special-token prompt.
+                if (
+                    split_data is not None
+                    and "niah" in task0.lower()
+                    and getattr(self, "_niah_debug_dir", "")
+                    and int(getattr(self, "_niah_debug_max_cases", 0) or 0) > 0
+                ):
+                    dbg_idx = valid_indices[0] if valid_indices else 0
+                    if 0 <= dbg_idx < len(chunk_docs) and chunk_docs[dbg_idx] is not None:
+                        doc = chunk_docs[dbg_idx] or {}
+                        ctx_text = split_data["context_list"][dbg_idx] if dbg_idx < len(split_data["context_list"]) else ""
+                        query_text = split_data["query_list"][dbg_idx] if dbg_idx < len(split_data["query_list"]) else ""
+                        assistant_prefix = ""
+                        if "assistant_prefix_list" in split_data and dbg_idx < len(split_data["assistant_prefix_list"]):
+                            assistant_prefix = split_data["assistant_prefix_list"][dbg_idx] or ""
+
+                        # Recompute max_spans for an accurate chat prefix snapshot.
+                        try:
+                            num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
+                            span_len = int(getattr(self.model.args, "max_mem_span_len", int(self.decoder_budget)))
+                            spans = self._split_contexts_to_spans(ctx_text, span_len)
+                            memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
+                            user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
+                            assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
+                            im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
+                            query_tokens = self._tokenizer.encode(query_text, bos=False, eos=False)
+                            assistant_prefix_tokens = (
+                                self._tokenizer.encode(assistant_prefix, bos=False, eos=False) if assistant_prefix else []
+                            )
+                            fixed_len = (
+                                len(memory_start)
+                                + len(im_end)
+                                + len(user_start)
+                                + len(query_tokens)
+                                + len(im_end)
+                                + len(assistant_start)
+                                + len(assistant_prefix_tokens)
+                                + (1 if include_bor else 0)
+                            )
+                            span_cost = max(1, num_comp + 2)
+                            max_spans = (int(self.decoder_budget) - fixed_len - int(gen_lens[dbg_idx])) // span_cost
+                            if max_spans <= 0:
+                                max_spans = 1
+                            if max_spans < len(spans):
+                                max_spans = max_spans
+                        except Exception:
+                            max_spans = None
+
+                        chat_ret = self._format_chat(
+                            user_text=query_text,
+                            assistant_text=assistant_prefix,
+                            contexts=ctx_text,
+                            max_spans=max_spans,
+                        )
+                        prefix_tokens = list(chat_ret.get("decoder_prefix_tokens") or [])
+                        # For `reconstruct_first`, the actual generation path appends a BOR token
+                        # right after the assistant prefix. Include it in debug dumps so users
+                        # can inspect BOR/EOR behavior in the saved prompt string.
+                        if include_bor:
+                            prefix_tokens.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+                        prompt_special = self.tok_decode_w_special_tokens(prefix_tokens)
+                        max_chars = int(getattr(self, "_niah_debug_max_prompt_chars", 0) or 0)
+                        if max_chars > 0 and len(prompt_special) > max_chars:
+                            prompt_special = prompt_special[:max_chars] + "\n...[truncated]..."
+
+                        raw_out = outs_text[dbg_idx] if dbg_idx < len(outs_text) else ""
+                        needle_type = _infer_niah_needle_type(doc.get("outputs", []))
+                        extracted = _extract_niah_needles(raw_out, needle_type) if needle_type else []
+                        row = {
+                            "task": task0,
+                            "idx_in_batch": dbg_idx,
+                            "doc_index": doc.get("index"),
+                            "max_length": doc.get("max_length"),
+                            "include_bor": bool(include_bor),
+                            "niah_use_bor": bool(getattr(self, "_niah_use_bor", False)),
+                            "needle_type": needle_type,
+                            "gold_outputs": doc.get("outputs"),
+                            "query": doc.get("gen_prefix"),
+                            "prompt_with_special_tokens": prompt_special,
+                            "response": raw_out,
+                            "extracted": extracted,
+                        }
+                        self._append_niah_debug_rows([row])
                 continue
 
             # Fallback: torch paths, process one by one within chunk
