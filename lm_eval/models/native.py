@@ -177,6 +177,88 @@ def _split_niah_input(input_text: str) -> Tuple[str, str]:
     return context, question
 
 
+def resolve_generation_kwargs(
+    gen_kwargs: Mapping[str, Any],
+    *,
+    default_temperature: float,
+    default_top_p: float = 1.0,
+    override_do_sample: Optional[bool] = None,
+    override_temperature: Optional[float] = None,
+    override_top_p: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve per-request generation kwargs into a normalized set for vLLM/torch decoding.
+
+    Precedence (highest -> lowest):
+      1) explicit overrides passed via `--model_args gen_*`
+      2) task-provided `generation_kwargs` on the request
+      3) model defaults (`default_temperature`, `default_top_p`)
+
+    Note:
+      - `do_sample=False` forces greedy decoding (`temperature=0.0`).
+      - We keep `top_p` at 1.0 for greedy mode (top_p is irrelevant when temperature=0).
+    """
+    # Task defaults
+    try:
+        temperature = float(gen_kwargs.get("temperature", default_temperature))
+    except Exception:
+        temperature = float(default_temperature)
+    try:
+        top_p = float(gen_kwargs.get("top_p", default_top_p))
+    except Exception:
+        top_p = float(default_top_p)
+
+    # Infer do_sample if not explicitly provided.
+    do_sample_val = gen_kwargs.get("do_sample", None)
+    do_sample = bool(do_sample_val) if do_sample_val is not None else (temperature > 0.0)
+
+    # Apply overrides.
+    if override_do_sample is not None:
+        do_sample = bool(override_do_sample)
+    if override_temperature is not None:
+        try:
+            temperature = float(override_temperature)
+        except Exception:
+            pass
+    if override_top_p is not None:
+        try:
+            top_p = float(override_top_p)
+        except Exception:
+            pass
+
+    # Enforce greedy behavior when not sampling.
+    if not do_sample:
+        temperature = 0.0
+        top_p = 1.0
+
+    return {
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+
+
+def resolve_max_gen_toks(
+    gen_kwargs: Mapping[str, Any],
+    *,
+    default_max_gen_toks: int,
+    override_max_gen_toks: Optional[int] = None,
+) -> int:
+    """Resolve `max_gen_toks` with an optional override."""
+    if override_max_gen_toks is not None:
+        try:
+            return int(override_max_gen_toks)
+        except Exception:
+            pass
+    for key in ("max_gen_toks", "max_generation_length"):
+        if key in gen_kwargs and gen_kwargs.get(key) is not None:
+            try:
+                return int(gen_kwargs[key])
+            except Exception:
+                continue
+    return int(default_max_gen_toks)
+
+
 
 def _split_doc_and_query(
     active_lg_docs: List[Optional[dict]],
@@ -354,6 +436,13 @@ class NativeCausalLM(TemplateLM):
         add_boq_index: bool = False,
         remove_eot_token: bool = True,
         fill_decoder_prefix_embeds: bool = False,
+
+        # Generation overrides (model_args-level). If provided, these take precedence over
+        # task YAML `generation_kwargs` (e.g. RULER/NIAH defaults).
+        gen_do_sample: Optional[bool] = None,
+        gen_temperature: Optional[float] = None,
+        gen_top_p: Optional[float] = None,
+        gen_max_gen_toks: Optional[int] = None,
         
     ) -> None:
         super().__init__()
@@ -400,6 +489,11 @@ class NativeCausalLM(TemplateLM):
         self._chat_add_generation_prompt = bool(chat_add_generation_prompt)
         self._add_thinking_tokens = bool(add_thinking_tokens)
         self._temperature = temperature
+        # Optional generation overrides (apply to generate_until only).
+        self._gen_do_sample_override = gen_do_sample if gen_do_sample is not None else None
+        self._gen_temperature_override = None if gen_temperature is None else float(gen_temperature)
+        self._gen_top_p_override = None if gen_top_p is None else float(gen_top_p)
+        self._gen_max_gen_toks_override = _coerce_int(gen_max_gen_toks, None)
         self._reconstruct_add_bor = bool(reconstruct_add_bor)
         self._reconstruct_max_bor = max(0, int(reconstruct_max_bor))
         self._add_query_before_likelihood = bool(add_query_before_likelihood)
@@ -2167,17 +2261,15 @@ class NativeCausalLM(TemplateLM):
         results: List[str] = []
 
         def _get_max_gen_tokens(gen_kwargs: dict) -> int:
-            # lm-eval passes `max_gen_toks` via `generation_kwargs`.
-            for key in ("max_gen_toks", "max_generation_length"):
-                if key in gen_kwargs and gen_kwargs.get(key) is not None:
-                    try:
-                        return int(gen_kwargs[key])
-                    except Exception:
-                        pass
             try:
-                return int(self.max_gen_toks)
+                default = int(self.max_gen_toks)
             except Exception:
-                return 0
+                default = 0
+            return resolve_max_gen_toks(
+                gen_kwargs,
+                default_max_gen_toks=default,
+                override_max_gen_toks=getattr(self, "_gen_max_gen_toks_override", None),
+            )
 
         packed: List[Tuple[Tuple[str, dict], Optional[dict], Optional[str]]] = [
             (req.args, getattr(req, "doc", None), getattr(req, "task_name", None)) for req in requests
@@ -2212,10 +2304,18 @@ class NativeCausalLM(TemplateLM):
                 else:
                     prompts = [c for c, _ in chunk]
 
+                resolved = resolve_generation_kwargs(
+                    gkwargs[0],
+                    default_temperature=self._temperature,
+                    default_top_p=1.0,
+                    override_do_sample=getattr(self, "_gen_do_sample_override", None),
+                    override_temperature=getattr(self, "_gen_temperature_override", None),
+                    override_top_p=getattr(self, "_gen_top_p_override", None),
+                )
                 sampling_params = {
                     "max_tokens": max(_get_max_gen_tokens(g) for g in gkwargs),
-                    "temperature": gkwargs[0].get("temperature", self._temperature),
-                    "top_p": gkwargs[0].get("top_p", 1.0),
+                    "temperature": resolved["temperature"],
+                    "top_p": resolved["top_p"],
                 }
                 outputs = self._vllm_manager.engine_wrapper.generate(prompts, sampling_params)
                 for out, (_, gk) in zip(outputs, chunk):
@@ -2248,10 +2348,18 @@ class NativeCausalLM(TemplateLM):
                 valid_indices = [i for i, e in enumerate(embeds) if e is not None]
                 outs_text = [""] * len(chunk)
                 if valid_indices:
+                    resolved = resolve_generation_kwargs(
+                        gkwargs[valid_indices[0]],
+                        default_temperature=self._temperature,
+                        default_top_p=1.0,
+                        override_do_sample=getattr(self, "_gen_do_sample_override", None),
+                        override_temperature=getattr(self, "_gen_temperature_override", None),
+                        override_top_p=getattr(self, "_gen_top_p_override", None),
+                    )
                     sampling_params = {
                         "max_tokens": max(_get_max_gen_tokens(gkwargs[i]) for i in valid_indices),
-                        "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
-                        "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
+                        "temperature": resolved["temperature"],
+                        "top_p": resolved["top_p"],
                     }
                     batch_embeds = [embeds[i] for i in valid_indices]
                     outs = self._vllm_manager.generate_from_embeddings(batch_embeds, sampling_params=sampling_params)
@@ -2333,10 +2441,18 @@ class NativeCausalLM(TemplateLM):
                 outs_text = [""] * len(chunk)
                 outs_token_ids: List[Optional[List[int]]] = [None] * len(chunk)
                 if valid_indices:
+                    resolved = resolve_generation_kwargs(
+                        gkwargs[valid_indices[0]],
+                        default_temperature=self._temperature,
+                        default_top_p=1.0,
+                        override_do_sample=getattr(self, "_gen_do_sample_override", None),
+                        override_temperature=getattr(self, "_gen_temperature_override", None),
+                        override_top_p=getattr(self, "_gen_top_p_override", None),
+                    )
                     sampling_params = {
                         "max_tokens": max(gen_lens[i] for i in valid_indices),
-                        "temperature": gkwargs[valid_indices[0]].get("temperature", self._temperature),
-                        "top_p": gkwargs[valid_indices[0]].get("top_p", 1.0),
+                        "temperature": resolved["temperature"],
+                        "top_p": resolved["top_p"],
                     }
                     # NIAH (BOR-enabled) can emit <EOR> then immediately EOS. By default vLLM
                     # stops on EOS, which makes it *look* like generation stops at EOR.
@@ -2462,8 +2578,16 @@ class NativeCausalLM(TemplateLM):
             for (context_str, gen_kwargs), task_name in zip(chunk, chunk_tasks):
                 until = gen_kwargs.get("until", None)
                 max_gen_len = _get_max_gen_tokens(gen_kwargs)
-                temperature = gen_kwargs.get("temperature", self._temperature)
-                top_p = gen_kwargs.get("top_p", 1.0)
+                resolved = resolve_generation_kwargs(
+                    gen_kwargs,
+                    default_temperature=self._temperature,
+                    default_top_p=1.0,
+                    override_do_sample=getattr(self, "_gen_do_sample_override", None),
+                    override_temperature=getattr(self, "_gen_temperature_override", None),
+                    override_top_p=getattr(self, "_gen_top_p_override", None),
+                )
+                temperature = resolved["temperature"]
+                top_p = resolved["top_p"]
 
                 if self._mode in {"compress_answer", "reconstruct_first", "niah_generate"} and hasattr(self.model, "compression_embeddings"):
                     include_bor = self._mode == "reconstruct_first"
