@@ -411,6 +411,10 @@ class NativeCausalLM(TemplateLM):
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
         self._niah_use_bor = bool(niah_use_bor)
+        # NIAH with BOR is intended to reconstruct relevant context for a given query.
+        # Enable BOQ token insertion by default so the query is explicitly marked.
+        # if self._mode == "niah_generate" and self._niah_use_bor:
+        #     self._add_boq_index = True
         self._niah_debug_dir = _normalize_optional_text(niah_debug_dir)
         if not self._niah_debug_dir:
             # By default, colocate NIAH debug artifacts with lm-eval outputs.
@@ -1136,7 +1140,8 @@ class NativeCausalLM(TemplateLM):
 
             memory_tokens = memory_start + comp_tokens + im_end
             comp_mask.extend([False] * len(im_end))
-            user_tokens = user_start + query_tokens + im_end
+            boq_tokens = [BEGIN_OF_QUERY_INDEX] if self._add_boq_index else []
+            user_tokens = user_start + boq_tokens + query_tokens + im_end
             comp_mask.extend([False] * len(user_tokens))
             
             # Always open an assistant turn; if `assistant_text` is provided, prefill
@@ -2289,7 +2294,9 @@ class NativeCausalLM(TemplateLM):
                     and all(t is not None for t in chunk_tasks)
                 )
                 task0 = str(chunk_tasks[0]) if chunk_tasks and chunk_tasks[0] is not None else ""
-                can_split = doc_split_ok and ("longbench2" in task0 or "niah" in task0)
+                can_split = doc_split_ok and (
+                    ("longbench2" in task0) or (self._mode == "niah_generate" and "niah" in task0)
+                )
 
                 gen_lens = [_get_max_gen_tokens(g) for g in gkwargs]
                 split_data: Optional[Dict[str, List[str]]] = None
@@ -2353,6 +2360,7 @@ class NativeCausalLM(TemplateLM):
                 if (
                     split_data is not None
                     and "niah" in task0.lower()
+                    and self._mode == "niah_generate"
                     and getattr(self, "_niah_debug_dir", "")
                     and int(getattr(self, "_niah_debug_max_cases", 0) or 0) != 0
                 ):
@@ -2389,6 +2397,7 @@ class NativeCausalLM(TemplateLM):
                                 len(memory_start)
                                 + len(im_end)
                                 + len(user_start)
+                                + (1 if getattr(self, "_add_boq_index", False) else 0)
                                 + len(query_tokens)
                                 + len(im_end)
                                 + len(assistant_start)
@@ -3036,6 +3045,7 @@ class NativeCausalLM(TemplateLM):
                     len(memory_start)
                     + len(im_end)
                     + len(user_start)
+                    + boq_extra
                     + len(query_tokens)
                     + len(im_end)
                     + len(assistant_start)
@@ -3881,6 +3891,7 @@ class NativeCausalLM(TemplateLM):
                     len(memory_start)
                     + len(im_end)
                     + len(user_start)
+                    + (1 if getattr(self, "_add_boq_index", False) else 0)
                     + len(query_tokens)
                     + len(im_end)
                     + len(assistant_start)
