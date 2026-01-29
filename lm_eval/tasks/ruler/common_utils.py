@@ -12,8 +12,18 @@ if TYPE_CHECKING:
 
 eval_logger = logging.getLogger(__name__)
 
+# Default sequence lengths for RULER synthetic tasks (NIAH, etc.). These keys
+# are also used by `process_results*` to populate per-length metric slots with
+# `-1` for non-matching samples so `aggregate_metrics` can ignore them.
 DEFAULT_SEQ_LENGTHS = [
+    2048,
     4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
 ]
 
 

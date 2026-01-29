@@ -565,6 +565,10 @@ class NativeCausalLM(TemplateLM):
         self._niah_debug_max_cases = int(niah_debug_max_cases)
         self._niah_debug_max_prompt_chars = max(0, int(niah_debug_max_prompt_chars))
         self._niah_debug_dumped = 0
+        # Per-run debug file id (avoid appending different runs into a single JSONL).
+        # Keep legacy `niah_debug_cases.jsonl` for backwards compatibility.
+        self._niah_debug_run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{os.getpid()}"
+        self._niah_debug_run_path: Optional[str] = None
         if show_compress_progress is None:
             self._show_compress_progress = (self._mode == "niah_generate")
         else:
@@ -572,7 +576,16 @@ class NativeCausalLM(TemplateLM):
         
         
         max_seq_length_int = _coerce_int(max_seq_length, None)
-        self._decoder_budget = max(max_seq_length_int or 0, 8192)
+        vllm_max_model_len_int = _coerce_int(vllm_max_model_len, None)
+        if max_seq_length_int is not None and max_seq_length_int > 0:
+            self._decoder_budget = max(max_seq_length_int, 8192)
+        elif vllm_max_model_len_int is not None and vllm_max_model_len_int > 0:
+            # If user only sets `vllm_max_model_len`, treat it as the effective decoder budget.
+            # This is important for NIAH/RULER where the raw context may exceed 32k but is
+            # expected to fit via compressed spans.
+            self._decoder_budget = max(vllm_max_model_len_int, 8192)
+        else:
+            self._decoder_budget = 8192
         
         
 
@@ -1124,14 +1137,24 @@ class NativeCausalLM(TemplateLM):
         if max_cases > 0 and dumped >= max_cases:
             return
         os.makedirs(debug_dir, exist_ok=True)
-        out_path = os.path.join(debug_dir, "niah_debug_cases.jsonl")
+        legacy_path = os.path.join(debug_dir, "niah_debug_cases.jsonl")
+        run_path = getattr(self, "_niah_debug_run_path", None)
+        if not run_path:
+            run_id = getattr(self, "_niah_debug_run_id", "") or datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_path = os.path.join(debug_dir, f"niah_debug_cases_{run_id}.jsonl")
+            self._niah_debug_run_path = run_path
         to_write = rows if max_cases < 0 else rows[: max_cases - dumped]
-        with open(out_path, "a", encoding="utf-8") as f:
-            for row in to_write:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for out_path in [legacy_path, run_path]:
+            if not out_path:
+                continue
+            with open(out_path, "a", encoding="utf-8") as f:
+                for row in to_write:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self._niah_debug_dumped = dumped + len(to_write)
         if not bool(getattr(self, "_niah_debug_notified", False)):
-            print(f"Saved NIAH debug cases to {out_path}")
+            print(f"Saved NIAH debug cases to {legacy_path}")
+            if run_path and run_path != legacy_path:
+                print(f"Saved NIAH debug cases to {run_path}")
             self._niah_debug_notified = True
 
     # ---- Tokenization helpers ----
@@ -2438,20 +2461,24 @@ class NativeCausalLM(TemplateLM):
                         results.append(text)
                     continue
 
-                # If we have structured docs and a supported task, split (context, query) and
-                # use the native_rag chat template to ensure the query is *not* compressed away.
-                doc_split_ok = (
-                    bool(self._chat_use_template)
-                    and all(d is not None for d in chunk_docs)
-                    and all(t is not None for t in chunk_tasks)
-                )
+                # If we have structured docs and a supported task, split (context, query) so the
+                # query is *not* compressed away.
+                #
+                # - LongBench2: requires native_rag chat template (memory/user/assistant scaffold).
+                # - RULER NIAH: allow splitting even when `use_chat_template=false`, because the
+                #   raw haystack can exceed `vllm_max_model_len` but is expected to fit via spans.
+                has_structured_docs = all(d is not None for d in chunk_docs) and all(t is not None for t in chunk_tasks)
                 task0 = str(chunk_tasks[0]) if chunk_tasks and chunk_tasks[0] is not None else ""
-                can_split = doc_split_ok and (
-                    ("longbench2" in task0) or (self._mode == "niah_generate" and "niah" in task0)
+                task0_lower = task0.lower()
+                is_niah_task = (self._mode == "niah_generate") and ("niah" in task0_lower)
+                is_longbench2_task = "longbench2" in task0_lower
+                can_split = has_structured_docs and (
+                    (is_longbench2_task and bool(self._chat_use_template)) or is_niah_task
                 )
 
                 gen_lens = [_get_max_gen_tokens(g) for g in gkwargs]
                 split_data: Optional[Dict[str, List[str]]] = None
+                embeds_meta: Optional[Dict[str, List[Any]]] = None
                 if can_split:
                     keys = get_doc_query_keys_by_task_name(task0)
                     split_data = _split_doc_and_query(
@@ -2463,7 +2490,7 @@ class NativeCausalLM(TemplateLM):
                         niah_use_bor=bool(getattr(self, "_niah_use_bor", False)),
                     )
                     prompts = [""] * len(chunk)
-                    embeds = self._build_compress_prompt_embeds_batch(
+                    build_ret = self._build_compress_prompt_embeds_batch(
                         prompts,
                         gen_lens,
                         include_bor,
@@ -2471,7 +2498,13 @@ class NativeCausalLM(TemplateLM):
                         context_list=split_data["context_list"],
                         query_list=split_data["query_list"],
                         assistant_prefix_list=split_data.get("assistant_prefix_list"),
+                        # NIAH debug output needs accurate `n_spans` and prompt layout.
+                        return_meta=bool(is_niah_task),
                     )
+                    if isinstance(build_ret, tuple):
+                        embeds, embeds_meta = build_ret
+                    else:
+                        embeds = build_ret
                 else:
                     prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
                     embeds = self._build_compress_prompt_embeds_batch(
@@ -2486,8 +2519,10 @@ class NativeCausalLM(TemplateLM):
                 vllm_max_len = int(getattr(self, "_vllm_max_model_len", 0) or 0)
                 valid_indices: List[int] = []
                 max_tokens_caps: Dict[int, int] = {}
+                skip_reason: List[Optional[str]] = [None] * len(chunk)
                 for i, e in enumerate(embeds):
                     if e is None:
+                        skip_reason[i] = "no_prompt_embeds"
                         continue
                     try:
                         e_len = int(e.shape[0])
@@ -2495,6 +2530,7 @@ class NativeCausalLM(TemplateLM):
                         e_len = 0
                     if vllm_max_len > 0 and e_len > vllm_max_len:
                         # Prompt itself does not fit; skip this sample.
+                        skip_reason[i] = f"prompt_too_long:{e_len}>{vllm_max_len}"
                         embeds[i] = None
                         continue
                     if vllm_max_len > 0:
@@ -2523,6 +2559,12 @@ class NativeCausalLM(TemplateLM):
                             max_toks = min(max_toks, int(max_tokens_caps.get(idx, max_toks)))
                         if max_toks <= 0:
                             # No room to generate any tokens; skip.
+                            skip_reason[idx] = (
+                                f"no_generation_room:prompt_len={vllm_max_len - int(max_tokens_caps.get(idx, 0) or 0)}"
+                                f" max_model_len={vllm_max_len}"
+                                if vllm_max_len > 0
+                                else "no_generation_room"
+                            )
                             embeds[idx] = None
                             continue
                         params = {
@@ -2540,10 +2582,18 @@ class NativeCausalLM(TemplateLM):
                         sampling_params_list.append(params)
                     valid_indices = filtered_indices
                     if valid_indices:
-                        outs = self._vllm_manager.generate_from_embeddings(
-                            batch_embeds,
-                            sampling_params=sampling_params_list,
-                        )
+                        try:
+                            outs = self._vllm_manager.generate_from_embeddings(
+                                batch_embeds,
+                                sampling_params=sampling_params_list,
+                            )
+                        except Exception as e:
+                            # Do not crash the entire evaluation on a single overlong/invalid request.
+                            err = f"vllm_generate_failed:{type(e).__name__}:{e}"
+                            for idx in valid_indices:
+                                if skip_reason[idx] is None:
+                                    skip_reason[idx] = err
+                            outs = []
                         for idx, out in zip(valid_indices, outs):
                             choice0 = out.outputs[0] if getattr(out, "outputs", None) else None
                             text = choice0.text if choice0 is not None else ""
@@ -2564,7 +2614,7 @@ class NativeCausalLM(TemplateLM):
                     and int(getattr(self, "_niah_debug_max_cases", 0) or 0) != 0
                 ):
                     debug_rows: List[dict] = []
-                    for dbg_idx in valid_indices or list(range(len(chunk_docs))):
+                    for dbg_idx in range(len(chunk_docs)):
                         if not (0 <= dbg_idx < len(chunk_docs)):
                             continue
                         if chunk_docs[dbg_idx] is None:
@@ -2579,53 +2629,113 @@ class NativeCausalLM(TemplateLM):
                         if "assistant_prefix_list" in split_data and dbg_idx < len(split_data["assistant_prefix_list"]):
                             assistant_prefix = split_data["assistant_prefix_list"][dbg_idx] or ""
 
-                        # Recompute max_spans for an accurate chat prefix snapshot.
+                        # Build an accurate special-token prefix snapshot matching the
+                        # actual prompt_embeds layout (avoid re-splitting long contexts).
+                        n_spans_dbg: Optional[int] = None
+                        try:
+                            if embeds_meta and "n_spans" in embeds_meta and dbg_idx < len(embeds_meta["n_spans"]):
+                                n_spans_dbg = int(embeds_meta["n_spans"][dbg_idx])
+                        except Exception:
+                            n_spans_dbg = None
+                        # Extra compression / budgeting diagnostics (helps verify span truncation).
+                        meta_prompt_len: Optional[int] = None
+                        meta_slots: Optional[int] = None
+                        meta_flat_ctx_len: Optional[int] = None
+                        meta_orig_n_spans: Optional[int] = None
+                        meta_orig_flat_ctx_len: Optional[int] = None
+                        meta_fixed_len: Optional[int] = None
+                        meta_avail_for_memory: Optional[int] = None
+                        meta_max_spans: Optional[int] = None
+                        meta_gen_len: Optional[int] = None
+                        meta_span_len: Optional[int] = None
+                        meta_decoder_budget: Optional[int] = None
+                        meta_vllm_max_model_len: Optional[int] = None
+                        meta_decoder_memory_layout: Optional[str] = None
+                        meta_num_comp: Optional[int] = None
+                        try:
+                            if embeds_meta:
+                                def _get_list_value(name: str) -> Optional[Any]:
+                                    val = embeds_meta.get(name)
+                                    if isinstance(val, list) and dbg_idx < len(val):
+                                        return val[dbg_idx]
+                                    return None
+
+                                meta_prompt_len = _coerce_int(_get_list_value("prefix_lens"), None)
+                                meta_slots = _coerce_int(_get_list_value("slots"), None)
+                                meta_flat_ctx_len = _coerce_int(_get_list_value("flat_ctx_len"), None)
+                                meta_orig_n_spans = _coerce_int(_get_list_value("orig_n_spans"), None)
+                                meta_orig_flat_ctx_len = _coerce_int(_get_list_value("orig_flat_ctx_len"), None)
+                                meta_fixed_len = _coerce_int(_get_list_value("fixed_len"), None)
+                                meta_avail_for_memory = _coerce_int(_get_list_value("avail_for_memory"), None)
+                                meta_max_spans = _coerce_int(_get_list_value("max_spans"), None)
+                                meta_gen_len = _coerce_int(_get_list_value("gen_lens"), None)
+
+                                meta_span_len = _coerce_int(embeds_meta.get("span_len"), None)
+                                meta_decoder_budget = _coerce_int(embeds_meta.get("decoder_budget"), None)
+                                meta_vllm_max_model_len = _coerce_int(embeds_meta.get("vllm_max_model_len"), None)
+                                dml = embeds_meta.get("decoder_memory_layout")
+                                meta_decoder_memory_layout = str(dml) if dml is not None else None
+                                meta_num_comp = _coerce_int(embeds_meta.get("num_comp"), None)
+                        except Exception:
+                            pass
+
                         try:
                             num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
-                            # Match the same decoder budget clamping logic as prompt_embeds building.
-                            decoder_budget_dbg = int(self.decoder_budget)
-                            vllm_max_dbg = int(getattr(self, "_vllm_max_model_len", 0) or 0)
-                            if getattr(self, "_vllm_manager", None) is not None and vllm_max_dbg > 0:
-                                decoder_budget_dbg = min(decoder_budget_dbg, vllm_max_dbg)
-                            span_len = int(getattr(self.model.args, "max_mem_span_len", decoder_budget_dbg))
-                            spans = self._split_contexts_to_spans(ctx_text, span_len)
-                            memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
-                            user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
-                            assistant_start = self._tokenizer.encode("<|im_start|>assistant\n", bos=False, eos=False)
-                            im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
-                            query_tokens = self._tokenizer.encode(query_text, bos=False, eos=False)
-                            assistant_prefix_tokens = (
-                                self._tokenizer.encode(assistant_prefix, bos=False, eos=False) if assistant_prefix else []
-                            )
-                            fixed_len = (
-                                len(memory_start)
-                                + len(im_end)
-                                + len(user_start)
-                                + (1 if getattr(self, "_add_boq_index", False) else 0)
-                                + len(query_tokens)
-                                + len(im_end)
-                                + len(assistant_start)
-                                + len(assistant_prefix_tokens)
-                                + (1 if include_bor else 0)
-                            )
-                            span_cost = max(1, num_comp + 2)
-                            max_spans = (decoder_budget_dbg - fixed_len - int(gen_lens[dbg_idx])) // span_cost
-                            # If the decoder budget cannot fit any spans, allow 0 (no memory),
-                            # rather than forcing 1 and potentially producing an overlong prompt.
-                            if max_spans < 0:
-                                max_spans = 0
-                            if max_spans > len(spans):
-                                max_spans = len(spans)
-                        except Exception:
-                            max_spans = None
+                            placeholder_id = 0
+                            prefix_tokens: List[int] = []
 
-                        chat_ret = self._format_chat(
-                            user_text=query_text,
-                            assistant_text=assistant_prefix,
-                            contexts=ctx_text,
-                            max_spans=max_spans,
-                        )
-                        prefix_tokens = list(chat_ret.get("decoder_prefix_tokens") or [])
+                            if bool(getattr(self, "_chat_use_template", False)) and str(
+                                getattr(self, "_chat_template_version", "")
+                            ).lower() == "v3":
+                                memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
+                                user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
+                                assistant_start = self._tokenizer.encode(
+                                    "<|im_start|>assistant\n", bos=False, eos=False
+                                )
+                                im_end = self._tokenizer.encode("<|im_end|>\n", bos=False, eos=False)
+
+                                memory_body: List[int] = []
+                                for _ in range(max(0, int(n_spans_dbg or 0))):
+                                    memory_body.extend(
+                                        [BEGIN_OF_MEMORY_INDEX]
+                                        + ([placeholder_id] * num_comp)
+                                        + [END_OF_MEMORY_INDEX]
+                                    )
+                                memory_tokens = memory_start + memory_body + im_end
+
+                                user_tokens: List[int] = list(user_start)
+                                if bool(getattr(self, "_add_boq_index", False)):
+                                    user_tokens.append(BEGIN_OF_QUERY_INDEX)
+                                user_tokens.extend(self._tokenizer.encode(query_text, bos=False, eos=False))
+                                user_tokens.extend(im_end)
+
+                                assistant_tokens: List[int] = list(assistant_start)
+                                if assistant_prefix:
+                                    assistant_tokens.extend(
+                                        self._tokenizer.encode(str(assistant_prefix), bos=False, eos=False)
+                                    )
+
+                                prefix_tokens = memory_tokens + user_tokens + assistant_tokens
+                            else:
+                                # Non-chat prefix layout: [memory blocks]* + [BOQ] + query + (space+gen_prefix)
+                                for _ in range(max(0, int(n_spans_dbg or 0))):
+                                    prefix_tokens.extend(
+                                        [BEGIN_OF_MEMORY_INDEX]
+                                        + ([placeholder_id] * num_comp)
+                                        + [END_OF_MEMORY_INDEX]
+                                    )
+                                if bool(getattr(self, "_add_boq_index", False)):
+                                    prefix_tokens.append(BEGIN_OF_QUERY_INDEX)
+                                prefix_tokens.extend(self._tokenizer.encode(query_text, bos=False, eos=False))
+                                if assistant_prefix:
+                                    # Match lm-eval's `target_delimiter: " "` between question and gen_prefix.
+                                    ap = str(assistant_prefix)
+                                    if ap and not ap[:1].isspace():
+                                        ap = " " + ap
+                                    prefix_tokens.extend(self._tokenizer.encode(ap, bos=False, eos=False))
+                        except Exception:
+                            prefix_tokens = []
+
                         if include_bor:
                             prefix_tokens.append(BEGIN_OF_RECONSTRUCTION_INDEX)
                         prompt_special = self.tok_decode_w_special_tokens(prefix_tokens)
@@ -2661,6 +2771,26 @@ class NativeCausalLM(TemplateLM):
                                 "max_length": doc.get("max_length"),
                                 "include_bor": bool(include_bor),
                                 "niah_use_bor": bool(getattr(self, "_niah_use_bor", False)),
+                                "max_bor": int(getattr(self, "_reconstruct_max_bor", 0) or 0),
+                                # Decoder/memory budgeting diagnostics
+                                "max_mem_span_len": int(getattr(self, "_max_mem_span_len", 0) or 0),
+                                "max_mem_span_len_override": getattr(self, "_max_mem_span_len_override", None),
+                                "span_len_used": meta_span_len,
+                                "decoder_budget_used": meta_decoder_budget,
+                                "vllm_max_model_len": meta_vllm_max_model_len,
+                                "decoder_memory_layout": meta_decoder_memory_layout,
+                                "num_compression_tokens": meta_num_comp,
+                                "prompt_len": meta_prompt_len,
+                                "n_spans": n_spans_dbg,
+                                "orig_n_spans": meta_orig_n_spans,
+                                "slots": meta_slots,
+                                "flat_ctx_len": meta_flat_ctx_len,
+                                "orig_flat_ctx_len": meta_orig_flat_ctx_len,
+                                "fixed_len": meta_fixed_len,
+                                "avail_for_memory": meta_avail_for_memory,
+                                "max_spans": meta_max_spans,
+                                "gen_len": meta_gen_len,
+                                "skip_reason": skip_reason[dbg_idx] if dbg_idx < len(skip_reason) else None,
                                 "needle_type": needle_type,
                                 "gold_outputs": doc.get("outputs"),
                                 "question": question_text,
@@ -3144,11 +3274,12 @@ class NativeCausalLM(TemplateLM):
             raise ValueError(f"Unsupported decoder_memory_layout: {decoder_memory_layout}")
         chat_enabled = bool(getattr(self, "_chat_use_template", False))
         use_chat = bool(chat_enabled and context_list is not None and query_list is not None)
-        if chat_enabled and (context_list is None) != (query_list is None):
-            raise ValueError("chat template requires both context_list and query_list when using chat contexts")
-        if use_chat:
+        use_split_nonchat = bool((not chat_enabled) and context_list is not None and query_list is not None)
+        if (context_list is None) != (query_list is None) and (context_list is not None or query_list is not None):
+            raise ValueError("context_list/query_list must both be set when using split contexts")
+        if use_chat or use_split_nonchat:
             if context_list is None or query_list is None:
-                raise ValueError("chat template requires context_list and query_list in _build_compress_prompt_embeds_batch")
+                raise ValueError("split mode requires both context_list and query_list")
             if len(context_list) != len(prompts) or len(query_list) != len(prompts):
                 raise ValueError(
                     f"context_list/query_list must match prompts length; got {len(context_list)}/{len(query_list)} vs {len(prompts)}"
@@ -3239,7 +3370,14 @@ class NativeCausalLM(TemplateLM):
         # --------------------------
         # Compression-aware path
         # --------------------------
-        max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", decoder_budget))
+        # Prefer the eval-time span length knob we computed in __init__ (which
+        # respects `--model_args max_mem_span_len=...`) over any checkpoint-default
+        # value. This is important for NIAH/RULER: if `max_mem_span_len` is smaller
+        # than intended, the number of memory spans (and thus decoder prompt length)
+        # can explode and exceed `vllm_max_model_len`.
+        max_mem_span_len = int(getattr(self, "_max_mem_span_len", 0) or 0)
+        if max_mem_span_len <= 0:
+            max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", decoder_budget))
         model_max_len = int(getattr(self.model.args, "max_seq_len", self._max_seq_length))
         if model_max_len <= num_comp:
             raise ValueError(
@@ -3249,7 +3387,10 @@ class NativeCausalLM(TemplateLM):
 
         # Each encoder micro-batch is: span_tokens + num_comp placeholders.
         # Ensure positions never exceed model max len.
-        span_len = max_mem_span_len
+        # Clamp span_len so `span_len + num_comp` never exceeds encoder max len.
+        span_len = min(int(max_mem_span_len), int(model_max_len) - int(num_comp))
+        if span_len <= 0:
+            span_len = 1
         placeholder_id = 0
 
         add_boq = bool(self._add_boq_index and not not_add_boq_index)
@@ -3413,6 +3554,229 @@ class NativeCausalLM(TemplateLM):
                 "slots": total_comp_slots_list,
                 "comp_mask_list": comp_mask_list,
                 "prefix_lens": prefix_lens,
+                # Global config snapshot (useful for debugging budget/truncation decisions).
+                "span_len": int(span_len),
+                "decoder_budget": int(decoder_budget),
+                "vllm_max_model_len": int(getattr(self, "_vllm_max_model_len", 0) or 0),
+                "decoder_memory_layout": str(decoder_memory_layout),
+                "num_comp": int(num_comp),
+                "gen_lens": [int(x) for x in gen_lens],
+            }
+            return (embeds, meta) if return_meta else embeds
+
+        if use_split_nonchat:
+            selected_spans_list: List[int] = []
+            selected_flat_lens: List[int] = []
+            orig_spans_list: List[int] = []
+            orig_flat_lens: List[int] = []
+            total_comp_slots_list: List[int] = []
+            comp_offsets: List[int] = [0]
+            comp_mask_list: List[List[bool]] = []
+            prefix_lens: List[int] = []
+            force_skip: List[bool] = [False] * len(prompts)
+            fixed_lens_list: List[int] = []
+            avail_for_memory_list: List[int] = []
+            max_spans_list: List[int] = []
+
+            enc_tokens_mb: List[torch.Tensor] = []
+            enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
+
+            query_tokens_list: List[List[int]] = []
+            assistant_prefix_tokens_list: List[List[int]] = []
+
+            for i, contexts in enumerate(context_list):
+                spans = self._split_contexts_to_spans(contexts, span_len)
+                # Record pre-truncation stats (useful for debugging overly aggressive truncation).
+                orig_n_spans = len(spans)
+                orig_flat_len = sum(len(sp) for sp in spans)
+                query_tokens = self._tokenizer.encode(query_list[i], bos=False, eos=False)
+                query_tokens_list.append(query_tokens)
+
+                assistant_prefix = ""
+                if assistant_prefix_list is not None:
+                    raw_prefix = assistant_prefix_list[i]
+                    if raw_prefix is not None:
+                        assistant_prefix = str(raw_prefix)
+
+                assistant_prefix_tokens: List[int] = []
+                if assistant_prefix:
+                    # Match lm-eval `target_delimiter: " "` between question and gen_prefix.
+                    ap_text = assistant_prefix
+                    if ap_text and not ap_text[:1].isspace():
+                        ap_text = " " + ap_text
+                    assistant_prefix_tokens = self._tokenizer.encode(ap_text, bos=False, eos=False)
+                assistant_prefix_tokens_list.append(assistant_prefix_tokens)
+
+                fixed_len = boq_extra + len(query_tokens) + len(assistant_prefix_tokens) + bor_extra
+                fixed_lens_list.append(int(fixed_len))
+                if fixed_len > decoder_budget:
+                    # Cannot fit even without memory blocks; skip.
+                    force_skip[i] = True
+                    spans = []
+                    orig_n_spans = 0
+                    orig_flat_len = 0
+
+                # Determine how many memory spans can fit in the decoder prompt budget.
+                avail_for_memory = int(decoder_budget) - int(fixed_len) - int(gen_lens[i])
+                avail_for_memory_list.append(int(avail_for_memory))
+                if decoder_memory_layout == "single":
+                    # single layout: [BOM] + slots + [EOM] costs 2 + (num_comp * n_spans)
+                    span_cost = num_comp
+                    max_spans = (avail_for_memory - 2) // max(1, span_cost)
+                else:
+                    # per-span layout: each span costs (BOM + slots + EOM) = num_comp + 2
+                    span_cost = num_comp + 2
+                    max_spans = avail_for_memory // max(1, span_cost)
+
+                if max_spans < 0:
+                    max_spans = 0
+                if max_spans == 0:
+                    spans = []
+                elif max_spans < len(spans):
+                    # Prefer tail spans (RULER/NIAH needles may appear late).
+                    spans = spans[-max_spans:]
+                max_spans_list.append(int(max_spans))
+                orig_spans_list.append(int(orig_n_spans))
+                orig_flat_lens.append(int(orig_flat_len))
+
+                n_spans = len(spans)
+                selected_spans_list.append(n_spans)
+                selected_flat_lens.append(sum(len(sp) for sp in spans))
+                slots = num_comp * n_spans
+                total_comp_slots_list.append(slots)
+                comp_offsets.append(comp_offsets[-1] + slots)
+
+                for sp in spans:
+                    enc_seq = torch.tensor(
+                        list(sp) + ([placeholder_id] * num_comp), device=self.device, dtype=torch.long
+                    )
+                    clen = int(enc_seq.numel())
+                    mem_mask = torch.zeros(clen, device=self.device, dtype=torch.bool)
+                    mem_mask[-num_comp:] = True
+                    cu = torch.tensor([0, clen], device=self.device, dtype=torch.int32)
+                    enc_tokens_mb.append(enc_seq)
+                    enc_ctx_mb.append(
+                        {
+                            "cu_seqlens_q": cu,
+                            "cu_seqlens_k": cu,
+                            "max_seqlen_q": clen,
+                            "max_seqlen_k": clen,
+                            "positions": torch.arange(clen, device=self.device, dtype=torch.int32),
+                            "encoder_mem_mask": mem_mask,
+                        }
+                    )
+
+            expected_total_slots = int(comp_offsets[-1])
+            d_model = int(getattr(self.model.args, "d_model", 0))
+            if expected_total_slots <= 0:
+                compression_vectors = torch.empty((0, d_model), device=self.device, dtype=self._dtype)
+            else:
+                if not hasattr(self.model, "compress_multi_batches"):
+                    raise RuntimeError(
+                        "Compression model missing compress_multi_batches; expected MassiveCompressedMemoryModel."
+                    )
+                extra_kwargs: Dict[str, Any] = {}
+                if (
+                    bool(getattr(self, "_show_compress_progress", False))
+                    and int(getattr(getattr(self, "_distributed_args", None), "rank", 0)) == 0
+                ):
+                    extra_kwargs = filter_kwargs_for_callable(
+                        getattr(self.model, "compress_multi_batches"),
+                        {"show_progress": True, "progress_desc": f"compress[{self._mode}]"},
+                    )
+                with torch.autocast(device_type="cuda", dtype=self._dtype):
+                    compression_vectors = self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb, **extra_kwargs)
+                if int(compression_vectors.shape[0]) != expected_total_slots:
+                    raise RuntimeError(
+                        f"compress_multi_batches returned {int(compression_vectors.shape[0])} vectors, "
+                        f"expected {expected_total_slots} (= num_comp * total_spans)."
+                    )
+                if compression_vectors.dtype != self._dtype:
+                    compression_vectors = compression_vectors.to(dtype=self._dtype)
+
+            for i in range(len(prompts)):
+                if force_skip[i]:
+                    embeds[i] = None
+                    comp_mask_list.append([])
+                    prefix_lens.append(0)
+                    continue
+
+                slots = int(total_comp_slots_list[i])
+                n_spans = int(selected_spans_list[i])
+
+                prefix: List[int] = []
+                comp_mask: List[bool] = []
+                if decoder_memory_layout == "single":
+                    if slots > 0:
+                        prefix = [BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * slots) + [END_OF_MEMORY_INDEX]
+                        comp_mask = [False] + ([True] * slots) + [False]
+                else:
+                    for _ in range(n_spans):
+                        prefix.extend([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX])
+                        comp_mask.extend([False] + ([True] * num_comp) + [False])
+
+                if add_boq:
+                    prefix.append(BEGIN_OF_QUERY_INDEX)
+                    comp_mask.append(False)
+
+                qt = query_tokens_list[i] if i < len(query_tokens_list) else []
+                prefix.extend(qt)
+                comp_mask.extend([False] * len(qt))
+
+                apt = assistant_prefix_tokens_list[i] if i < len(assistant_prefix_tokens_list) else []
+                prefix.extend(apt)
+                comp_mask.extend([False] * len(apt))
+
+                if include_bor:
+                    prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+                    comp_mask.append(False)
+
+                if not prefix:
+                    embeds[i] = None
+                    comp_mask_list.append([])
+                    prefix_lens.append(0)
+                    continue
+
+                prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
+                comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+                pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+
+                if slots > 0:
+                    mask_slots = int(comp_mask_t.sum().item())
+                    if mask_slots != slots:
+                        raise RuntimeError(
+                            f"Internal error: comp_mask slots ({mask_slots}) != expected slots ({slots}) for sample {i}."
+                        )
+                    v0, v1 = int(comp_offsets[i]), int(comp_offsets[i + 1])
+                    vec = compression_vectors[v0:v1]
+                    if int(vec.shape[0]) != slots:
+                        raise RuntimeError(
+                            f"Internal error: compression slice rows ({int(vec.shape[0])}) != slots ({slots}) for sample {i}."
+                        )
+                    pe[comp_mask_t] = vec.to(dtype=self._dtype)
+
+                embeds[i] = pe
+                comp_mask_list.append(list(comp_mask))
+                prefix_lens.append(len(prefix))
+
+            meta = {
+                "n_spans": selected_spans_list,
+                "flat_ctx_len": selected_flat_lens,
+                "orig_n_spans": orig_spans_list,
+                "orig_flat_ctx_len": orig_flat_lens,
+                "slots": total_comp_slots_list,
+                "comp_mask_list": comp_mask_list,
+                "prefix_lens": prefix_lens,
+                "fixed_len": fixed_lens_list,
+                "avail_for_memory": avail_for_memory_list,
+                "max_spans": max_spans_list,
+                # Global config snapshot (helps debug span budgeting decisions).
+                "span_len": int(span_len),
+                "decoder_budget": int(decoder_budget),
+                "vllm_max_model_len": int(getattr(self, "_vllm_max_model_len", 0) or 0),
+                "decoder_memory_layout": str(decoder_memory_layout),
+                "num_comp": int(num_comp),
+                "gen_lens": [int(x) for x in gen_lens],
             }
             return (embeds, meta) if return_meta else embeds
 
