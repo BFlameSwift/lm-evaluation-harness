@@ -1,0 +1,9 @@
+group: infinitebench
+group_alias: "InfiniteBench"
+task:
+  - infinitebench_retrieve_passkey
+  - infinitebench_retrieve_number
+  - infinitebench_longbook_choice_eng
+metadata:
+  version: 1.0
+
