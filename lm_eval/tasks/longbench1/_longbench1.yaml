@@ -1,0 +1,6 @@
+group: longbench1
+group_alias: "LongBench v1 (custom)"
+task:
+  - longbench1_passage_retrieval_en
+metadata:
+  version: 1.0
