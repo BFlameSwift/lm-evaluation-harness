@@ -67,6 +67,33 @@ def filter_kwargs_for(
     return {k: v for k, v in raw_kwargs.items() if k in valid_names}
 
 
+def filter_kwargs_for_callable(
+    fn: Any,
+    raw_kwargs: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Filter kwargs for an arbitrary callable (bound method/function).
+
+    If the callable accepts **kwargs, return raw_kwargs unchanged.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return {}
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(raw_kwargs)
+    valid_names = {
+        name
+        for name, param in sig.parameters.items()
+        if param.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+    return {k: v for k, v in raw_kwargs.items() if k in valid_names}
+
+
 def _str_to_dtype(name: Optional[str]) -> torch.dtype:
     if name is None or name == "auto":
         return torch.bfloat16
@@ -430,6 +457,10 @@ class NativeCausalLM(TemplateLM):
         # 0 disables, <0 means "unlimited"
         niah_debug_max_cases: int = -1,
         niah_debug_max_prompt_chars: int = 8000,
+        # Compression progress (helpful for slow NIAH/RULER runs). If unset:
+        #   - enabled by default for `mode=niah_generate`
+        #   - disabled otherwise
+        show_compress_progress: Optional[bool] = None,
         save_loglikelihood_debug: bool = True,
         loglikelihood_debug_path: Optional[str] = None,
 
@@ -534,6 +565,10 @@ class NativeCausalLM(TemplateLM):
         self._niah_debug_max_cases = int(niah_debug_max_cases)
         self._niah_debug_max_prompt_chars = max(0, int(niah_debug_max_prompt_chars))
         self._niah_debug_dumped = 0
+        if show_compress_progress is None:
+            self._show_compress_progress = (self._mode == "niah_generate")
+        else:
+            self._show_compress_progress = bool(show_compress_progress)
         
         
         max_seq_length_int = _coerce_int(max_seq_length, None)
@@ -1913,7 +1948,16 @@ class NativeCausalLM(TemplateLM):
 
         with torch.autocast(device_type="cuda", dtype=self._dtype):
             if has_multi:
-                return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
+                extra_kwargs: Dict[str, Any] = {}
+                if (
+                    bool(getattr(self, "_show_compress_progress", False))
+                    and int(getattr(getattr(self, "_distributed_args", None), "rank", 0)) == 0
+                ):
+                    extra_kwargs = filter_kwargs_for_callable(
+                        getattr(self.model, "compress_multi_batches"),
+                        {"show_progress": True, "progress_desc": "compress_plain"},
+                    )
+                return self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb, **extra_kwargs)
 
             # Fallback: run per-span compression sequentially to keep positions valid.
             outs: List[torch.Tensor] = []
@@ -2437,7 +2481,25 @@ class NativeCausalLM(TemplateLM):
                         # Best-effort: include prompt tokens so the decoder sees the question.
                         decoder_include_prompt_tokens=True,
                     )
-                valid_indices = [i for i, e in enumerate(embeds) if e is not None]
+                # vLLM enforces a hard prompt length limit (`max_model_len`). Filter/clip
+                # requests so a single over-long prompt does not crash the whole run.
+                vllm_max_len = int(getattr(self, "_vllm_max_model_len", 0) or 0)
+                valid_indices: List[int] = []
+                max_tokens_caps: Dict[int, int] = {}
+                for i, e in enumerate(embeds):
+                    if e is None:
+                        continue
+                    try:
+                        e_len = int(e.shape[0])
+                    except Exception:
+                        e_len = 0
+                    if vllm_max_len > 0 and e_len > vllm_max_len:
+                        # Prompt itself does not fit; skip this sample.
+                        embeds[i] = None
+                        continue
+                    if vllm_max_len > 0:
+                        max_tokens_caps[i] = max(0, vllm_max_len - e_len)
+                    valid_indices.append(i)
                 outs_text = [""] * len(chunk)
                 outs_token_ids: List[Optional[List[int]]] = [None] * len(chunk)
                 if valid_indices:
@@ -2449,27 +2511,48 @@ class NativeCausalLM(TemplateLM):
                         override_temperature=getattr(self, "_gen_temperature_override", None),
                         override_top_p=getattr(self, "_gen_top_p_override", None),
                     )
-                    sampling_params = {
-                        "max_tokens": max(gen_lens[i] for i in valid_indices),
-                        "temperature": resolved["temperature"],
-                        "top_p": resolved["top_p"],
-                    }
-                    # NIAH (BOR-enabled) can emit <EOR> then immediately EOS. By default vLLM
-                    # stops on EOS, which makes it *look* like generation stops at EOR.
-                    # `ignore_eos=True` ensures we honor the requested token budget.
-                    if self._mode == "niah_generate" and include_bor:
-                        sampling_params.setdefault("ignore_eos", True)
-                    batch_embeds = [embeds[i] for i in valid_indices]
-                    outs = self._vllm_manager.generate_from_embeddings(batch_embeds, sampling_params=sampling_params)
-                    for idx, out in zip(valid_indices, outs):
-                        choice0 = out.outputs[0] if getattr(out, "outputs", None) else None
-                        text = choice0.text if choice0 is not None else ""
-                        outs_text[idx] = self._truncate_until(text, gkwargs[idx].get("until"))
-                        try:
-                            token_ids = getattr(choice0, "token_ids", None) if choice0 is not None else None
-                            outs_token_ids[idx] = list(token_ids) if token_ids is not None else None
-                        except Exception:
-                            outs_token_ids[idx] = None
+                    batch_embeds: List[torch.Tensor] = []
+                    sampling_params_list: List[Dict[str, Any]] = []
+                    filtered_indices: List[int] = []
+                    for idx in valid_indices:
+                        e = embeds[idx]
+                        if e is None:
+                            continue
+                        max_toks = int(gen_lens[idx])
+                        if vllm_max_len > 0:
+                            max_toks = min(max_toks, int(max_tokens_caps.get(idx, max_toks)))
+                        if max_toks <= 0:
+                            # No room to generate any tokens; skip.
+                            embeds[idx] = None
+                            continue
+                        params = {
+                            "max_tokens": max_toks,
+                            "temperature": resolved["temperature"],
+                            "top_p": resolved["top_p"],
+                        }
+                        # NIAH (BOR-enabled) can emit <EOR> then immediately EOS. By default vLLM
+                        # stops on EOS, which makes it *look* like generation stops at EOR.
+                        # `ignore_eos=True` ensures we honor the requested token budget.
+                        if self._mode == "niah_generate" and include_bor:
+                            params.setdefault("ignore_eos", True)
+                        filtered_indices.append(idx)
+                        batch_embeds.append(e)
+                        sampling_params_list.append(params)
+                    valid_indices = filtered_indices
+                    if valid_indices:
+                        outs = self._vllm_manager.generate_from_embeddings(
+                            batch_embeds,
+                            sampling_params=sampling_params_list,
+                        )
+                        for idx, out in zip(valid_indices, outs):
+                            choice0 = out.outputs[0] if getattr(out, "outputs", None) else None
+                            text = choice0.text if choice0 is not None else ""
+                            outs_text[idx] = self._truncate_until(text, gkwargs[idx].get("until"))
+                            try:
+                                token_ids = getattr(choice0, "token_ids", None) if choice0 is not None else None
+                                outs_token_ids[idx] = list(token_ids) if token_ids is not None else None
+                            except Exception:
+                                outs_token_ids[idx] = None
                 results.extend(outs_text)
 
                 # NIAH: dump debug cases (rank0), including special-token prompt/response.
@@ -2499,7 +2582,12 @@ class NativeCausalLM(TemplateLM):
                         # Recompute max_spans for an accurate chat prefix snapshot.
                         try:
                             num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
-                            span_len = int(getattr(self.model.args, "max_mem_span_len", int(self.decoder_budget)))
+                            # Match the same decoder budget clamping logic as prompt_embeds building.
+                            decoder_budget_dbg = int(self.decoder_budget)
+                            vllm_max_dbg = int(getattr(self, "_vllm_max_model_len", 0) or 0)
+                            if getattr(self, "_vllm_manager", None) is not None and vllm_max_dbg > 0:
+                                decoder_budget_dbg = min(decoder_budget_dbg, vllm_max_dbg)
+                            span_len = int(getattr(self.model.args, "max_mem_span_len", decoder_budget_dbg))
                             spans = self._split_contexts_to_spans(ctx_text, span_len)
                             memory_start = self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False)
                             user_start = self._tokenizer.encode("<|im_start|>user\n", bos=False, eos=False)
@@ -2521,11 +2609,13 @@ class NativeCausalLM(TemplateLM):
                                 + (1 if include_bor else 0)
                             )
                             span_cost = max(1, num_comp + 2)
-                            max_spans = (int(self.decoder_budget) - fixed_len - int(gen_lens[dbg_idx])) // span_cost
-                            if max_spans <= 0:
-                                max_spans = 1
-                            if max_spans < len(spans):
-                                max_spans = max_spans
+                            max_spans = (decoder_budget_dbg - fixed_len - int(gen_lens[dbg_idx])) // span_cost
+                            # If the decoder budget cannot fit any spans, allow 0 (no memory),
+                            # rather than forcing 1 and potentially producing an overlong prompt.
+                            if max_spans < 0:
+                                max_spans = 0
+                            if max_spans > len(spans):
+                                max_spans = len(spans)
                         except Exception:
                             max_spans = None
 
@@ -3068,6 +3158,17 @@ class NativeCausalLM(TemplateLM):
                     f"assistant_prefix_list must match prompts length; got {len(assistant_prefix_list)} vs {len(prompts)}"
                 )
         decoder_budget = int(self.decoder_budget)
+        # vLLM has a hard max prompt length. When we build prompt_embeds for vLLM
+        # (generate_from_embeddings), we must clamp the effective decoder budget to
+        # vLLM's `max_model_len` to avoid hard failures.
+        vllm_max = getattr(self, "_vllm_max_model_len", None)
+        if getattr(self, "_vllm_manager", None) is not None and vllm_max is not None:
+            try:
+                vllm_max_int = int(vllm_max)
+            except Exception:
+                vllm_max_int = 0
+            if vllm_max_int > 0:
+                decoder_budget = min(decoder_budget, vllm_max_int)
 
         # --------------------------
         # Fast path: no compression
@@ -3196,9 +3297,13 @@ class NativeCausalLM(TemplateLM):
                     + bor_extra
                 )
                 max_spans = (decoder_budget - fixed_len - int(gen_lens[i])) // max(1, span_cost)
-                if max_spans <= 0:
-                    max_spans = 1
-                if max_spans < len(spans):
+                # If the decoder budget cannot fit any memory spans, prefer dropping
+                # spans rather than forcing 1 span and crashing vLLM with an overlong prompt.
+                if max_spans < 0:
+                    max_spans = 0
+                if max_spans == 0:
+                    spans = []
+                elif max_spans < len(spans):
                     spans = spans[-max_spans:]
                 max_spans_list.append(max_spans)
                 n_spans = len(spans)
@@ -3233,8 +3338,17 @@ class NativeCausalLM(TemplateLM):
             else:
                 if not hasattr(self.model, "compress_multi_batches"):
                     raise RuntimeError("Compression model missing compress_multi_batches; expected MassiveCompressedMemoryModel.")
+                extra_kwargs: Dict[str, Any] = {}
+                if (
+                    bool(getattr(self, "_show_compress_progress", False))
+                    and int(getattr(getattr(self, "_distributed_args", None), "rank", 0)) == 0
+                ):
+                    extra_kwargs = filter_kwargs_for_callable(
+                        getattr(self.model, "compress_multi_batches"),
+                        {"show_progress": True, "progress_desc": f"compress[{self._mode}]"},
+                    )
                 with torch.autocast(device_type="cuda", dtype=self._dtype):
-                    compression_vectors = self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
+                    compression_vectors = self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb, **extra_kwargs)
                 if int(compression_vectors.shape[0]) != expected_total_slots:
                     raise RuntimeError(
                         f"compress_multi_batches returned {int(compression_vectors.shape[0])} vectors, "
@@ -3332,8 +3446,10 @@ class NativeCausalLM(TemplateLM):
             
             max_chunks = max_comp_tokens // max(1, int(span_cost))
             if max_chunks <= 0:
-                max_chunks = 1
-            if max_chunks < len(ctx_spans):
+                max_chunks = 0
+            if max_chunks == 0:
+                ctx_spans = []
+            elif max_chunks < len(ctx_spans):
                 ctx_spans = ctx_spans[-max_chunks:]
                 if verbose_compress:
                     print("need chunk spans,", max_chunks, "total spans ", len(ctx_spans))
@@ -3398,8 +3514,17 @@ class NativeCausalLM(TemplateLM):
         else:
             if not hasattr(self.model, "compress_multi_batches"):
                 raise RuntimeError("Compression model missing compress_multi_batches; expected MassiveCompressedMemoryModel.")
+            extra_kwargs: Dict[str, Any] = {}
+            if (
+                bool(getattr(self, "_show_compress_progress", False))
+                and int(getattr(getattr(self, "_distributed_args", None), "rank", 0)) == 0
+            ):
+                extra_kwargs = filter_kwargs_for_callable(
+                    getattr(self.model, "compress_multi_batches"),
+                    {"show_progress": True, "progress_desc": f"compress[{self._mode}]"},
+                )
             with torch.autocast(device_type="cuda", dtype=self._dtype):
-                compression_vectors = self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb)
+                compression_vectors = self.model.compress_multi_batches(enc_tokens_mb, enc_ctx_mb, **extra_kwargs)
             if int(compression_vectors.shape[0]) != expected_total_slots:
                 raise RuntimeError(
                     f"compress_multi_batches returned {int(compression_vectors.shape[0])} vectors, "
@@ -3997,7 +4122,11 @@ class NativeCausalLM(TemplateLM):
                 if t == END_OF_RECONSTRUCTION_INDEX:
                     eor_count += 1
                     out.append(t)
-                    if max_bor > 0 and eor_count >= max_bor:
+                    # If `max_bor` is disabled (<=0), stop at the first EOR.
+                    if max_bor <= 0:
+                        stop_reason = "eor"
+                        break
+                    if eor_count >= max_bor:
                         stop_reason = "max_eor"
                         break
                     continue
