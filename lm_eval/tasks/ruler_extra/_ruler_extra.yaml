@@ -1,0 +1,8 @@
+group: ruler_extra
+task:
+  - ruler_custom_multihop
+  - ruler_custom_aggregation_sum
+  - ruler_custom_qa_simple
+metadata:
+  version: 1
+

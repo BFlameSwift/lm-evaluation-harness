@@ -1,0 +1,7 @@
+group: ruler_heatmap
+group_alias: "RULER (Heatmap)"
+task:
+  - ruler_niah_heatmap_numbers
+metadata:
+  version: 1.0
+
