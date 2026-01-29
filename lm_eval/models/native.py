@@ -2086,8 +2086,10 @@ class NativeCausalLM(TemplateLM):
                         for layer in self.model.layers:
                             h = layer(h, context=dec_ctx)
                         h = self.model.norm(h)
-                        logits = self.model.output(h).float()
-                    nxt = int(torch.argmax(logits[-1]))
+                        # Only project the last token to avoid allocating logits for the full
+                        # prompt length (which can be extremely large for long-context tasks).
+                        logits_last = self.model.output(h[-1:]).float()
+                    nxt = int(torch.argmax(logits_last[0]))
                     next_tokens.append(nxt)
                 # append tokens
                 for i, nxt in enumerate(next_tokens):
