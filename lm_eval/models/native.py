@@ -1,4 +1,45 @@
 import os
+import sys
+from pathlib import Path
+
+
+def _maybe_add_native_rag_root_to_syspath() -> None:
+    """
+    The `native` model backend depends on modules that live outside the
+    `lm-evaluation-harness` repo in this monorepo layout:
+
+        <llm_root>/
+          arch/
+          eval_func/
+          data/
+          ...
+          lm-evaluation-harness/
+
+    When running `python -m lm_eval ...` from the harness directory, that
+    `<llm_root>` is not on `sys.path` by default, so importing this module would
+    fail and the model would not be registered.
+
+    We keep this auto-discovery lightweight and best-effort so upstream-style
+    installs (where these folders don't exist) are unaffected.
+    """
+    env_root = os.getenv("NATIVE_RAG_EVAL_LLM_ROOT") or os.getenv("NATIVE_RAG_LLM_ROOT")
+    if env_root:
+        candidate = Path(env_root).expanduser().resolve()
+        if (candidate / "arch").is_dir() and (candidate / "eval_func").is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            return
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "arch").is_dir() and (parent / "eval_func").is_dir():
+            if str(parent) not in sys.path:
+                sys.path.insert(0, str(parent))
+            return
+
+
+_maybe_add_native_rag_root_to_syspath()
+
 import json
 import re
 from typing import List, Optional, Tuple
@@ -33,13 +74,15 @@ from eval_func.vllm_runner import (
     VLLMRemoteEngineWrapper,
 )
 from eval_func.utils import load_checkpoint_harness, _build_device_mesh
-import sys
+from lm_eval.models.native_doc_utils import get_doc_query_keys_by_task_name, split_doc_and_query
 import math
 from typing import Type, TypeVar, Mapping, Any, Dict
 import inspect
 import gc
 
 T = TypeVar("T")
+
+_split_doc_and_query = split_doc_and_query
 
 
 
@@ -190,20 +233,6 @@ def _extract_niah_needles(text: str, needle_type: str) -> List[str]:
     return []
 
 
-def _split_niah_input(input_text: str) -> Tuple[str, str]:
-    """Split RULER NIAH `input` into (context, question) best-effort."""
-    if not input_text:
-        return "", ""
-    # The official template appends a final question line starting with "What are...".
-    marker = "\nWhat "
-    idx = input_text.rfind(marker)
-    if idx == -1:
-        return input_text, ""
-    context = input_text[:idx].rstrip()
-    question = input_text[idx + 1 :].strip()
-    return context, question
-
-
 def resolve_generation_kwargs(
     gen_kwargs: Mapping[str, Any],
     *,
@@ -284,107 +313,6 @@ def resolve_max_gen_toks(
             except Exception:
                 continue
     return int(default_max_gen_toks)
-
-
-
-def _split_doc_and_query(
-    active_lg_docs: List[Optional[dict]],
-    active_tasks_names: List[Optional[str]],
-    prompt_list: List[str] = [],
-    doc_key: str = "context",
-    question_key: str = "question",
-    *,
-    niah_use_bor: bool = False,
-) -> Dict[str, List[str]]:
-    """
-    Split a rendered prompt into:
-        - doc_tokens: everything up to and including the closing `</text>` marker
-        - query_tokens: everything after (question/choices/Answer:)
-
-    We use tokenizer offset_mapping on the *full prompt string* to find the token boundary,
-    because BPE boundaries mean that encoding `</text>` in isolation often does not match a
-    subsequence of the full prompt token ids.
-    """
-    if not active_lg_docs or not active_tasks_names:
-        return {"context_list": [], "question_list": [], "query_list": []}
-    
-    ret_context_list = []
-    ret_question_list = []
-    ret_query_list = []
-    ret_assistant_prefix_list = []
-    # breakpoint()
-    for doc, task_name, prompt in zip(active_lg_docs, active_tasks_names, prompt_list):
-        if doc is None or task_name is None:
-            continue
-        if "longbench2" in task_name:
-            context_text = doc[doc_key]
-            question_text = doc[question_key]
-            real_query_text = prompt.split("\n</text>\n\n")[1].strip()
-            
-            ret_question_list.append(question_text)
-            ret_query_list.append(real_query_text)
-            ret_context_list.append(context_text)
-            ret_assistant_prefix_list.append("")
-
-        elif "niah" in task_name:
-            # RULER NIAH synthetic tasks:
-            # - doc["input"] contains a long haystack + a final question line.
-            # - harness appends doc["gen_prefix"] to the prompt as an answer prefix.
-            # We split input into:
-            #   context: everything before the last line (haystack + instructions)
-            #   question: last line ("What is/are ...?")
-            #   query: question (user), assistant_prefix: gen_prefix (assistant-prefill)
-            input_text = doc.get("input", "")
-            if not isinstance(input_text, str):
-                input_text = str(input_text)
-            gen_prefix = doc.get("gen_prefix", "")
-            if not isinstance(gen_prefix, str):
-                gen_prefix = str(gen_prefix)
-            gen_prefix = gen_prefix.strip()
-
-            context_text, question_text = _split_niah_input(input_text)
-
-            # In lm-eval chat mode, `gen_prefix` is appended as an assistant message.
-            # For our native_rag chat template, keep the user message as *only* the
-            # question, and prefill the assistant with `gen_prefix` so generation
-            # continues with the expected answer format.
-            query_text = question_text.strip()
-            assistant_prefix = "" if niah_use_bor else gen_prefix
-
-            ret_question_list.append(question_text)
-            ret_query_list.append(query_text)
-            ret_context_list.append(context_text)
-            ret_assistant_prefix_list.append(assistant_prefix)
-
-        else:
-            raise ValueError(f"Unsupported task: {task_name}")
-
-    return {
-        "context_list": ret_context_list,
-        "question_list": ret_question_list,
-        "query_list": ret_query_list,
-        "assistant_prefix_list": ret_assistant_prefix_list,
-    }
-
-def get_doc_query_keys_by_task_name(task_name: str) -> Dict[str, str]:
-    if "longbench2" in task_name:
-        return {
-            "doc_key": "context",
-            "question_key": "question",
-        }
-    if "niah" in task_name:
-        # RULER NIAH docs store everything under `input` + `gen_prefix`.
-        # `_split_doc_and_query` handles the actual parsing.
-        return {
-            "doc_key": "input",
-            "question_key": "input",
-        }
-    else:
-        print(f"Unsupported task: {task_name}")
-        return {
-            "doc_key": "context",
-            "question_key": "question",
-        }
 
 
 @register_model("native")
