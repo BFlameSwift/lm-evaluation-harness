@@ -25,12 +25,12 @@ def _extract_paragraph_numbers(text: str) -> List[int]:
     lowered = text.lower()
 
     # Prefer explicit "paragraph N" mentions.
-    nums = [int(n) for n in re.findall(r"paragraph\\s*(\\d+)", lowered)]
+    nums = [int(n) for n in re.findall(r"paragraph\s*(\d+)", lowered)]
     if nums:
         return nums
 
     # Fallback: first integer anywhere.
-    m = re.search(r"(\\d+)", lowered)
+    m = re.search(r"(\d+)", lowered)
     return [int(m.group(1))] if m else []
 
 
