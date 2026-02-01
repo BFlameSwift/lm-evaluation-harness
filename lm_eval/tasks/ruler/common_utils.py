@@ -1,7 +1,7 @@
 import logging
 import re
 from functools import cache
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 
 from transformers import AutoTokenizer
 
@@ -27,14 +27,59 @@ DEFAULT_SEQ_LENGTHS = [
 ]
 
 
+def _resolve_tokenizer_path(tokenizer: Any = None, pretrained: Any = None, **kwargs) -> str:
+    """Resolve tokenizer path/id from TaskManager metadata.
+
+    NOTE: lm-eval forwards `--model_args` into custom_dataset() as `pretrained`,
+    which may be a *dict* for custom models (e.g., our `native` model).
+    We normalize to a string path/id and keep caching on the normalized value.
+    """
+
+    candidate: Any = tokenizer or pretrained or kwargs.get("tokenizer_path") or kwargs.get("tokenizer")
+
+    if isinstance(candidate, dict):
+        candidate = (
+            candidate.get("tokenizer")
+            or candidate.get("tokenizer_path")
+            or candidate.get("pretrained")
+            or candidate.get("model")
+        )
+
+    if not candidate:
+        # Fallback: sometimes metadata may pass nested dicts under different keys.
+        for key in ("tokenizer_path", "tokenizer", "pretrained", "model_args"):
+            val = kwargs.get(key)
+            if isinstance(val, dict):
+                candidate = val.get("tokenizer") or val.get("tokenizer_path")
+                if candidate:
+                    break
+            elif val:
+                candidate = val
+                break
+
+    if not candidate:
+        raise ValueError(
+            "RULER synthetic tasks require a tokenizer id/path via task metadata. "
+            "Pass e.g. `--metadata '{\"tokenizer\":\"/path/to/tokenizer\",\"max_seq_lengths\":[32768]}'` "
+            "(note: `--model_args tokenizer_path=...` is NOT forwarded into task custom_dataset())."
+        )
+
+    return str(candidate)
+
+
 @cache
+def _get_tokenizer_cached(
+    pretrained: str,
+) -> Union["transformers.PreTrainedTokenizer", "transformers.PreTrainedTokenizerFast"]:
+    eval_logger.info(f"Using tokenizer {pretrained} for synthetic tasks.")
+    return AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+
+
 def get_tokenizer(
     tokenizer=None, pretrained=None, **kwargs
 ) -> Union["transformers.PreTrainedTokenizer", "transformers.PreTrainedTokenizerFast"]:
-    pretrained = tokenizer or pretrained
-    assert pretrained, "No tokenizer or pretrained provided."
-    eval_logger.info(f"Using tokenizer {pretrained} for synthetic tasks.")
-    return AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+    pretrained = _resolve_tokenizer_path(tokenizer=tokenizer, pretrained=pretrained, **kwargs)
+    return _get_tokenizer_cached(pretrained)
 
 
 def postprocess_pred(prediction: list[str]) -> list[str]:
@@ -58,6 +103,7 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{12}\b"
 )
 _MAGIC_NUMBER_RE = re.compile(r"\b\d{7}\b")
+_MAGIC_NUMBER_SEP_RE = re.compile(r"\b(\d)[, _-]?(\d{3})[, _-]?(\d{3})\b")
 
 
 def _infer_needle_type(outputs: list[str]) -> str:
@@ -78,7 +124,23 @@ def _extract_needles(text: str, needle_type: str) -> list[str]:
     if needle_type == "uuids":
         return _UUID_RE.findall(text)
     if needle_type == "numbers":
-        return _MAGIC_NUMBER_RE.findall(text)
+        hits = _MAGIC_NUMBER_RE.findall(text)
+        if hits:
+            return hits
+
+        # Handle thousands separators (e.g., "3,344,545" or "3 344 545").
+        sep_hits: list[str] = []
+        for m in _MAGIC_NUMBER_SEP_RE.finditer(text):
+            digits = "".join(m.groups())
+            if len(digits) == 7:
+                sep_hits.append(digits)
+        if sep_hits:
+            return sep_hits
+
+        # Last resort: strip non-digits and search again. This is intentionally
+        # permissive for pre-trained models that may not follow formats.
+        digits_only = re.sub(r"\D", "", text)
+        return _MAGIC_NUMBER_RE.findall(digits_only)
     return []
 
 

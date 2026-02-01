@@ -123,7 +123,7 @@ def generate_input_output(
     template: str,
     num_needle_q: int = 1,
     random_seed: int = RANDOM_SEED,
-) -> tuple[str, list[str], str]:
+) -> tuple[str, list[str], str, dict]:
     NEEDLE = "One of the special magic {type_needle_v} for {key} is: {value}."
     keys, values, needles = [], [], []
     for _ in range(num_needle_k):
@@ -141,22 +141,22 @@ def generate_input_output(
         values.append(value)
 
     random.Random(random_seed).shuffle(needles)
+    meta: dict = {}
 
     # Context
     if type_haystack == "essay":
         assert isinstance(haystack, list)
         text = " ".join(haystack[:num_haystack])
         document_sents = cached_sent_tokenize(text.strip())
-        insertion_positions = (
-            [0]
-            + sorted(
-                [
-                    int(len(document_sents) * (depth / 100))
-                    for depth in random.sample(DEPTHS, len(needles))
-                ]
-            )
-            + [len(document_sents)]
+        depth_pos_pairs = sorted(
+            [
+                (depth, int(len(document_sents) * (depth / 100)))
+                for depth in random.sample(DEPTHS, len(needles))
+            ],
+            key=lambda x: x[1],
         )
+        meta["depth_percents"] = [int(depth) for depth, _ in depth_pos_pairs]
+        insertion_positions = [0] + [pos for _, pos in depth_pos_pairs] + [len(document_sents)]
         document_sents_list = []
         for i in range(1, len(insertion_positions)):
             last_pos = insertion_positions[i - 1]
@@ -180,6 +180,8 @@ def generate_input_output(
             ]
 
         indexes = sorted(random.sample(range(num_haystack), len(needles)), reverse=True)
+        meta["needle_indexes"] = [int(x) for x in indexes]
+        meta["num_haystack"] = int(num_haystack)
         for index, element in zip(indexes, needles):
             sentences.insert(index, element)
         context = "\n".join(sentences)
@@ -209,7 +211,7 @@ def generate_input_output(
         query=query,
     )
 
-    return input_text, answers, query
+    return input_text, answers, query, meta
 
 
 def generate_samples(
@@ -249,7 +251,7 @@ def generate_samples(
 
     total_tokens = 0  # Track the total tokens generated for the first example
     while total_tokens + tokens_to_generate < max_seq_length:
-        input_text, answer, query = generate_input_output(
+        input_text, answer, query, _meta = generate_input_output(
             num_haystack,
             haystack,
             type_haystack=type_haystack,
@@ -283,7 +285,7 @@ def generate_samples(
         used_haystack = num_haystack
         while True:
             try:
-                input_text, answer, query = generate_input_output(
+                input_text, answer, query, meta = generate_input_output(
                     used_haystack,
                     haystack,
                     type_haystack=type_haystack,
@@ -308,6 +310,15 @@ def generate_samples(
                 input_text.replace("\n", " ").replace("\t", " ").strip().split()
             )
 
+        depth_percent = None
+        depth_percents = meta.get("depth_percents")
+        if isinstance(depth_percents, list) and len(depth_percents) == 1:
+            depth_percent = int(depth_percents[0])
+        elif isinstance(meta.get("needle_indexes"), list) and len(meta["needle_indexes"]) == 1:
+            num_haystack_meta = int(meta.get("num_haystack") or 0)
+            denom = max(1, num_haystack_meta - 1)
+            depth_percent = int(round(float(meta["needle_indexes"][0]) / float(denom) * 100))
+
         formatted_output = {
             "index": index,
             "input": input_text,
@@ -318,6 +329,8 @@ def generate_samples(
             if num_needle_q * num_needle_v == 1
             else f"The special magic {type_needle_v} for {query} mentioned in the provided text are",
         }
+        if depth_percent is not None:
+            formatted_output["depth_percent"] = int(depth_percent)
         if formatted_output["outputs"][0] not in formatted_output["input"]:
             assert False, (
                 f"Needle not in input: {formatted_output}. Something went wrong."

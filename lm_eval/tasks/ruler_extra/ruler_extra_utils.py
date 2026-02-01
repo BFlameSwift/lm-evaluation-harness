@@ -30,9 +30,14 @@ def _ordered_unique(xs: Iterable[int]) -> List[int]:
 
 @cache
 def _get_tokenizer(tokenizer: str | None = None, pretrained: str | None = None, **kwargs):
-    name = tokenizer or pretrained
+    # lm-eval passes CLI `--model_args` and `--metadata` into TaskManager.metadata,
+    # which then gets merged into each task config's `metadata`.
+    # Our native model uses `tokenizer_path`, so accept it as a fallback.
+    name = tokenizer or pretrained or kwargs.get("tokenizer_path")
     if not name:
-        raise ValueError("ruler_extra_utils requires `tokenizer` or `pretrained` in metadata.")
+        raise ValueError(
+            "ruler_extra_utils requires `tokenizer`/`pretrained` (or `tokenizer_path`) in metadata."
+        )
     return AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
 
@@ -119,7 +124,9 @@ def ruler_custom_qa_simple_dataset(
                     {
                         "input": f"{context}\n\n{question}",
                         "outputs": [value],
-                        "gen_prefix": "Answer:",
+                        # `_QA_TEMPLATE` already ends with "Answer:", so keep `gen_prefix`
+                        # empty to avoid "Answer: Answer:" duplication.
+                        "gen_prefix": "",
                         "max_length": max_len,
                         "depth_percent": depth,
                         "task": "qa",
@@ -167,7 +174,9 @@ def ruler_custom_multihop_dataset(
                     {
                         "input": f"{context}\n\n{question}",
                         "outputs": [country],
-                        "gen_prefix": "Answer:",
+                        # `_QA_TEMPLATE` already ends with "Answer:", so keep `gen_prefix`
+                        # empty to avoid "Answer: Answer:" duplication.
+                        "gen_prefix": "",
                         "max_length": max_len,
                         "depth_percent": depth,
                         "task": "multihop",
@@ -216,7 +225,9 @@ def ruler_custom_aggregation_sum_dataset(
                     {
                         "input": f"{context}\n\n{question}",
                         "outputs": [total],
-                        "gen_prefix": "Answer:",
+                        # `_QA_TEMPLATE` already ends with "Answer:", so keep `gen_prefix`
+                        # empty to avoid "Answer: Answer:" duplication.
+                        "gen_prefix": "",
                         "max_length": max_len,
                         "depth_percent": depth,
                         "task": "aggregation_sum",

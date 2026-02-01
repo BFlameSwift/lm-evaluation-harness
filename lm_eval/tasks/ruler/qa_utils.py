@@ -31,6 +31,7 @@ CONFIG = {
 SEED = 42
 TEMPLATE = CONFIG["template"]
 DOCUMENT_PROMPT = "Document {i}:\n{document}"
+QUERY_PROMPT = "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nQuestion: {query} Answer:"
 
 
 @cache
@@ -98,7 +99,7 @@ def read_hotpotqa(
 
 def generate_input_output(
     index: int, num_docs: int, qas: list[dict], docs: list[str]
-) -> tuple[str, list[str]]:
+) -> tuple[str, str, str, str, list[str]]:
     curr_q: str = qas[index]["query"]
     curr_a: list[str] = qas[index]["outputs"]
     curr_docs: list[int] = qas[index]["context"]
@@ -128,7 +129,8 @@ def generate_input_output(
         [DOCUMENT_PROMPT.format(i=i + 1, document=d) for i, d in enumerate(all_docs)]
     )
     input_text = TEMPLATE.format(context=context, query=curr_q)
-    return input_text, curr_a
+    query_prompt = QUERY_PROMPT.format(query=curr_q)
+    return input_text, context, curr_q, query_prompt, curr_a
 
 
 def generate_samples(
@@ -150,7 +152,7 @@ def generate_samples(
 
     total_tokens = 0  # Track the total tokens generated for this example
     while total_tokens + tokens_to_generate < max_seq_length:
-        input_text, answer = generate_input_output(0, num_docs, qas=qas, docs=docs)
+        input_text, _, _, _, answer = generate_input_output(0, num_docs, qas=qas, docs=docs)
         # Calculate the number of tokens in the example
         total_tokens = len(tokenizer(input_text + f" {answer}").input_ids)
         # print(
@@ -173,7 +175,7 @@ def generate_samples(
         used_docs = num_docs
         while True:
             try:
-                input_text, answer = generate_input_output(
+                input_text, context, question, query_prompt, answer = generate_input_output(
                     index + pre_samples, used_docs, qas=qas, docs=docs
                 )
                 length = len(tokenizer(input_text).input_ids) + tokens_to_generate
@@ -191,6 +193,12 @@ def generate_samples(
         formatted_output = {
             "index": index,
             "input": input_text,
+            # For compression-aware execution (native-rag `compress_answer`), keep the long
+            # documents separate so the harness can compress them into memory spans and
+            # keep the short query prompt uncompressed.
+            "context": context,
+            "question": question,
+            "query_prompt": query_prompt,
             "outputs": answer,
             "length": length,
             "max_length": max_seq_length,
@@ -203,12 +211,14 @@ def generate_samples(
 
 def get_dataset(pretrained, docs, qas, max_seq_length=None, **kwargs) -> list[dict]:
     tokenizer = get_tokenizer(pretrained)
+    num_samples = int(kwargs.get("num_samples", 500))
+    tokens_to_generate = int(kwargs.get("tokens_to_generate", CONFIG["tokens_to_generate"]))
     write_jsons = generate_samples(
         tokenizer=tokenizer,
         docs=docs,
         qas=qas,
-        num_samples=500,
-        tokens_to_generate=32,
+        num_samples=num_samples,
+        tokens_to_generate=tokens_to_generate,
         max_seq_length=max_seq_length,
     )
     return write_jsons
@@ -216,12 +226,21 @@ def get_dataset(pretrained, docs, qas, max_seq_length=None, **kwargs) -> list[di
 
 def get_qa_dataset(ds, **kwargs) -> dict[str, datasets.Dataset]:
     pretrained = kwargs.get("tokenizer", kwargs.get("pretrained", {}))
+    num_samples = int(kwargs.get("num_samples", 500))
+    tokens_to_generate = int(kwargs.get("tokens_to_generate", CONFIG["tokens_to_generate"]))
     if ds == "squad":
         qas, docs = read_squad()
     else:
         qas, docs = read_hotpotqa()
     df = (
-        get_dataset(pretrained=pretrained, docs=docs, qas=qas, max_seq_length=seq)
+        get_dataset(
+            pretrained=pretrained,
+            docs=docs,
+            qas=qas,
+            max_seq_length=seq,
+            num_samples=num_samples,
+            tokens_to_generate=tokens_to_generate,
+        )
         for seq in kwargs.pop("max_seq_lengths", DEFAULT_SEQ_LENGTHS)
     )
 

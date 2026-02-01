@@ -24,7 +24,15 @@ def _mean(xs: List[float]) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build a depth×length heatmap from lm-eval log_samples jsonl.")
     ap.add_argument("--samples", type=str, required=True, help="Path to samples_*.jsonl produced by lm_eval --log_samples.")
-    ap.add_argument("--metric", type=str, default="score", help="Metric field to read from each row (default: score).")
+    ap.add_argument(
+        "--metric",
+        type=str,
+        default="auto",
+        help=(
+            "Metric field to read from each row. "
+            "Use 'auto' (default) to infer per-length metrics (e.g., '65536' keys) or fall back to 'score'."
+        ),
+    )
     ap.add_argument("--out_dir", type=str, required=True, help="Output directory for heatmap artifacts.")
     ap.add_argument("--title", type=str, default="", help="Optional plot title.")
     args = ap.parse_args()
@@ -34,6 +42,30 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = _load_jsonl(samples_path)
+
+    def read_metric(row: dict, *, length: int) -> float | None:
+        metric = args.metric
+        if metric == "auto":
+            if length >= 0:
+                key = str(length)
+                if key in row:
+                    return float(row[key])
+                maybe = row.get("metrics")
+                if isinstance(maybe, dict) and key in maybe:
+                    return float(maybe[key])
+            if "score" in row:
+                return float(row["score"])
+            maybe = row.get("metrics")
+            if isinstance(maybe, dict) and "score" in maybe:
+                return float(maybe["score"])
+            return None
+
+        if metric in row:
+            return float(row[metric])
+        maybe = row.get("metrics")
+        if isinstance(maybe, dict) and metric in maybe:
+            return float(maybe[metric])
+        return None
 
     # Collect (length, depth) -> metric list
     grid: Dict[Tuple[int, int], List[float]] = {}
@@ -45,10 +77,7 @@ def main() -> None:
         depth = int(doc.get("depth_percent", -1))
         if length < 0 or depth < 0:
             continue
-        val = r.get(args.metric)
-        if val is None:
-            # Some harness versions store metrics under a dict.
-            val = (r.get("metrics") or {}).get(args.metric)
+        val = read_metric(r, length=length)
         if val is None:
             continue
         lengths.add(length)
@@ -110,4 +139,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
