@@ -56,7 +56,28 @@ def process_results(doc: dict, results: list[str]) -> dict[str, float]:
     pred = postprocess_pred(results)
     target = doc.get("target", "").strip()
 
-    # String match
-    score = 1.0 if target.lower() in pred[0].lower() else 0.0
+    # Base-model friendly scoring:
+    # - Prefer exact/substring match to the canonical target string.
+    # - Fall back to matching the *key answer token* (usually the final location word).
+    #
+    # This avoids zeroing scores when the model answers correctly but doesn't follow
+    # an exact templated sentence format.
+    pred0 = pred[0] if pred else ""
+    pred_low = pred0.lower()
+    target_low = target.lower()
+
+    score = 0.0
+    if target_low and target_low in pred_low:
+        score = 1.0
+    else:
+        # Extract final "answer token" (strip punctuation/quotes).
+        # Examples:
+        # - "The most recent location of Charlie is balcony." -> "balcony"
+        # - "The bottle is in the balcony." -> "balcony"
+        # - "kitchen" -> "kitchen"
+        ans_token = re.sub(r"^[\"'`]+|[\"'`\\.,;:!?]+$", "", target.split()[-1]) if target else ""
+        ans_token_low = ans_token.lower()
+        if ans_token_low and ans_token_low in pred_low:
+            score = 1.0
 
     return {"acc": score}

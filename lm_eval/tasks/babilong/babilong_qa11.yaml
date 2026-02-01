@@ -2,8 +2,8 @@ include: _babilong_common_yaml
 task: babilong_qa11
 test_split: qa11
 dataset_name: 0k
-description: "I will give you context with the facts about people and their locations hidden in some random text and a question. You need to answer the question based only on the information from the facts.\nIf a person was in different locations, use the latest location the person was in to answer the question.\nYour answer should contain only one word - location. Do not write anything else after that. Do not explain your answer.\n\n"
-doc_to_text: "{{input.strip()}}\n{{question.strip()}}"
+description: ""
+doc_to_text: "{{input.strip()}}\nQuestion: {{question.strip()}}\nAnswer:"
 
 fewshot_config:
   sampler: first_n
