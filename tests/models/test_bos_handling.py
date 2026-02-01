@@ -48,14 +48,18 @@ def pythia_tokenizer():
 @pytest.fixture(scope="module")
 def gemma_tokenizer():
     """
-    Load gemma-2-2b-it tokenizer for testing.
+    Load a tokenizer that **adds BOS by default** for testing.
 
     Properties:
-    - BOS token: '<bos>' (ID: 2)
+    - BOS token: '<s>' (ID: 1)
     - DOES add BOS by default (add_bos_token=True in tokenizer)
     - Used to test tokenizers that add BOS by default
+
+    Note:
+    - We intentionally avoid gated/restricted repositories (e.g. Gemma) so the
+      test suite can run in CI/offline environments without auth.
     """
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it")
+    tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
     # Set pad token to avoid padding errors in batch encoding
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"

@@ -2,6 +2,28 @@ from itertools import islice
 
 import pytest
 
+try:
+    import unitxt  # type: ignore
+except Exception as e:  # pragma: no cover
+    pytest.skip(f"unitxt is not available: {type(e).__name__}: {e}", allow_module_level=True)
+
+# `datasets` streaming support takes a file lock based on the dataset script path.
+# For unitxt-installed dataset scripts, this lock lands under `site-packages.lock`,
+# which is not writable in some conda/sandbox environments. Skip instead of failing
+# test collection.
+try:
+    from pathlib import Path
+
+    lock_path = str(Path(getattr(unitxt, "__file__", "")).resolve().parent.parent) + ".lock"
+    try:
+        Path(lock_path).touch(exist_ok=True)
+        Path(lock_path).unlink(missing_ok=True)
+    except PermissionError as e:  # pragma: no cover
+        pytest.skip(f"unitxt file lock path is not writable: {lock_path}: {e}", allow_module_level=True)
+except Exception:
+    # Best-effort: do not block test collection if the environment is unusual.
+    pass
+
 from lm_eval import tasks as tasks
 from lm_eval.api.task import ConfigurableTask
 from tests.test_tasks import BaseTasks, task_class

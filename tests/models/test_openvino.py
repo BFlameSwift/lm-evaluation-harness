@@ -3,7 +3,14 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from optimum.intel import OVModelForCausalLM, OVModelForSeq2SeqLM
+import os
+
+if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+    pytest.skip("openvino tests require online model downloads", allow_module_level=True)
+try:
+    from optimum.intel import OVModelForCausalLM, OVModelForSeq2SeqLM
+except Exception as e:  # pragma: no cover
+    pytest.skip(f"optimum-intel is not available: {type(e).__name__}: {e}", allow_module_level=True)
 from transformers import AutoTokenizer
 
 from lm_eval import evaluator
