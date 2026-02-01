@@ -8,7 +8,6 @@ from . import (
     hf_vlms,
     huggingface,
     ibm_watsonx_ai,
-    native,
     mamba_lm,
     nemo_lm,
     neuron_optimum,
@@ -19,6 +18,15 @@ from . import (
     sglang_generate_API,
     textsynth,
 )
+
+# The `native` backend is a local extension in some downstream forks and may
+# depend on extra modules (e.g. custom model code) not present in a vanilla
+# lm-evaluation-harness install. Keep it optional so the package can still be
+# imported in minimal environments (including CI).
+try:
+    from . import native  # noqa: F401
+except Exception:
+    pass
 
 # vLLM is an optional dependency. Importing it unconditionally can break
 # environments where CUDA runtime libs are unavailable or mismatched.

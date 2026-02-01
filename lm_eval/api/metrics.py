@@ -526,16 +526,23 @@ def bootstrap_stderr(
         from tqdm import tqdm
 
         print("bootstrapping for stddev:", f.__name__)
-        with mp.Pool(mp.cpu_count()) as pool:
-            for bootstrap in tqdm(
-                pool.imap(
-                    _bootstrap_internal(f, chunk_size),
-                    [(i, xs) for i in range(iters // chunk_size)],
-                ),
-                total=iters // chunk_size,
-            ):
-                # sample w replacement
-                res.extend(bootstrap)
+        try:
+            with mp.Pool(mp.cpu_count()) as pool:
+                for bootstrap in tqdm(
+                    pool.imap(
+                        _bootstrap_internal(f, chunk_size),
+                        [(i, xs) for i in range(iters // chunk_size)],
+                    ),
+                    total=iters // chunk_size,
+                ):
+                    # sample w replacement
+                    res.extend(bootstrap)
+        except (PermissionError, OSError) as e:
+            # Some sandboxed environments (e.g., limited /dev/shm) cannot create
+            # multiprocessing semaphores. Fall back to the deterministic single-
+            # process implementation so evaluation/tests can still run.
+            print(f"[bootstrap_stderr] multiprocessing disabled ({type(e).__name__}: {e}); falling back to serial.")
+            res = _bootstrap_internal_no_mp(f, xs, iters)
     else:
         res = _bootstrap_internal_no_mp(f, xs, iters)
 
