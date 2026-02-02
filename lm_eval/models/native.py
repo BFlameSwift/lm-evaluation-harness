@@ -648,7 +648,21 @@ class NativeCausalLM(TemplateLM):
                 apply_tp(model, device_mesh)
             tokenizer = Tokenizer(pretrain_model_dir)
         else:
-            model, tokenizer, _, device_mesh = load_checkpoint_harness(checkpoint_dir, distributed_args, tokenizer_path)
+            # Some native checkpoints are trained with a very large `max_seq_len` (e.g., to support
+            # many compressed spans on the encoder side). For harness eval we should cap the
+            # *decoder* RoPE cache and related buffers to the actual eval budget (vLLM/HF max len),
+            # otherwise we may allocate extremely large rotary caches and hit ROCm quirks.
+            max_seq_len_override = None
+            if max_seq_length_int is not None and max_seq_length_int > 0:
+                max_seq_len_override = int(max_seq_length_int)
+            elif vllm_max_model_len_int is not None and vllm_max_model_len_int > 0:
+                max_seq_len_override = int(vllm_max_model_len_int)
+            model, tokenizer, _, device_mesh = load_checkpoint_harness(
+                checkpoint_dir,
+                distributed_args,
+                tokenizer_path,
+                max_seq_len_override=max_seq_len_override,
+            )
 
         self._is_hf_model = hasattr(model, "config") and not hasattr(model, "args")
 
@@ -663,7 +677,44 @@ class NativeCausalLM(TemplateLM):
                     "and ensure checkpoint shards exist (model_state_rank_0..{tp_size-1})."
                 )
 
-        self.model = model.to(dtype=self._dtype, device=self._device)
+        # `load_checkpoint_harness()` may already move/cast the model (and may fall back to a safer
+        # dtype on ROCm). Avoid an extra `.to()` here, because it can be expensive and can also
+        # re-trigger HIP dtype conversion issues.
+        loaded_dtype = getattr(model, "_native_loaded_dtype", None)
+        if loaded_dtype is not None and loaded_dtype != self._dtype:
+            print(
+                f"[native][warn] overriding requested dtype={self._dtype} with loaded dtype={loaded_dtype}",
+                file=sys.stderr,
+            )
+            self._dtype = loaded_dtype
+
+        def _same_cuda_device(a: torch.device, b: torch.device) -> bool:
+            if a.type != "cuda" or b.type != "cuda":
+                return a == b
+            try:
+                ai = torch.cuda.current_device() if a.index is None else int(a.index)
+            except Exception:
+                ai = a.index
+            try:
+                bi = torch.cuda.current_device() if b.index is None else int(b.index)
+            except Exception:
+                bi = b.index
+            return ai == bi
+
+        try:
+            any_param = next(model.parameters())
+            model_device = any_param.device
+            model_dtype = any_param.dtype
+        except StopIteration:
+            model_device = self._device
+            model_dtype = self._dtype
+
+        needs_device = model_device != self._device and not _same_cuda_device(model_device, self._device)
+        needs_dtype = (loaded_dtype is None) and (model_dtype != self._dtype)
+        if needs_device or needs_dtype:
+            self.model = model.to(dtype=self._dtype, device=self._device)
+        else:
+            self.model = model
         self.model.eval()
         self._tokenizer = tokenizer
         self._device_mesh = device_mesh
