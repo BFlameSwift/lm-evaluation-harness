@@ -2880,6 +2880,15 @@ class NativeCausalLM(TemplateLM):
                     "vllm_server_host/vllm_server_port."
                 )
 
+        # If caller explicitly asked for vLLM in decoder path, require it here.
+        if self._mode == "decoder" and (self._use_vllm_decoder or self._use_vllm_answer or self._use_vllm_reconstruct):
+            self._ensure_vllm_manager(caller="generate_until(mode=decoder)")
+            if self._vllm_manager is None:
+                raise RuntimeError(
+                    "generate_until(mode=decoder) requested vLLM (use_vllm_*), but vLLM initialization failed. "
+                    "Check vLLM install/config or set vllm_max_model_len and vllm_gpu_memory_utilization."
+                )
+
         def _infer_doc_id(doc: Optional[dict], doc_id: Any) -> Any:
             if doc_id is not None:
                 return doc_id
@@ -2920,6 +2929,37 @@ class NativeCausalLM(TemplateLM):
                     prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
                 else:
                     prompts = [c for c, _ in chunk]
+                # vLLM has a hard max prompt length; for safety, tail-truncate if needed.
+                vllm_max_len = int(getattr(self, "_vllm_max_model_len", 0) or 0)
+                clip_notes: List[Optional[str]] = [None] * len(prompts)
+                prompt_lens: List[int] = []
+                prompt_caps: List[int] = []
+                if vllm_max_len > 0:
+                    clipped_prompts: List[str] = []
+                    for i, prompt in enumerate(prompts):
+                        try:
+                            toks = self.tok_encode(prompt)
+                        except Exception:
+                            toks = []
+                        reserve = 1
+                        try:
+                            reserve = max(1, int(_get_max_gen_tokens(gkwargs[i])))
+                        except Exception:
+                            reserve = 1
+                        target = int(vllm_max_len) - int(reserve)
+                        if target <= 0 and vllm_max_len > 1:
+                            target = int(vllm_max_len) - 1
+                        if target > 0 and len(toks) > target:
+                            toks = toks[-target:]
+                            clip_notes[i] = f"tail_truncated:{len(toks)}"
+                            try:
+                                prompt = self.tok_decode(toks)
+                            except Exception:
+                                pass
+                        clipped_prompts.append(prompt)
+                        prompt_lens.append(len(toks))
+                        prompt_caps.append(max(0, int(vllm_max_len) - int(len(toks))))
+                    prompts = clipped_prompts
 
                 resolved = resolve_generation_kwargs(
                     gkwargs[0],
@@ -2929,8 +2969,11 @@ class NativeCausalLM(TemplateLM):
                     override_temperature=getattr(self, "_gen_temperature_override", None),
                     override_top_p=getattr(self, "_gen_top_p_override", None),
                 )
+                max_req_toks = max(_get_max_gen_tokens(g) for g in gkwargs)
+                if vllm_max_len > 0 and prompt_caps:
+                    max_req_toks = min(max_req_toks, max(1, min(prompt_caps)))
                 sampling_params = {
-                    "max_tokens": max(_get_max_gen_tokens(g) for g in gkwargs),
+                    "max_tokens": max_req_toks,
                     "temperature": resolved["temperature"],
                     "top_p": resolved["top_p"],
                 }
@@ -2954,6 +2997,7 @@ class NativeCausalLM(TemplateLM):
                             "prompt": prompt,
                             "prompt_len_tokens": prompt_len_tokens,
                             "prompt_len_chars": len(prompt),
+                            "clip_note": clip_notes[i] if i < len(clip_notes) else None,
                             "generation_kwargs": gk,
                             "sampling_params": sampling_params,
                             "skip_reason": None,
@@ -2971,6 +3015,9 @@ class NativeCausalLM(TemplateLM):
                 embeds: List[Optional[torch.Tensor]] = []
                 prompts: List[str] = []
                 gkwargs = []
+                vllm_max_len = int(getattr(self, "_vllm_max_model_len", 0) or 0)
+                clip_notes: List[Optional[str]] = []
+                prompt_caps: List[int] = []
                 for c, gk in chunk:
                     if self._chat_use_template:
                         prompt_c = self._format_chat(c, add_generation_prompt=True)["decoder_prefix"]
@@ -2981,7 +3028,25 @@ class NativeCausalLM(TemplateLM):
                     if len(tokens) == 0:
                         embeds.append(None)
                         gkwargs.append(gk)
+                        clip_notes.append(None)
                         continue
+                    if vllm_max_len > 0:
+                        reserve = 1
+                        try:
+                            reserve = max(1, int(_get_max_gen_tokens(gk)))
+                        except Exception:
+                            reserve = 1
+                        target = int(vllm_max_len) - int(reserve)
+                        if target <= 0 and vllm_max_len > 1:
+                            target = int(vllm_max_len) - 1
+                        if target > 0 and len(tokens) > target:
+                            tokens = tokens[-target:]
+                            clip_notes.append(f"tail_truncated:{len(tokens)}")
+                        else:
+                            clip_notes.append(None)
+                        prompt_caps.append(max(0, int(vllm_max_len) - int(len(tokens))))
+                    else:
+                        clip_notes.append(None)
                     tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
                     embeds.append(self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype))
                     gkwargs.append(gk)
@@ -2997,8 +3062,11 @@ class NativeCausalLM(TemplateLM):
                         override_temperature=getattr(self, "_gen_temperature_override", None),
                         override_top_p=getattr(self, "_gen_top_p_override", None),
                     )
+                    max_req_toks = max(_get_max_gen_tokens(gkwargs[i]) for i in valid_indices)
+                    if vllm_max_len > 0 and prompt_caps:
+                        max_req_toks = min(max_req_toks, max(1, min(prompt_caps)))
                     sampling_params = {
-                        "max_tokens": max(_get_max_gen_tokens(gkwargs[i]) for i in valid_indices),
+                        "max_tokens": max_req_toks,
                         "temperature": resolved["temperature"],
                         "top_p": resolved["top_p"],
                     }
@@ -3021,6 +3089,7 @@ class NativeCausalLM(TemplateLM):
                             "prompt": prompt,
                             "prompt_len_tokens": int(e.shape[0]) if e is not None else 0,
                             "prompt_len_chars": len(prompt),
+                            "clip_note": clip_notes[i] if i < len(clip_notes) else None,
                             "generation_kwargs": gk,
                             "sampling_params": sampling_params if valid_indices else None,
                             "skip_reason": None if e is not None else "no_prompt_embeds",
