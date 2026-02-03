@@ -112,7 +112,13 @@ def split_doc_and_query(
             ret_question_list.append(question_text)
             ret_query_list.append(real_query_text)
             ret_context_list.append(context_text)
-            ret_assistant_prefix_list.append("")
+            assistant_prefix = ""
+            # For LongBench passage retrieval tasks, bias pretrain models to emit the
+            # expected "Paragraph N" format by adding a short assistant prefix.
+            lower_query = real_query_text.lower()
+            if "best answered by" in lower_query and "paragraph" not in lower_query:
+                assistant_prefix = "Paragraph"
+            ret_assistant_prefix_list.append(assistant_prefix)
 
         elif is_babilong_task:
             context_text = doc.get(doc_key, "")
