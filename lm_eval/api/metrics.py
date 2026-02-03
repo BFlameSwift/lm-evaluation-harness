@@ -8,7 +8,6 @@ from collections.abc import Iterable
 from typing import Callable, List, Optional, Sequence, TypeVar
 
 import numpy as np
-import sacrebleu
 
 from lm_eval.api.registry import register_aggregation, register_metric
 
@@ -16,6 +15,17 @@ from lm_eval.api.registry import register_aggregation, register_metric
 T = TypeVar("T")
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _lazy_sacrebleu():
+    try:
+        import sacrebleu  # type: ignore
+    except Exception as exc:
+        raise ModuleNotFoundError(
+            "sacrebleu is required for BLEU/chrF/TER metrics. "
+            "Install it (pip install sacrebleu) or avoid tasks that use these metrics."
+        ) from exc
+    return sacrebleu
 
 
 # Register Aggregations First
@@ -92,6 +102,7 @@ def bleu(items):
 
     Higher is better
     """
+    sacrebleu = _lazy_sacrebleu()
     refs = list(zip(*items))[0]
     preds = list(zip(*items))[1]
     refs, preds = _sacreformat(refs, preds)
@@ -107,6 +118,7 @@ def chrf(items):
 
     Higher is better  # TODO I think
     """
+    sacrebleu = _lazy_sacrebleu()
     refs = list(zip(*items))[0]
     preds = list(zip(*items))[1]
     refs, preds = _sacreformat(refs, preds)
@@ -123,6 +135,7 @@ def ter(items):
 
     Lower is better
     """
+    sacrebleu = _lazy_sacrebleu()
     refs = list(zip(*items))[0]
     preds = list(zip(*items))[1]
     refs, preds = _sacreformat(refs, preds)

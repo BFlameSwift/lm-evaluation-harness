@@ -1,12 +1,21 @@
 import logging
 from typing import Callable, Dict, Union
 
-import evaluate as hf_evaluate
-
 from lm_eval.api.model import LM
 
 
 eval_logger = logging.getLogger(__name__)
+
+
+def _lazy_hf_evaluate():
+    try:
+        import evaluate as hf_evaluate  # type: ignore
+    except Exception as exc:
+        raise ModuleNotFoundError(
+            "The optional dependency `evaluate` is required to load HF Evaluate metrics. "
+            "Install it (pip install evaluate) or use built-in lm-eval metrics only."
+        ) from exc
+    return hf_evaluate
 
 MODEL_REGISTRY = {}
 
@@ -130,6 +139,7 @@ def get_metric(name: str, hf_evaluate_metric=False) -> Callable:
             )
 
     try:
+        hf_evaluate = _lazy_hf_evaluate()
         metric_object = hf_evaluate.load(name)
         return metric_object.compute
     except Exception:

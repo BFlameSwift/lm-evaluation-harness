@@ -371,7 +371,70 @@ class Reorderer:
 
 def make_table(result_dict, column: str = "results", sort_results: bool = False):
     """Generate table of results."""
-    from pytablewriter import LatexTableWriter, MarkdownTableWriter
+    try:
+        from pytablewriter import LatexTableWriter, MarkdownTableWriter  # type: ignore
+    except Exception:
+        # pytablewriter is an optional dependency. When it is missing, fall back
+        # to a minimal markdown table so lm_eval can still finish and save results.
+
+        def _md_escape(val):
+            s = str(val)
+            return s.replace("|", "\\|")
+
+        if column == "results":
+            column_name = "Tasks"
+        elif column == "groups":
+            column_name = "Groups"
+        else:
+            column_name = str(column)
+
+        headers = [
+            column_name,
+            "Version",
+            "Filter",
+            "n-shot",
+            "Metric",
+            "",
+            "Value",
+            "",
+            "Stderr",
+        ]
+
+        values = []
+        keys = result_dict.get(column, {}).keys()
+        if sort_results:
+            keys = sorted(keys)
+        for k in keys:
+            dic = result_dict[column][k]
+            version = result_dict.get("versions", {}).get(k, "    N/A")
+            n = str(result_dict.get("n-shot", " ").get(k, " "))
+            higher_is_better = result_dict.get("higher_is_better", {}).get(k, {})
+
+            if "alias" in dic:
+                k = dic.pop("alias")
+
+            metric_items = sorted(dic.items())
+            for mf, v in metric_items:
+                m, _, f = mf.partition(",")
+                if m.endswith("_stderr"):
+                    continue
+                hib = HIGHER_IS_BETTER_SYMBOLS.get(higher_is_better.get(m), "")
+                v = "%.4f" % v if isinstance(v, float) else v
+                if m + "_stderr" + "," + f in dic:
+                    se = dic[m + "_stderr" + "," + f]
+                    se = "   N/A" if se == "N/A" else "%.4f" % se
+                    values.append([k, version, f, n, m, hib, v, "±", se])
+                else:
+                    values.append([k, version, f, n, m, hib, v, "", ""])
+                k = ""
+                version = ""
+
+        lines = []
+        lines.append("| " + " | ".join(_md_escape(h) for h in headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in values:
+            lines.append("| " + " | ".join(_md_escape(x) for x in row) + " |")
+        return "\n".join(lines)
 
     if column == "results":
         column_name = "Tasks"
