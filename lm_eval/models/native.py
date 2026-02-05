@@ -42,6 +42,7 @@ _maybe_add_native_rag_root_to_syspath()
 
 import json
 import re
+import hashlib
 from typing import List, Optional, Tuple
 
 import torch
@@ -66,7 +67,7 @@ from data.ae_loader import (
     END_OF_RECONSTRUCTION_INDEX,
 )
 from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
-from eval_func.model2safetensors import convert_checkpoint
+from eval_func.model2safetensors import convert_checkpoint, safemodel_needs_reconvert
 from eval_func.vllm_runner import (
     VLLMEngineWrapper,
     VLLMEngineConfig,
@@ -826,30 +827,84 @@ class NativeCausalLM(TemplateLM):
                 base_dir = self._vllm_output_root or self._vllm_checkpoint_dir
                 if base_dir is None:
                     raise ValueError("vLLM reconstruction requires vllm_model_path or checkpoint_dir (or vllm_output_root).")
-                safedir = os.path.join(base_dir, "safemodel")
-                model_path = safedir
-                self._vllm_model_dir  = model_path
-                self._vllm_output_root = os.path.join(base_dir, "vllm_output")
-                need_convert = not os.path.exists(os.path.join(safedir, "model.safetensors")) or not os.path.exists(
-                    os.path.join(safedir, "config.json")
-                )
-                if need_convert:
-                    os.makedirs(safedir, exist_ok=True)
-                    convert_checkpoint(
-                        checkpoint_dir=self._vllm_checkpoint_dir,
-                        output_dir=safedir,
-                        tokenizer_path=self._vllm_tokenizer_path,
-                        dtype=self._dtype,
-                        additional_kwargs={
-                            "max_position_embeddings": self._vllm_max_model_len,
-                            "eos_token_id": self.eos_token_id,
-                            "pad_token_id": self.pad_token_id,
-                            "bos_token_id": getattr(self._tokenizer, "bos_id", None),
-                            "temperature": self._temperature,
-                            "max_seq_len": self._max_seq_length,
-                        },
+
+                def _safemodel_ready(safedir: str) -> bool:
+                    model_file = os.path.join(safedir, "model.safetensors")
+                    cfg_file = os.path.join(safedir, "config.json")
+                    if not (os.path.exists(model_file) and os.path.exists(cfg_file)):
+                        return False
+                    try:
+                        return not safemodel_needs_reconvert(safedir)
+                    except Exception:
+                        return False
+
+                convert_kwargs = {
+                    "checkpoint_dir": self._vllm_checkpoint_dir,
+                    "tokenizer_path": self._vllm_tokenizer_path,
+                    "dtype": self._dtype,
+                    "additional_kwargs": {
+                        "max_position_embeddings": self._vllm_max_model_len,
+                        "eos_token_id": self.eos_token_id,
+                        "pad_token_id": self.pad_token_id,
+                        "bos_token_id": getattr(self._tokenizer, "bos_id", None),
+                        # Keep for backwards compatibility with older prompt templates,
+                        # even though vLLM doesn't consume it directly.
+                        "temperature": self._temperature,
+                        "max_seq_len": self._max_seq_length,
+                    },
+                }
+
+                # Prefer exporting safemodel into the lm-eval output directory so results
+                # are colocated. Some blob/network filesystems fail during atomic renames,
+                # so we fall back to a local temp directory (default: /tmp).
+                remote_safedir = os.path.join(base_dir, "safemodel")
+                try:
+                    if not _safemodel_ready(remote_safedir):
+                        os.makedirs(remote_safedir, exist_ok=True)
+                        convert_checkpoint(output_dir=remote_safedir, **convert_kwargs)
+                    self._ensure_vllm_config(remote_safedir)
+                    self._vllm_model_dir = remote_safedir
+                    model_path = remote_safedir
+                except Exception as e:
+                    local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
+                    local_root = os.path.abspath(os.path.expanduser(str(local_root)))
+                    key = "|".join(
+                        [
+                            f"ckpt={os.path.abspath(str(self._vllm_checkpoint_dir))}",
+                            f"tok={os.path.abspath(str(self._vllm_tokenizer_path)) if self._vllm_tokenizer_path else ''}",
+                            f"dtype={str(self._dtype)}",
+                            f"maxlen={int(self._vllm_max_model_len or 0)}",
+                        ]
                     )
-                self._ensure_vllm_config(safedir)
+                    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+                    local_safedir = os.path.join(local_root, "native_vllm_safemodel", digest)
+                    print(
+                        f"[native][warn] vLLM safemodel export to '{remote_safedir}' failed: {type(e).__name__}: {e}. "
+                        f"Falling back to local safemodel at '{local_safedir}'.",
+                        file=sys.stderr,
+                    )
+                    os.makedirs(local_safedir, exist_ok=True)
+
+                    # Best-effort cross-process lock to avoid duplicating huge exports.
+                    lock_path = os.path.join(local_safedir, ".export.lock")
+                    try:
+                        import fcntl  # type: ignore
+                    except Exception:
+                        fcntl = None
+                    with open(lock_path, "w", encoding="utf-8") as lock_f:
+                        if fcntl is not None:
+                            try:
+                                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                            except Exception:
+                                pass
+                        if not _safemodel_ready(local_safedir):
+                            convert_checkpoint(output_dir=local_safedir, **convert_kwargs)
+                        self._ensure_vllm_config(local_safedir)
+                    self._vllm_model_dir = local_safedir
+                    model_path = local_safedir
+        if model_path is not None:
+            # Propagate resolved model path so vLLM init uses it.
+            self._vllm_model_dir = model_path
         
     def _init_vllm(self) -> None:
         # Remote vLLM server path (no local engine init).
