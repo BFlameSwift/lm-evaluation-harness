@@ -854,6 +854,37 @@ class NativeCausalLM(TemplateLM):
                     },
                 }
 
+                def _resolve_local_safedir() -> str:
+                    local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
+                    local_root = os.path.abspath(os.path.expanduser(str(local_root)))
+                    key = "|".join(
+                        [
+                            f"ckpt={os.path.abspath(str(self._vllm_checkpoint_dir))}",
+                            f"tok={os.path.abspath(str(self._vllm_tokenizer_path)) if self._vllm_tokenizer_path else ''}",
+                            f"dtype={str(self._dtype)}",
+                            f"maxlen={int(self._vllm_max_model_len or 0)}",
+                        ]
+                    )
+                    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+                    return os.path.join(local_root, "native_vllm_safemodel", digest)
+
+                # Optional hard switch to avoid blob/network filesystems entirely.
+                prefer_local = str(os.environ.get("NATIVE_VLLM_FORCE_LOCAL_SAFEMODEL", "")).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                }
+                if prefer_local:
+                    local_safedir = _resolve_local_safedir()
+                    os.makedirs(local_safedir, exist_ok=True)
+                    if not _safemodel_ready(local_safedir):
+                        convert_checkpoint(output_dir=local_safedir, **convert_kwargs)
+                    self._ensure_vllm_config(local_safedir)
+                    self._vllm_model_dir = local_safedir
+                    model_path = local_safedir
+                    return
+
                 # Prefer exporting safemodel into the lm-eval output directory so results
                 # are colocated. Some blob/network filesystems fail during atomic renames,
                 # so we fall back to a local temp directory (default: /tmp).
@@ -866,18 +897,7 @@ class NativeCausalLM(TemplateLM):
                     self._vllm_model_dir = remote_safedir
                     model_path = remote_safedir
                 except Exception as e:
-                    local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
-                    local_root = os.path.abspath(os.path.expanduser(str(local_root)))
-                    key = "|".join(
-                        [
-                            f"ckpt={os.path.abspath(str(self._vllm_checkpoint_dir))}",
-                            f"tok={os.path.abspath(str(self._vllm_tokenizer_path)) if self._vllm_tokenizer_path else ''}",
-                            f"dtype={str(self._dtype)}",
-                            f"maxlen={int(self._vllm_max_model_len or 0)}",
-                        ]
-                    )
-                    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-                    local_safedir = os.path.join(local_root, "native_vllm_safemodel", digest)
+                    local_safedir = _resolve_local_safedir()
                     print(
                         f"[native][warn] vLLM safemodel export to '{remote_safedir}' failed: {type(e).__name__}: {e}. "
                         f"Falling back to local safemodel at '{local_safedir}'.",
