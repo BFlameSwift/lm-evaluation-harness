@@ -3,6 +3,47 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 
+def should_keep_context_raw(
+    *,
+    enable_short_ctx_passthrough: bool,
+    context_len: int,
+    fixed_len: int,
+    reserve_gen: int,
+    decoder_budget: int,
+    max_seq_len: int,
+    compress_threshold: int,
+) -> bool:
+    """
+    Return True when a sample should bypass compression and keep raw context.
+
+    This is an optional optimization for short/easy samples. It must be
+    explicitly enabled; default behavior remains compression-first.
+    """
+    if not bool(enable_short_ctx_passthrough):
+        return False
+    if int(context_len) <= 0:
+        return False
+    total_no_compress = int(context_len) + int(fixed_len) + int(reserve_gen)
+    if total_no_compress > int(decoder_budget):
+        return False
+    if total_no_compress > int(max_seq_len):
+        return False
+    return total_no_compress < int(compress_threshold)
+
+
+def split_tokens_to_spans(tokens: List[int], span_len: int) -> List[List[int]]:
+    """
+    Split a token list into fixed-size spans.
+
+    Returns an empty list for empty input, so callers do not accidentally
+    create a fake "empty span" that still allocates memory slots.
+    """
+    if not tokens:
+        return []
+    step = int(span_len) if int(span_len) > 0 else 1
+    return [tokens[i : i + step] for i in range(0, len(tokens), step)]
+
+
 def _split_niah_input(input_text: str) -> Tuple[str, str]:
     """Split RULER NIAH `input` into (context, question) best-effort."""
     if not input_text:

@@ -75,7 +75,12 @@ from eval_func.vllm_runner import (
     VLLMRemoteEngineWrapper,
 )
 from eval_func.utils import load_checkpoint_harness, _build_device_mesh
-from lm_eval.models.native_doc_utils import get_doc_query_keys_by_task_name, split_doc_and_query
+from lm_eval.models.native_doc_utils import (
+    get_doc_query_keys_by_task_name,
+    should_keep_context_raw,
+    split_tokens_to_spans,
+    split_doc_and_query,
+)
 import math
 from typing import Type, TypeVar, Mapping, Any, Dict
 import inspect
@@ -405,6 +410,9 @@ class NativeCausalLM(TemplateLM):
         compress_threshold: int = 8192,
         compress_chunk: int = 2048,
         max_cycles: int = 10,
+        # Optional optimization: keep short contexts raw (no compression).
+        # Default False to preserve compression-first behavior.
+        compress_keep_short_ctx_raw: bool = False,
         compress_start_tokens: Optional[str] = "<think>",
         temperature: float = 1.0,
         # chat template related， also load from yaml task
@@ -501,6 +509,17 @@ class NativeCausalLM(TemplateLM):
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
         self._max_cycles = max(1, int(max_cycles))
+        env_keep_short_ctx = os.environ.get("NATIVE_COMPRESS_KEEP_SHORT_CTX_RAW")
+        if env_keep_short_ctx is None:
+            self._compress_keep_short_ctx_raw = bool(compress_keep_short_ctx_raw)
+        else:
+            self._compress_keep_short_ctx_raw = str(env_keep_short_ctx).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
         self._compress_start_tokens = []
         self._add_boq_index = bool(add_boq_index)
         self._fill_decoder_prefix_embeds = bool(fill_decoder_prefix_embeds)
@@ -2764,17 +2783,36 @@ class NativeCausalLM(TemplateLM):
                 tgt_full_lens.append(len(tgt))
 
             logits = self._model_call(inp_batch)
-            logprobs = self._model_logits(logits)
+            use_chunked_scoring = hasattr(self.model, "compression_embeddings")
+            logprobs = None
+            if not use_chunked_scoring:
+                logprobs = self._model_logits(logits)
 
             debug_rows: List[dict] = []
             for i, tgt in enumerate(tgt_batch):
                 tgt_tensor = torch.tensor(tgt, device=self.device, dtype=torch.long)
-                seq_logprobs = logprobs[i, -tgt_full_lens[i] :, :]
-                cont_len = cont_lens[i]
-                tail_logprobs = seq_logprobs[-cont_len:, :]
-                token_logprobs = tail_logprobs.gather(-1, tgt_tensor[-cont_len:].unsqueeze(-1)).squeeze(-1)
-                logprob = float(token_logprobs.sum().item())
-                greedy = bool((tail_logprobs.argmax(dim=-1) == tgt_tensor[-cont_len:]).all().item())
+                cont_len = min(int(cont_lens[i]), int(tgt_full_lens[i]))
+                if cont_len <= 0:
+                    logprob = 0.0
+                    greedy = True
+                elif use_chunked_scoring:
+                    # Compression checkpoints return hidden states from `_model_call`.
+                    # Score token tails with chunked vocab projection to avoid OOM.
+                    seq_hidden = logits[i, -tgt_full_lens[i] :, :]
+                    tail_hidden = seq_hidden[-cont_len:, :]
+                    logprob, greedy = self._chunked_logprob_and_greedy(
+                        tail_hidden,
+                        tgt_tensor[-cont_len:],
+                        chunk_size=int(getattr(self, "_score_rows_per_chunk", 32)),
+                    )
+                else:
+                    seq_logprobs = logprobs[i, -tgt_full_lens[i] :, :]
+                    tail_logprobs = seq_logprobs[-cont_len:, :]
+                    token_logprobs = tail_logprobs.gather(
+                        -1, tgt_tensor[-cont_len:].unsqueeze(-1)
+                    ).squeeze(-1)
+                    logprob = float(token_logprobs.sum().item())
+                    greedy = bool((tail_logprobs.argmax(dim=-1) == tgt_tensor[-cont_len:]).all().item())
                 res.append((logprob, greedy))
 
                 if self._save_loglikelihood_debug and self._distributed_args.rank == 0:
@@ -4300,6 +4338,11 @@ class NativeCausalLM(TemplateLM):
                     f"assistant_prefix_list must match prompts length; got {len(assistant_prefix_list)} vs {len(prompts)}"
                 )
         decoder_budget = int(self.decoder_budget)
+        mode = str(getattr(self, "_mode", "") or "")
+        compress_threshold = int(
+            getattr(self, "_compress_threshold", self._max_seq_length or decoder_budget) or decoder_budget
+        )
+        compress_threshold = max(1, compress_threshold)
         # vLLM enforces a hard max prompt length (`max_model_len`). When we build
         # prompt_embeds for compression-heavy modes (generate_until uses vLLM
         # prompt_embeds; reconstruct_first scoring also requires vLLM), we must
@@ -4307,7 +4350,7 @@ class NativeCausalLM(TemplateLM):
         # vLLM engine hasn't been initialized yet.
         vllm_max_int = _coerce_int(getattr(self, "_vllm_max_model_len", None), None) or 0
         if vllm_max_int > 0:
-            if self._mode in {"compress_answer", "reconstruct_first", "vllm_decoding_with_compress", "niah_generate"}:
+            if mode in {"compress_answer", "reconstruct_first", "vllm_decoding_with_compress", "niah_generate"}:
                 decoder_budget = min(decoder_budget, vllm_max_int)
             elif getattr(self, "_vllm_manager", None) is not None:
                 decoder_budget = min(decoder_budget, vllm_max_int)
@@ -4421,6 +4464,9 @@ class NativeCausalLM(TemplateLM):
             fixed_lens_list: List[int] = []
             avail_for_memory_list: List[int] = []
             force_skip: List[bool] = [False] * len(prompts)
+            raw_ctx_prefix_tokens_list: List[List[int]] = []
+            query_tokens_list: List[List[int]] = []
+            assistant_prefix_tokens_list: List[List[int]] = []
 
             enc_tokens_mb: List[torch.Tensor] = []
             enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
@@ -4432,13 +4478,17 @@ class NativeCausalLM(TemplateLM):
             span_cost = num_comp + 2
             # Reserve some room for generation so we don't end up with a prompt that
             # leaves 0 tokens for the model to output (vLLM would then skip).
-            reserve_cap = 256 if self._mode == "niah_generate" else 1024
+            # Some unit-test fixtures instantiate NativeCausalLM via __new__ without
+            # running full __init__, so _mode may be absent.
+            reserve_cap = 256 if mode == "niah_generate" else 1024
 
             for i, contexts in enumerate(context_list):
-                spans = self._split_contexts_to_spans(contexts, span_len)
+                context_tokens = self._tokenizer.encode(contexts, bos=False, eos=False) if contexts else []
+                spans = self._split_contexts_to_spans(contexts, span_len) if context_tokens else []
                 orig_spans_list.append(len(spans))
                 orig_flat_lens.append(sum(len(sp) for sp in spans))
                 query_tokens = self._tokenizer.encode(query_list[i], bos=False, eos=False)
+                query_tokens_list.append(query_tokens)
                 assistant_prefix = ""
                 if assistant_prefix_list is not None:
                     raw_prefix = assistant_prefix_list[i]
@@ -4447,6 +4497,7 @@ class NativeCausalLM(TemplateLM):
                 assistant_prefix_tokens = (
                     self._tokenizer.encode(assistant_prefix, bos=False, eos=False) if assistant_prefix else []
                 )
+                assistant_prefix_tokens_list.append(assistant_prefix_tokens)
                 fixed_len = (
                     len(memory_start)
                     + len(im_end)
@@ -4458,10 +4509,25 @@ class NativeCausalLM(TemplateLM):
                     + len(assistant_prefix_tokens)
                     + bor_extra
                 )
-                fixed_lens_list.append(int(fixed_len))
                 reserve_gen = min(int(gen_lens[i]), reserve_cap) if int(gen_lens[i]) > 0 else 0
-                avail_for_memory_list.append(int(decoder_budget) - int(fixed_len) - int(reserve_gen))
-                max_spans = (decoder_budget - fixed_len - int(reserve_gen)) // max(1, span_cost)
+                raw_ctx_prefix_tokens: List[int] = []
+                # Optional short-context passthrough; disabled by default.
+                if should_keep_context_raw(
+                    enable_short_ctx_passthrough=bool(getattr(self, "_compress_keep_short_ctx_raw", False)),
+                    context_len=len(context_tokens),
+                    fixed_len=fixed_len,
+                    reserve_gen=int(reserve_gen),
+                    decoder_budget=int(decoder_budget),
+                    max_seq_len=int(self._max_seq_length),
+                    compress_threshold=int(compress_threshold),
+                ):
+                    spans = []
+                    raw_ctx_prefix_tokens = list(context_tokens)
+                raw_ctx_prefix_tokens_list.append(raw_ctx_prefix_tokens)
+                fixed_len_effective = fixed_len + len(raw_ctx_prefix_tokens)
+                fixed_lens_list.append(int(fixed_len_effective))
+                avail_for_memory_list.append(int(decoder_budget) - int(fixed_len_effective) - int(reserve_gen))
+                max_spans = (decoder_budget - fixed_len_effective - int(reserve_gen)) // max(1, span_cost)
                 # If the decoder budget cannot fit any memory spans, prefer dropping
                 # spans rather than forcing 1 span and crashing vLLM with an overlong prompt.
                 if max_spans < 0:
@@ -4503,7 +4569,7 @@ class NativeCausalLM(TemplateLM):
             else:
                 with torch.autocast(device_type="cuda", dtype=self._dtype):
                     compression_vectors = self._compress_multi_batches_with_progress(
-                        enc_tokens_mb, enc_ctx_mb, desc=f"compress[{self._mode}]"
+                        enc_tokens_mb, enc_ctx_mb, desc=f"compress[{mode}]"
                     )
                 if int(compression_vectors.shape[0]) != expected_total_slots:
                     raise RuntimeError(
@@ -4518,6 +4584,46 @@ class NativeCausalLM(TemplateLM):
                     embeds[i] = None
                     comp_mask_list.append([])
                     prefix_lens.append(0)
+                    continue
+                raw_ctx_tokens = raw_ctx_prefix_tokens_list[i] if i < len(raw_ctx_prefix_tokens_list) else []
+                if raw_ctx_tokens:
+                    # Build chat-style raw prefix directly: memory(raw ctx) + user(query) + assistant(prefix).
+                    prefix_tokens: List[int] = []
+                    comp_mask: List[bool] = []
+                    prefix_tokens.extend(memory_start)
+                    comp_mask.extend([False] * len(memory_start))
+                    prefix_tokens.extend(raw_ctx_tokens)
+                    comp_mask.extend([False] * len(raw_ctx_tokens))
+                    prefix_tokens.extend(im_end)
+                    comp_mask.extend([False] * len(im_end))
+                    prefix_tokens.extend(user_start)
+                    comp_mask.extend([False] * len(user_start))
+                    if add_boq:
+                        prefix_tokens.append(BEGIN_OF_QUERY_INDEX)
+                        comp_mask.append(False)
+                    qt = query_tokens_list[i] if i < len(query_tokens_list) else []
+                    prefix_tokens.extend(qt)
+                    comp_mask.extend([False] * len(qt))
+                    prefix_tokens.extend(im_end)
+                    comp_mask.extend([False] * len(im_end))
+                    prefix_tokens.extend(assistant_start)
+                    comp_mask.extend([False] * len(assistant_start))
+                    apt = assistant_prefix_tokens_list[i] if i < len(assistant_prefix_tokens_list) else []
+                    prefix_tokens.extend(apt)
+                    comp_mask.extend([False] * len(apt))
+                    if include_bor:
+                        prefix_tokens.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+                        comp_mask.append(False)
+                    if not prefix_tokens:
+                        embeds[i] = None
+                        comp_mask_list.append([])
+                        prefix_lens.append(0)
+                        continue
+                    prefix_t = torch.tensor(prefix_tokens, device=self.device, dtype=torch.long)
+                    pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+                    embeds[i] = pe
+                    comp_mask_list.append(list(comp_mask))
+                    prefix_lens.append(len(prefix_tokens))
                     continue
                 assistant_prefix = None
                 if assistant_prefix_list is not None:
@@ -4580,6 +4686,7 @@ class NativeCausalLM(TemplateLM):
                 "avail_for_memory": avail_for_memory_list,
                 "max_spans": max_spans_list,
                 "force_skip": force_skip,
+                "raw_ctx_prefix_len": [len(x) for x in raw_ctx_prefix_tokens_list],
                 # Global config snapshot (useful for debugging budget/truncation decisions).
                 "span_len": int(span_len),
                 "decoder_budget": int(decoder_budget),
@@ -4609,9 +4716,11 @@ class NativeCausalLM(TemplateLM):
 
             query_tokens_list: List[List[int]] = []
             assistant_prefix_tokens_list: List[List[int]] = []
+            raw_ctx_prefix_tokens_list: List[List[int]] = []
 
             for i, contexts in enumerate(context_list):
-                spans = self._split_contexts_to_spans(contexts, span_len)
+                context_tokens = self._tokenizer.encode(contexts, bos=False, eos=False)
+                spans = self._split_contexts_to_spans(contexts, span_len) if context_tokens else []
                 # Record pre-truncation stats (useful for debugging overly aggressive truncation).
                 orig_n_spans = len(spans)
                 orig_flat_len = sum(len(sp) for sp in spans)
@@ -4633,9 +4742,31 @@ class NativeCausalLM(TemplateLM):
                     assistant_prefix_tokens = self._tokenizer.encode(ap_text, bos=False, eos=False)
                 assistant_prefix_tokens_list.append(assistant_prefix_tokens)
 
+                # Some unit-test fixtures instantiate NativeCausalLM via __new__
+                # without running full __init__, so _mode may be missing.
+                mode = str(getattr(self, "_mode", "") or "")
+                reserve_cap = 256 if mode == "niah_generate" else 1024
+                reserve_gen = min(int(gen_lens[i]), reserve_cap) if int(gen_lens[i]) > 0 else 0
                 fixed_len = boq_extra + len(query_tokens) + len(assistant_prefix_tokens) + bor_extra
-                fixed_lens_list.append(int(fixed_len))
-                if fixed_len > decoder_budget:
+
+                raw_ctx_prefix_tokens: List[int] = []
+                # Optional short-context passthrough; disabled by default.
+                if should_keep_context_raw(
+                    enable_short_ctx_passthrough=bool(getattr(self, "_compress_keep_short_ctx_raw", False)),
+                    context_len=len(context_tokens),
+                    fixed_len=fixed_len,
+                    reserve_gen=int(reserve_gen),
+                    decoder_budget=int(decoder_budget),
+                    max_seq_len=int(self._max_seq_length),
+                    compress_threshold=int(compress_threshold),
+                ):
+                    spans = []
+                    raw_ctx_prefix_tokens = list(context_tokens)
+                raw_ctx_prefix_tokens_list.append(raw_ctx_prefix_tokens)
+
+                fixed_len_effective = fixed_len + len(raw_ctx_prefix_tokens)
+                fixed_lens_list.append(int(fixed_len_effective))
+                if fixed_len_effective > decoder_budget:
                     # Cannot fit even without memory blocks; skip.
                     force_skip[i] = True
                     spans = []
@@ -4643,9 +4774,7 @@ class NativeCausalLM(TemplateLM):
                     orig_flat_len = 0
 
                 # Determine how many memory spans can fit in the decoder prompt budget.
-                reserve_cap = 256 if self._mode == "niah_generate" else 1024
-                reserve_gen = min(int(gen_lens[i]), reserve_cap) if int(gen_lens[i]) > 0 else 0
-                avail_for_memory = int(decoder_budget) - int(fixed_len) - int(reserve_gen)
+                avail_for_memory = int(decoder_budget) - int(fixed_len_effective) - int(reserve_gen)
                 avail_for_memory_list.append(int(avail_for_memory))
                 if decoder_memory_layout == "single":
                     # single layout: [BOM] + slots + [EOM] costs 2 + (num_comp * n_spans)
@@ -4701,7 +4830,7 @@ class NativeCausalLM(TemplateLM):
             else:
                 with torch.autocast(device_type="cuda", dtype=self._dtype):
                     compression_vectors = self._compress_multi_batches_with_progress(
-                        enc_tokens_mb, enc_ctx_mb, desc=f"compress[{self._mode}]"
+                        enc_tokens_mb, enc_ctx_mb, desc=f"compress[{mode}]"
                     )
                 if int(compression_vectors.shape[0]) != expected_total_slots:
                     raise RuntimeError(
@@ -4731,6 +4860,11 @@ class NativeCausalLM(TemplateLM):
                     for _ in range(n_spans):
                         prefix.extend([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX])
                         comp_mask.extend([False] + ([True] * num_comp) + [False])
+
+                raw_ctx_tokens = raw_ctx_prefix_tokens_list[i] if i < len(raw_ctx_prefix_tokens_list) else []
+                if raw_ctx_tokens:
+                    prefix.extend(raw_ctx_tokens)
+                    comp_mask.extend([False] * len(raw_ctx_tokens))
 
                 if add_boq:
                     prefix.append(BEGIN_OF_QUERY_INDEX)
@@ -4787,6 +4921,7 @@ class NativeCausalLM(TemplateLM):
                 "fixed_len": fixed_lens_list,
                 "avail_for_memory": avail_for_memory_list,
                 "max_spans": max_spans_list,
+                "raw_ctx_prefix_len": [len(x) for x in raw_ctx_prefix_tokens_list],
                 # Global config snapshot (helps debug span budgeting decisions).
                 "span_len": int(span_len),
                 "decoder_budget": int(decoder_budget),
@@ -4814,16 +4949,17 @@ class NativeCausalLM(TemplateLM):
             prompt_tokens_list.append(p_tokens)
 
             # Split into raw spans.
-            ctx_spans = [p_tokens[j : j + span_len] for j in range(0, len(p_tokens), span_len)]
-            if not ctx_spans:
-                ctx_spans = [[]]
+            ctx_spans = split_tokens_to_spans(p_tokens, span_len)
 
             # Select tail spans to fit within decoder budget (without truncating generation budget).
             prompt_in_dec_len = len(p_tokens) if decoder_include_prompt_tokens else 0
             total_static = prompt_in_dec_len + boq_extra + bor_extra + (2 if decoder_memory_layout == "single" else 0)
             
             span_cost = num_comp if decoder_memory_layout == "single" else (num_comp + 2)
-            reserve_cap = 256 if self._mode == "niah_generate" else 1024
+            # Some unit-test fixtures instantiate NativeCausalLM via __new__
+            # without running full __init__, so _mode may be missing.
+            mode = str(getattr(self, "_mode", "") or "")
+            reserve_cap = 256 if mode == "niah_generate" else 1024
             reserve_gen = min(int(glen), reserve_cap) if int(glen) > 0 else 0
             max_comp_tokens = max(0, int(decoder_budget) - int(total_static) - int(reserve_gen))
             
@@ -4897,7 +5033,7 @@ class NativeCausalLM(TemplateLM):
         else:
             with torch.autocast(device_type="cuda", dtype=self._dtype):
                 compression_vectors = self._compress_multi_batches_with_progress(
-                    enc_tokens_mb, enc_ctx_mb, desc=f"compress[{self._mode}]"
+                    enc_tokens_mb, enc_ctx_mb, desc=f"compress[{mode}]"
                 )
             if int(compression_vectors.shape[0]) != expected_total_slots:
                 raise RuntimeError(
@@ -4938,6 +5074,12 @@ class NativeCausalLM(TemplateLM):
 
             if not prefix:
                 embeds[i] = None
+                # Keep meta arrays index-aligned with batch samples.
+                # Without these placeholders, comp_mask/prefix meta can shift when
+                # some samples have no memory/query prefix (e.g. empty-context paths),
+                # which may later mis-map per-sample masks in grouped scoring.
+                comp_mask_list.append([])
+                prefix_lens.append(0)
                 continue
 
             prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
@@ -5010,13 +5152,26 @@ class NativeCausalLM(TemplateLM):
             if not ctx_tokens:
                 return [], []
             max_len = int(self.max_length)
+            compress_threshold = int(getattr(self, "_compress_threshold", max_len) or max_len)
             span_cost = num_comp + 2  # decoder cost per span: BOM + slots + EOM
             saving = max_mem_span_len - span_cost
             if saving <= 0:
                 # No compression benefit; let the span selector drop old spans.
-                return ctx_tokens, []
+                return [], list(ctx_tokens)
 
             raw_len = len(ctx_tokens)
+            # Optional short-context passthrough (off by default).
+            if should_keep_context_raw(
+                enable_short_ctx_passthrough=bool(getattr(self, "_compress_keep_short_ctx_raw", False)),
+                context_len=raw_len,
+                fixed_len=cont_len,
+                reserve_gen=0,
+                decoder_budget=max_len,
+                max_seq_len=max_len,
+                compress_threshold=compress_threshold,
+            ):
+                return [], list(ctx_tokens)
+
             total_spans = math.ceil(raw_len / max_mem_span_len)
             # If even compressing all spans can't fit, keep no suffix and let the builder drop spans.
             if total_spans * span_cost + cont_len > max_len:
@@ -5026,7 +5181,8 @@ class NativeCausalLM(TemplateLM):
             #   raw_len + cont_len - k*(max_mem_span_len - (num_comp+2)) <= max_len
             need = raw_len + cont_len - max_len
             if need <= 0:
-                k = raw_len // max_mem_span_len  # compress all full spans; keep remainder as suffix
+                # Fits already. Keep raw suffix by default; only compress when threshold says so.
+                k = 0
             else:
                 k = int(math.ceil(need / float(saving)))
             k = max(0, min(k, raw_len // max_mem_span_len))
@@ -5057,16 +5213,12 @@ class NativeCausalLM(TemplateLM):
             suffix_tokens_list: List[List[int]] = [[] for _ in range(len(chunk))]
 
             
-            # fill decoder prefix embeds, only compress old context and keep new context uncompressed
-            # TODO temp close this feature
-            if self._fill_decoder_prefix_embeds and not getattr(self, "_chat_use_template", False):
-                prompt_tokens_list, suffix_tokens_list_t = zip(
-                    *[_split_ctx_for_compression(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)]
-                )
-                prompt_tokens_override = list(prompt_tokens_list)
-                suffix_tokens_list = list(suffix_tokens_list_t)
-            elif getattr(self, "_chat_use_template", False):
-                suffix_tokens_list = [[] for _ in range(len(chunk))]
+            # Optional short-context passthrough (disabled by default).
+            prompt_tokens_list, suffix_tokens_list_t = zip(
+                *[_split_ctx_for_compression(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)]
+            )
+            prompt_tokens_override = list(prompt_tokens_list)
+            suffix_tokens_list = list(suffix_tokens_list_t)
 
 
             # prompt_tokens, suffix_tokens = compute_needed_comp_slots(prompt_tokens_override[0])
@@ -5358,8 +5510,14 @@ class NativeCausalLM(TemplateLM):
                     continue
                 pe0 = prefix_embeds_list[i]
                 if pe0 is None:
-                    skip_reasons[i] = "no_prefix"
-                    continue
+                    # Allow no-compression/no-prefix path by using empty prefix embeddings;
+                    # continuation can still be scored conditioned on raw suffix tokens.
+                    if suffix_tokens_list is not None and len(suffix_tokens_list[i]) > 0:
+                        d_model = int(getattr(self.model.args, "d_model", 0))
+                        pe0 = torch.empty((0, d_model), device=self.device, dtype=self._dtype)
+                    else:
+                        skip_reasons[i] = "no_prefix"
+                        continue
 
                 # Prefix consists of memory blocks + raw suffix tokens (kept uncompressed).
                 suffix_e = suffix_embeds_list[i]

@@ -716,19 +716,23 @@ class VLLM(TemplateLM):
             disable=disable_tqdm,
             desc="Running loglikelihood requests",
         )
+        # vLLM validates prompt_len + requested_output_len <= max_model_len.
+        # Even in score-only mode it may require at least 1 output token budget.
+        # Reserve one token to avoid hard failure when prompt is exactly max_length.
+        max_input_len = max(1, self.max_length - 1)
         for chunk in chunks:
             inputs = []
             ctxlens = []
             for cache_key, context_enc, continuation_enc in chunk:
                 if (
                     full_length := len(context_enc + continuation_enc)
-                ) > self.max_length:
+                ) > max_input_len:
                     eval_logger.warning(
-                        f"Context length {full_length} exceeds max length ({self.max_length}). Truncating context."
+                        f"Context length {full_length} exceeds max length ({max_input_len}, reserving 1 token for vLLM). Truncating context."
                     )
-                inp = (context_enc + continuation_enc)[-(self.max_length) :]
+                inp = (context_enc + continuation_enc)[-max_input_len:]
                 ctxlen = len(context_enc) - max(
-                    0, len(context_enc) + len(continuation_enc) - (self.max_length)
+                    0, len(context_enc) + len(continuation_enc) - max_input_len
                 )
 
                 inputs.append(inp)
