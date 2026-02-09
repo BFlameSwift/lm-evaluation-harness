@@ -198,6 +198,24 @@ def _parse_verifier_score_mode(name: Optional[str]) -> str:
     return mode
 
 
+def _parse_mcq_verifier_prompt_style(name: Optional[str]) -> str:
+    if name is None:
+        return "minimal"
+    mode = str(name).strip().lower()
+    if mode not in {"minimal", "explicit_yesno"}:
+        raise ValueError(f"Unsupported mcq_verifier_prompt_style: {name}")
+    return mode
+
+
+def _parse_mcq_verifier_tie_break(name: Optional[str]) -> str:
+    if name is None:
+        return "none"
+    mode = str(name).strip().lower()
+    if mode not in {"none", "ll_yes", "ll_margin", "choice_idx"}:
+        raise ValueError(f"Unsupported mcq_verifier_tie_break: {name}")
+    return mode
+
+
 def _is_mcq_verifier_mode(mode: Optional[str]) -> bool:
     mode_s = str(mode or "").strip().lower()
     return mode_s in {"verifier", "yes_only", "yes_minus_no", "yes_prob"}
@@ -256,6 +274,33 @@ def _verifier_score_from_ll(ll_yes: float, ll_no: float, mode: str) -> float:
     raise ValueError(f"Invalid verifier_score_mode: {mode}")
 
 
+def _apply_mcq_verifier_tie_break(
+    score: float,
+    *,
+    ll_yes: float,
+    ll_no: float,
+    choice_idx: Optional[int],
+    mode: str,
+    eps: float = 1e-8,
+) -> float:
+    mode_s = str(mode or "").strip().lower()
+    if mode_s == "none":
+        return float(score)
+
+    signal = 0.0
+    if mode_s == "ll_yes":
+        signal = float(ll_yes) if math.isfinite(float(ll_yes)) else -1.0e9
+    elif mode_s == "ll_margin":
+        diff = float(ll_yes) - float(ll_no)
+        signal = float(diff) if math.isfinite(diff) else -1.0e9
+    elif mode_s == "choice_idx":
+        idx = int(choice_idx) if choice_idx is not None else 0
+        signal = -float(idx)
+    else:
+        raise ValueError(f"Invalid mcq_verifier_tie_break: {mode}")
+    return float(score) + float(eps) * float(signal)
+
+
 def _apply_verifier_score_norm(score: float, candidate_tokens: int, mode: str) -> float:
     mode_s = str(mode or "").strip().lower()
     if mode_s == "none":
@@ -294,7 +339,7 @@ def _build_verifier_variant_texts(seed: Optional[str], fallback: str) -> List[st
     return out
 
 
-def _build_choice_verifier_prompt_text(label: str, opt_text: str) -> str:
+def _build_choice_verifier_prompt_text(label: str, opt_text: str, prompt_style: str = "minimal") -> str:
     label_s = str(label or "").strip()
     opt_s = str(opt_text or "").strip()
     if label_s and opt_s:
@@ -303,6 +348,12 @@ def _build_choice_verifier_prompt_text(label: str, opt_text: str) -> str:
         candidate = f"({label_s})"
     else:
         candidate = opt_s
+    style = str(prompt_style or "minimal").strip().lower()
+    if style == "explicit_yesno":
+        return (
+            "Judge whether the following candidate answer is correct.\n"
+            f"Candidate: {candidate}\n"
+        )
     return f"Candidate: {candidate}\n"
 
 
@@ -579,6 +630,8 @@ class NativeCausalLM(TemplateLM):
         verifier_no_token: Optional[str] = " No",
         verifier_apply_norm: str = "none",
         verifier_prompt_suffix: Optional[str] = None,
+        mcq_verifier_prompt_style: str = "minimal",
+        mcq_verifier_tie_break: str = "none",
         # NIAH generate_until defaults
         niah_use_bor: bool = False,
         # NIAH generate_until debugging (write JSONL cases)
@@ -724,6 +777,8 @@ class NativeCausalLM(TemplateLM):
             _normalize_optional_text(verifier_prompt_suffix)
             or "\nIs this correct? Answer with Yes or No.\n"
         )
+        self._mcq_verifier_prompt_style = _parse_mcq_verifier_prompt_style(mcq_verifier_prompt_style)
+        self._mcq_verifier_tie_break = _parse_mcq_verifier_tie_break(mcq_verifier_tie_break)
         self._verifier_prompt_suffix_tokens: Optional[List[int]] = None
         self._verifier_yes_variants: List[Tuple[str, List[int]]] = []
         self._verifier_no_variants: List[Tuple[str, List[int]]] = []
@@ -2016,19 +2071,6 @@ class NativeCausalLM(TemplateLM):
             "choice_idx": int(choice_idx) if choice_idx is not None else None,
             "source": "continuation",
         }
-        if choice_text:
-            candidate = str(choice_text).strip()
-            if label_text and len(label_text) <= 8:
-                label_prefix = label_text
-                if not (label_prefix.startswith("(") and label_prefix.endswith(")")):
-                    label_prefix = f"({label_prefix})"
-                candidate = f"{label_prefix} {candidate}"
-            meta["source"] = "doc_choice"
-        else:
-            candidate = label_text
-        if not candidate:
-            meta["source"] = "continuation_tokens"
-            return list(continuation_tokens), meta
         label_for_prompt = ""
         if label_text:
             label_clean = label_text.strip()
@@ -2036,9 +2078,30 @@ class NativeCausalLM(TemplateLM):
                 label_clean = label_clean[1:-1].strip()
             if len(label_clean) <= 8:
                 label_for_prompt = label_clean
-        if meta.get("source") != "doc_choice":
+
+        if choice_text:
+            candidate_opt = str(choice_text).strip()
+            if label_for_prompt:
+                candidate_opt = re.sub(
+                    rf"^\(?\s*{re.escape(label_for_prompt)}\s*\)?\s*[:.)-]?\s*",
+                    "",
+                    candidate_opt,
+                    flags=re.IGNORECASE,
+                )
+            meta["source"] = "doc_choice"
+        else:
+            candidate_opt = label_text
             label_for_prompt = ""
-        prompt_text = "\n" + _build_choice_verifier_prompt_text(label_for_prompt, candidate)
+
+        if not candidate_opt:
+            meta["source"] = "continuation_tokens"
+            return list(continuation_tokens), meta
+
+        prompt_text = "\n" + _build_choice_verifier_prompt_text(
+            label_for_prompt,
+            candidate_opt,
+            prompt_style=getattr(self, "_mcq_verifier_prompt_style", "minimal"),
+        )
         cand_tokens = self._tokenizer.encode(prompt_text, bos=False, eos=False)
         if not cand_tokens:
             meta["source"] = "continuation_tokens"
@@ -3295,20 +3358,30 @@ class NativeCausalLM(TemplateLM):
                                 base_tokens=base_tokens,
                                 decoder_budget=int(self.max_length),
                             )
+                        ll_yes = float(verifier_out.get("ll_yes", float("-inf")))
+                        ll_no = float(verifier_out.get("ll_no", float("-inf")))
                         raw_score = float(verifier_out.get("score", float("-inf")))
-                        logprob = _apply_verifier_score_norm(
+                        normed_score = _apply_verifier_score_norm(
                             raw_score,
                             candidate_tokens=max(1, len(candidate_tokens)),
                             mode=self._verifier_apply_norm,
+                        )
+                        logprob = _apply_mcq_verifier_tie_break(
+                            normed_score,
+                            ll_yes=ll_yes,
+                            ll_no=ll_no,
+                            choice_idx=choice_idxs_slice[i],
+                            mode=self._mcq_verifier_tie_break,
                         )
                         greedy = bool(verifier_out.get("greedy", False))
                         verifier_stats = {
                             "metric": "verifier",
                             "score": float(logprob),
+                            "score_before_tie_break": float(normed_score),
                             "raw_score": float(raw_score),
                             "tokens": int(max(1, len(candidate_tokens))),
-                            "ll_yes": verifier_out.get("ll_yes"),
-                            "ll_no": verifier_out.get("ll_no"),
+                            "ll_yes": ll_yes,
+                            "ll_no": ll_no,
                             "best_yes_variant": verifier_out.get("best_yes_variant"),
                             "best_no_variant": verifier_out.get("best_no_variant"),
                             "candidate_source": candidate_meta.get("source"),
@@ -3316,6 +3389,7 @@ class NativeCausalLM(TemplateLM):
                             "candidate_tokens_len": int(len(candidate_tokens)),
                             "prompt_suffix_tokens_len": int(len(suffix_tokens)),
                             "truncated_for_budget": bool(truncated_for_budget),
+                            "tie_break_mode": self._mcq_verifier_tie_break,
                             "greedy": greedy,
                         }
                     res.append((float(logprob), greedy))
@@ -3358,6 +3432,8 @@ class NativeCausalLM(TemplateLM):
                     if use_mcq_verifier:
                         row["verifier_score_mode"] = self._active_verifier_score_mode()
                         row["verifier_apply_norm"] = self._verifier_apply_norm
+                        row["mcq_verifier_prompt_style"] = self._mcq_verifier_prompt_style
+                        row["mcq_verifier_tie_break"] = self._mcq_verifier_tie_break
                     if loss is not None:
                         row["loss"] = loss
 
@@ -3405,6 +3481,10 @@ class NativeCausalLM(TemplateLM):
 
                     if verifier_stats is not None:
                         row["verifier_score"] = float(verifier_stats.get("score", float(logprob)))
+                        if verifier_stats.get("score_before_tie_break") is not None:
+                            row["verifier_score_before_tie_break"] = float(
+                                verifier_stats.get("score_before_tie_break")
+                            )
                         row["verifier_raw_score"] = float(verifier_stats.get("raw_score", row["verifier_score"]))
                         row["score_tokens"] = int(verifier_stats.get("tokens", 0))
                         if verifier_stats.get("ll_yes") is not None:
@@ -5752,6 +5832,10 @@ class NativeCausalLM(TemplateLM):
                     if score_info is not None:
                         if score_info.get("metric") == "verifier":
                             row["verifier_score"] = float(score_info.get("score", logprob))
+                            if score_info.get("score_before_tie_break") is not None:
+                                row["verifier_score_before_tie_break"] = float(
+                                    score_info.get("score_before_tie_break")
+                                )
                             row["verifier_raw_score"] = float(score_info.get("raw_score", row["verifier_score"]))
                             row["verifier_tokens"] = int(score_info.get("tokens", 0))
                             if score_info.get("ll_yes") is not None:
@@ -6075,21 +6159,31 @@ class NativeCausalLM(TemplateLM):
                         decoder_budget=decoder_budget,
                         rows_per_chunk=rows_per_chunk,
                     )
+                    ll_yes = float(verifier_out.get("ll_yes", float("-inf")))
+                    ll_no = float(verifier_out.get("ll_no", float("-inf")))
                     raw_score = float(verifier_out.get("score", float("-inf")))
-                    score = _apply_verifier_score_norm(
+                    normed_score = _apply_verifier_score_norm(
                         raw_score,
                         candidate_tokens=len(candidate_tokens),
                         mode=self._verifier_apply_norm,
+                    )
+                    score = _apply_mcq_verifier_tie_break(
+                        normed_score,
+                        ll_yes=ll_yes,
+                        ll_no=ll_no,
+                        choice_idx=choice_idxs_slice[i],
+                        mode=self._mcq_verifier_tie_break,
                     )
                     greedy = bool(verifier_out.get("greedy", False))
                     chunk_results[i] = (float(score), greedy)
                     score_stats_by_idx[i] = {
                         "metric": "verifier",
                         "score": float(score),
+                        "score_before_tie_break": float(normed_score),
                         "raw_score": float(raw_score),
                         "tokens": int(max(1, len(candidate_tokens))),
-                        "ll_yes": verifier_out.get("ll_yes"),
-                        "ll_no": verifier_out.get("ll_no"),
+                        "ll_yes": ll_yes,
+                        "ll_no": ll_no,
                         "best_yes_variant": verifier_out.get("best_yes_variant"),
                         "best_no_variant": verifier_out.get("best_no_variant"),
                         "candidate_source": candidate_meta.get("source"),
@@ -6097,6 +6191,7 @@ class NativeCausalLM(TemplateLM):
                         "candidate_tokens_len": int(len(candidate_tokens)),
                         "prompt_suffix_tokens_len": int(len(suffix_tokens)),
                         "truncated_for_budget": bool(truncated_for_budget),
+                        "tie_break_mode": self._mcq_verifier_tie_break,
                         "greedy": greedy,
                     }
                     continue
