@@ -164,6 +164,148 @@ def _parse_mode(name: Optional[str]) -> str:
     return name
 
 
+def _parse_mcq_score_mode(name: Optional[str]) -> str:
+    if name is None:
+        return "ll"
+    mode = str(name).strip().lower()
+    if mode not in {"ll", "verifier", "yes_only", "yes_minus_no", "yes_prob"}:
+        raise ValueError(f"Unsupported mcq_score_mode: {name}")
+    return mode
+
+
+def _map_choice_score_mode_to_mcq_mode(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    mode = str(name).strip().lower()
+    if not mode:
+        return None
+    if mode in {"ll", "loglikelihood"}:
+        return "ll"
+    if mode in {"verifier", "yes_only", "yes_minus_no", "yes_prob"}:
+        return mode
+    # Backward-compat with eval_longbench modes; harness MCQ uses ll/verifier-style scores.
+    if mode in {"label", "option", "both"}:
+        return "ll"
+    raise ValueError(f"Unsupported choice_score_mode: {name}")
+
+
+def _parse_verifier_score_mode(name: Optional[str]) -> str:
+    if name is None:
+        return "yes_prob"
+    mode = str(name).strip().lower()
+    if mode not in {"yes_only", "yes_minus_no", "yes_prob"}:
+        raise ValueError(f"Unsupported verifier_score_mode: {name}")
+    return mode
+
+
+def _is_mcq_verifier_mode(mode: Optional[str]) -> bool:
+    mode_s = str(mode or "").strip().lower()
+    return mode_s in {"verifier", "yes_only", "yes_minus_no", "yes_prob"}
+
+
+def _resolve_verifier_score_mode(mcq_score_mode: Optional[str], verifier_score_mode: str) -> str:
+    mode_s = str(mcq_score_mode or "").strip().lower()
+    if mode_s in {"yes_only", "yes_minus_no", "yes_prob"}:
+        return mode_s
+    return verifier_score_mode
+
+
+def _parse_verifier_apply_norm(name: Optional[str]) -> str:
+    if name is None:
+        return "none"
+    mode = str(name).strip().lower()
+    if mode not in {"none", "sum", "length"}:
+        raise ValueError(f"Unsupported verifier_apply_norm: {name}")
+    return mode
+
+
+def _map_choice_score_norm_to_verifier_norm(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    mode = str(name).strip().lower()
+    if not mode:
+        return None
+    if mode in {"none", "sum", "length"}:
+        return mode
+    if mode in {"avg", "mean"}:
+        return "length"
+    raise ValueError(f"Unsupported choice_score_norm: {name}")
+
+
+def _sigmoid_stable(x: float) -> float:
+    if math.isnan(x):
+        return 0.5
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _verifier_score_from_ll(ll_yes: float, ll_no: float, mode: str) -> float:
+    mode_s = str(mode or "").strip().lower()
+    if mode_s == "yes_only":
+        return float(ll_yes)
+    diff = float(ll_yes) - float(ll_no)
+    if mode_s == "yes_minus_no":
+        if math.isnan(diff):
+            return float("-inf")
+        return float(diff)
+    if mode_s == "yes_prob":
+        return float(_sigmoid_stable(diff))
+    raise ValueError(f"Invalid verifier_score_mode: {mode}")
+
+
+def _apply_verifier_score_norm(score: float, candidate_tokens: int, mode: str) -> float:
+    mode_s = str(mode or "").strip().lower()
+    if mode_s == "none":
+        return float(score)
+    denom = max(1, int(candidate_tokens))
+    if mode_s == "length":
+        return float(score) / float(denom)
+    if mode_s == "sum":
+        return float(score) * float(denom)
+    raise ValueError(f"Invalid verifier_apply_norm: {mode}")
+
+
+def _build_verifier_variant_texts(seed: Optional[str], fallback: str) -> List[str]:
+    base = str(seed) if seed is not None else ""
+    if not base.strip():
+        base = fallback
+    stem = base.strip()
+    cands = [
+        base,
+        stem,
+        f" {stem}",
+        stem.lower(),
+        f" {stem.lower()}",
+        stem.capitalize(),
+        f" {stem.capitalize()}",
+    ]
+    out: List[str] = []
+    seen = set()
+    for c in cands:
+        if not c:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def _build_choice_verifier_prompt_text(label: str, opt_text: str) -> str:
+    label_s = str(label or "").strip()
+    opt_s = str(opt_text or "").strip()
+    if label_s and opt_s:
+        candidate = f"({label_s}) {opt_s}"
+    elif label_s:
+        candidate = f"({label_s})"
+    else:
+        candidate = opt_s
+    return f"Candidate: {candidate}\n"
+
+
 def _coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional[int]:
     if value is None:
         return default
@@ -181,6 +323,16 @@ def _coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional
         return int(value)
     except Exception:
         return default
+
+
+def _token_embed(model: torch.nn.Module, token_ids: torch.Tensor) -> torch.Tensor:
+    if hasattr(model, "tok_embeddings"):
+        return model.tok_embeddings(token_ids)  # type: ignore[attr-defined]
+    if hasattr(model, "get_input_embeddings"):
+        emb_layer = model.get_input_embeddings()
+        if emb_layer is not None:
+            return emb_layer(token_ids)
+    raise AttributeError("Model does not expose token embedding layer (tok_embeddings/get_input_embeddings)")
 
 
 def _normalize_optional_text(value: Optional[Any]) -> str:
@@ -418,6 +570,15 @@ class NativeCausalLM(TemplateLM):
         add_query_before_likelihood: bool = False,
         likelihood_prefix_reconstruct: Optional[str] = None,
         likelihood_prefix_compress_answer: Optional[str] = None,
+        mcq_score_mode: str = "ll",
+        # Backward-compat aliases used by eval_longbench-style configs.
+        choice_score_mode: Optional[str] = None,
+        choice_score_norm: Optional[str] = None,
+        verifier_score_mode: str = "yes_prob",
+        verifier_yes_token: Optional[str] = " Yes",
+        verifier_no_token: Optional[str] = " No",
+        verifier_apply_norm: str = "none",
+        verifier_prompt_suffix: Optional[str] = None,
         # NIAH generate_until defaults
         niah_use_bor: bool = False,
         # NIAH generate_until debugging (write JSONL cases)
@@ -491,6 +652,7 @@ class NativeCausalLM(TemplateLM):
         self._active_loglikelihood_docs: Optional[List[Optional[dict]]] = None
         self._active_loglikelihood_task_names: Optional[List[Optional[str]]] = None
         self._active_loglikelihood_doc_ids: Optional[List[Optional[int]]] = None
+        self._active_loglikelihood_choice_idxs: Optional[List[Optional[int]]] = None
         
         self._active_context_key = "context"
         self._active_question_key = "question"
@@ -529,6 +691,42 @@ class NativeCausalLM(TemplateLM):
         self._likelihood_prefix_compress_answer = _normalize_optional_text(likelihood_prefix_compress_answer)
         self._likelihood_prefix_tokens_reconstruct: Optional[List[int]] = None
         self._likelihood_prefix_tokens_compress_answer: Optional[List[int]] = None
+        resolved_mcq_score_mode = mcq_score_mode
+        mapped_choice_score_mode = _map_choice_score_mode_to_mcq_mode(choice_score_mode)
+        if mapped_choice_score_mode is not None:
+            explicit_mcq = str(mcq_score_mode or "").strip().lower()
+            if explicit_mcq not in {"", "ll"} and mapped_choice_score_mode != explicit_mcq:
+                print(
+                    f"[native][warn] Both mcq_score_mode={mcq_score_mode!r} and "
+                    f"choice_score_mode={choice_score_mode!r} were set; keeping mcq_score_mode.",
+                    file=sys.stderr,
+                )
+            else:
+                resolved_mcq_score_mode = mapped_choice_score_mode
+        self._mcq_score_mode = _parse_mcq_score_mode(resolved_mcq_score_mode)
+        self._verifier_score_mode = _parse_verifier_score_mode(verifier_score_mode)
+        resolved_verifier_apply_norm = verifier_apply_norm
+        mapped_choice_score_norm = _map_choice_score_norm_to_verifier_norm(choice_score_norm)
+        if mapped_choice_score_norm is not None:
+            explicit_norm = str(verifier_apply_norm or "").strip().lower()
+            if explicit_norm not in {"", "none"} and mapped_choice_score_norm != explicit_norm:
+                print(
+                    f"[native][warn] Both verifier_apply_norm={verifier_apply_norm!r} and "
+                    f"choice_score_norm={choice_score_norm!r} were set; keeping verifier_apply_norm.",
+                    file=sys.stderr,
+                )
+            else:
+                resolved_verifier_apply_norm = mapped_choice_score_norm
+        self._verifier_apply_norm = _parse_verifier_apply_norm(resolved_verifier_apply_norm)
+        self._verifier_yes_variant_texts = _build_verifier_variant_texts(verifier_yes_token, fallback="Yes")
+        self._verifier_no_variant_texts = _build_verifier_variant_texts(verifier_no_token, fallback="No")
+        self._verifier_prompt_suffix = (
+            _normalize_optional_text(verifier_prompt_suffix)
+            or "\nIs this correct? Answer with Yes or No.\n"
+        )
+        self._verifier_prompt_suffix_tokens: Optional[List[int]] = None
+        self._verifier_yes_variants: List[Tuple[str, List[int]]] = []
+        self._verifier_no_variants: List[Tuple[str, List[int]]] = []
         self._save_loglikelihood_debug = bool(save_loglikelihood_debug)
         self._loglikelihood_debug_path = loglikelihood_debug_path
         self._last_loglikelihood_debug: List[dict] = []
@@ -718,6 +916,20 @@ class NativeCausalLM(TemplateLM):
             self.model = model
         self.model.eval()
         self._tokenizer = tokenizer
+        self._verifier_yes_variants = [
+            (txt, self._tokenizer.encode(txt, bos=False, eos=False))
+            for txt in self._verifier_yes_variant_texts
+        ]
+        self._verifier_yes_variants = [(txt, toks) for txt, toks in self._verifier_yes_variants if len(toks) > 0]
+        self._verifier_no_variants = [
+            (txt, self._tokenizer.encode(txt, bos=False, eos=False))
+            for txt in self._verifier_no_variant_texts
+        ]
+        self._verifier_no_variants = [(txt, toks) for txt, toks in self._verifier_no_variants if len(toks) > 0]
+        if not self._verifier_yes_variants:
+            self._verifier_yes_variants = [(" Yes", self._tokenizer.encode(" Yes", bos=False, eos=False))]
+        if not self._verifier_no_variants:
+            self._verifier_no_variants = [(" No", self._tokenizer.encode(" No", bos=False, eos=False))]
         self._device_mesh = device_mesh
         self._model_parallel_group = device_mesh.get_group(1) if device_mesh is not None else None
 
@@ -1744,6 +1956,216 @@ class NativeCausalLM(TemplateLM):
             return cached
         return []
 
+    def _get_verifier_prompt_suffix_tokens(self) -> List[int]:
+        cached = getattr(self, "_verifier_prompt_suffix_tokens", None)
+        if cached is None:
+            text = getattr(self, "_verifier_prompt_suffix", "")
+            cached = self._tokenizer.encode(text, bos=False, eos=False) if text else []
+            self._verifier_prompt_suffix_tokens = cached
+        return cached
+
+    def _use_mcq_verifier(self) -> bool:
+        return _is_mcq_verifier_mode(getattr(self, "_mcq_score_mode", "ll"))
+
+    def _active_verifier_score_mode(self) -> str:
+        return _resolve_verifier_score_mode(
+            getattr(self, "_mcq_score_mode", "ll"),
+            getattr(self, "_verifier_score_mode", "yes_prob"),
+        )
+
+    def _resolve_choice_text_from_doc(self, doc: Optional[dict], choice_idx: Optional[int]) -> Optional[str]:
+        if not isinstance(doc, dict):
+            return None
+        if choice_idx is None:
+            return None
+        idx = int(choice_idx)
+        if idx < 0:
+            return None
+        choices = doc.get("choices")
+        # mmlu-style: {"choices": [str, ...]}
+        if isinstance(choices, list):
+            if idx < len(choices):
+                value = choices[idx]
+                return str(value) if value is not None else None
+            return None
+        # arc-style: {"choices": {"text":[...], "label":[...]}}
+        if isinstance(choices, dict):
+            text_list = choices.get("text")
+            if isinstance(text_list, list) and idx < len(text_list):
+                value = text_list[idx]
+                return str(value) if value is not None else None
+            return None
+        # hellaswag-style after process_docs.
+        endings = doc.get("endings")
+        if isinstance(endings, list) and idx < len(endings):
+            value = endings[idx]
+            return str(value) if value is not None else None
+        return None
+
+    def _build_verifier_candidate_tokens(
+        self,
+        *,
+        continuation_tokens: List[int],
+        continuation_str: str,
+        doc: Optional[dict],
+        choice_idx: Optional[int],
+    ) -> Tuple[List[int], Dict[str, Any]]:
+        choice_text = self._resolve_choice_text_from_doc(doc, choice_idx)
+        label_text = str(continuation_str or "").strip()
+        meta: Dict[str, Any] = {
+            "choice_idx": int(choice_idx) if choice_idx is not None else None,
+            "source": "continuation",
+        }
+        if choice_text:
+            candidate = str(choice_text).strip()
+            if label_text and len(label_text) <= 8:
+                label_prefix = label_text
+                if not (label_prefix.startswith("(") and label_prefix.endswith(")")):
+                    label_prefix = f"({label_prefix})"
+                candidate = f"{label_prefix} {candidate}"
+            meta["source"] = "doc_choice"
+        else:
+            candidate = label_text
+        if not candidate:
+            meta["source"] = "continuation_tokens"
+            return list(continuation_tokens), meta
+        label_for_prompt = ""
+        if label_text:
+            label_clean = label_text.strip()
+            if label_clean.startswith("(") and label_clean.endswith(")") and len(label_clean) >= 3:
+                label_clean = label_clean[1:-1].strip()
+            if len(label_clean) <= 8:
+                label_for_prompt = label_clean
+        if meta.get("source") != "doc_choice":
+            label_for_prompt = ""
+        prompt_text = "\n" + _build_choice_verifier_prompt_text(label_for_prompt, candidate)
+        cand_tokens = self._tokenizer.encode(prompt_text, bos=False, eos=False)
+        if not cand_tokens:
+            meta["source"] = "continuation_tokens"
+            return list(continuation_tokens), meta
+        preview = prompt_text[:200]
+        meta["candidate_preview"] = preview
+        return cand_tokens, meta
+
+    def _score_verifier_yes_no_from_base(
+        self,
+        *,
+        base_embeds: torch.Tensor,
+        base_comp_mask: torch.Tensor,
+        decoder_budget: int,
+        rows_per_chunk: int,
+    ) -> Dict[str, Any]:
+        yes_scores: List[Dict[str, Any]] = []
+        for variant, toks in self._verifier_yes_variants:
+            out = self._score_continuation_fixed_base(
+                base_embeds=base_embeds,
+                cont_tokens=list(toks),
+                base_comp_mask=base_comp_mask,
+                decoder_budget=decoder_budget,
+                rows_per_chunk=rows_per_chunk,
+            )
+            yes_scores.append({"variant": variant, **out})
+        no_scores: List[Dict[str, Any]] = []
+        for variant, toks in self._verifier_no_variants:
+            out = self._score_continuation_fixed_base(
+                base_embeds=base_embeds,
+                cont_tokens=list(toks),
+                base_comp_mask=base_comp_mask,
+                decoder_budget=decoder_budget,
+                rows_per_chunk=rows_per_chunk,
+            )
+            no_scores.append({"variant": variant, **out})
+
+        best_yes = max(yes_scores, key=lambda x: float(x.get("ll", float("-inf"))))
+        best_no = max(no_scores, key=lambda x: float(x.get("ll", float("-inf"))))
+        ll_yes = float(best_yes.get("ll", float("-inf")))
+        ll_no = float(best_no.get("ll", float("-inf")))
+        score = float(_verifier_score_from_ll(ll_yes, ll_no, self._active_verifier_score_mode()))
+        greedy = bool(best_yes.get("greedy", False))
+        return {
+            "ll_yes": ll_yes,
+            "ll_no": ll_no,
+            "score": score,
+            "greedy": greedy,
+            "best_yes_variant": best_yes.get("variant"),
+            "best_no_variant": best_no.get("variant"),
+            "yes_variants": yes_scores,
+            "no_variants": no_scores,
+        }
+
+    @torch.no_grad()
+    def _score_continuation_on_tokens(
+        self,
+        *,
+        base_tokens: List[int],
+        continuation_tokens: List[int],
+        decoder_budget: int,
+    ) -> Dict[str, Any]:
+        cont = list(continuation_tokens or [])
+        if not cont:
+            return {"ll": 0.0, "greedy": True}
+
+        keep_base = max(1, int(decoder_budget) - len(cont))
+        base = list(base_tokens or [])
+        if len(base) > keep_base:
+            base = base[-keep_base:]
+        seq = base + cont
+        if len(seq) <= 1:
+            return {"ll": float("-inf"), "greedy": False}
+
+        inp = torch.tensor(seq[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
+        tgt = torch.tensor(seq[1:], device=self.device, dtype=torch.long)
+        logprobs = self._model_logits(self._model_call(inp))
+        tail = int(len(cont))
+        tail_logprobs = logprobs[0, -tail:, :]
+        tail_tgt = tgt[-tail:]
+        token_logprobs = tail_logprobs.gather(-1, tail_tgt.unsqueeze(-1)).squeeze(-1)
+        ll = float(token_logprobs.sum().item())
+        greedy = bool((tail_logprobs.argmax(dim=-1) == tail_tgt).all().item())
+        return {"ll": ll, "greedy": greedy}
+
+    @torch.no_grad()
+    def _score_verifier_yes_no_from_tokens(
+        self,
+        *,
+        base_tokens: List[int],
+        decoder_budget: int,
+    ) -> Dict[str, Any]:
+        yes_scores: List[Dict[str, Any]] = []
+        for variant, toks in self._verifier_yes_variants:
+            out = self._score_continuation_on_tokens(
+                base_tokens=base_tokens,
+                continuation_tokens=list(toks),
+                decoder_budget=decoder_budget,
+            )
+            yes_scores.append({"variant": variant, **out})
+
+        no_scores: List[Dict[str, Any]] = []
+        for variant, toks in self._verifier_no_variants:
+            out = self._score_continuation_on_tokens(
+                base_tokens=base_tokens,
+                continuation_tokens=list(toks),
+                decoder_budget=decoder_budget,
+            )
+            no_scores.append({"variant": variant, **out})
+
+        best_yes = max(yes_scores, key=lambda x: float(x.get("ll", float("-inf"))))
+        best_no = max(no_scores, key=lambda x: float(x.get("ll", float("-inf"))))
+        ll_yes = float(best_yes.get("ll", float("-inf")))
+        ll_no = float(best_no.get("ll", float("-inf")))
+        score = float(_verifier_score_from_ll(ll_yes, ll_no, self._active_verifier_score_mode()))
+        greedy = bool(best_yes.get("greedy", False))
+        return {
+            "ll_yes": ll_yes,
+            "ll_no": ll_no,
+            "score": score,
+            "greedy": greedy,
+            "best_yes_variant": best_yes.get("variant"),
+            "best_no_variant": best_no.get("variant"),
+            "yes_variants": yes_scores,
+            "no_variants": no_scores,
+        }
+
     @torch.no_grad()
     def _chunked_logprob_and_greedy(
         self,
@@ -1959,7 +2381,7 @@ class NativeCausalLM(TemplateLM):
             h_score = h.index_select(0, score_pos)
 
             if rows_per_chunk is None:
-                rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
+                rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
                 rows_per_chunk = max(16, min(rows_per_chunk, 512))
             rows_per_chunk = max(8, int(rows_per_chunk))
 
@@ -2129,7 +2551,7 @@ class NativeCausalLM(TemplateLM):
             h_score = h.index_select(0, score_pos)
 
             if rows_per_chunk is None:
-                rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
+                rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
                 rows_per_chunk = max(8, min(rows_per_chunk, 512))
             rows_per_chunk = max(8, int(rows_per_chunk))
 
@@ -2238,7 +2660,7 @@ class NativeCausalLM(TemplateLM):
             return {"ll": float("-inf"), "greedy": False, "tokens": 0, "loss": float("inf"), "ppl": float("inf"), "windows": 0, "rolled": True}
 
         if rows_per_chunk is None:
-            rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
+            rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
             rows_per_chunk = max(16, min(int(rows_per_chunk), 512))
 
         def _score_window(prefix: torch.Tensor, prefix_mask: torch.Tensor, targets: List[int], prefix_len: int) -> Tuple[float, bool]:
@@ -2246,7 +2668,7 @@ class NativeCausalLM(TemplateLM):
                 return 0.0, True
             t = torch.tensor(targets, device=self.device, dtype=torch.long)
             with torch.autocast(device_type="cuda", dtype=self._dtype):
-                e = self.model.tok_embeddings(t).to(dtype=self._dtype)
+                e = _token_embed(self.model, t).to(dtype=self._dtype)
             seq = torch.cat([prefix, e], dim=0)
             mask = torch.cat([prefix_mask, torch.zeros(int(t.numel()), device=self.device, dtype=torch.bool)], dim=0)
             out = self._forward_score_continuations(
@@ -2296,7 +2718,7 @@ class NativeCausalLM(TemplateLM):
             overlap_id = int(cont_tokens[start])
             overlap_t = torch.tensor([overlap_id], device=self.device, dtype=torch.long)
             with torch.autocast(device_type="cuda", dtype=self._dtype):
-                overlap_e = self.model.tok_embeddings(overlap_t).to(dtype=self._dtype)
+                overlap_e = _token_embed(self.model, overlap_t).to(dtype=self._dtype)
             prefix = torch.cat([base_embeds, overlap_e], dim=0)
             prefix_mask = torch.cat([base_comp_mask, torch.zeros(1, device=self.device, dtype=torch.bool)], dim=0)
             llw, gw = _score_window(prefix, prefix_mask, cont_tokens[start + 1 : end], base_len + 1)
@@ -2487,7 +2909,7 @@ class NativeCausalLM(TemplateLM):
                 # Build dummy encoder/decoder contexts for compression model when used as plain LM
                 decoder_context = dict(context)
                 decoder_context["compression_token_mask"] = torch.zeros_like(positions, dtype=torch.bool)
-                x_tokens = self.model.tok_embeddings(inps.flatten()).to(self._dtype)
+                x_tokens = _token_embed(self.model, inps.flatten()).to(self._dtype)
                 h = x_tokens
                 for layer in self.model.layers:
                     h = layer(h, context=decoder_context)
@@ -2577,7 +2999,7 @@ class NativeCausalLM(TemplateLM):
                         "compression_token_mask": torch.zeros(enc.numel(), device=self.device, dtype=torch.bool),
                     }
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
-                        x_tokens = self.model.tok_embeddings(enc).to(self._dtype)
+                        x_tokens = _token_embed(self.model, enc).to(self._dtype)
                         h = x_tokens
                         for layer in self.model.layers:
                             h = layer(h, context=dec_ctx)
@@ -2762,10 +3184,33 @@ class NativeCausalLM(TemplateLM):
             bs = int(bs)
         except Exception:
             bs = 1
+        rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
+        rows_per_chunk = max(16, min(int(rows_per_chunk), 512))
         iterator = range(0, len(requests), bs)
         pbar = tqdm(iterator, disable=disable_tqdm or self.rank != 0, desc="native loglikelihood")
         for batch_start in pbar:
             chunk = requests[batch_start : batch_start + bs]
+            use_mcq_verifier = self._use_mcq_verifier()
+            docs_slice: List[Optional[dict]] = [None] * len(chunk)
+            choice_idxs_slice: List[Optional[int]] = [None] * len(chunk)
+            if use_mcq_verifier:
+                try:
+                    if self._active_loglikelihood_docs:
+                        for bi in range(len(chunk)):
+                            gi = batch_start + bi
+                            if gi < len(self._active_loglikelihood_docs):
+                                v = self._active_loglikelihood_docs[gi]
+                                docs_slice[bi] = v if isinstance(v, dict) else None
+                    if self._active_loglikelihood_choice_idxs:
+                        for bi in range(len(chunk)):
+                            gi = batch_start + bi
+                            if gi < len(self._active_loglikelihood_choice_idxs):
+                                cidx = self._active_loglikelihood_choice_idxs[gi]
+                                if cidx is not None:
+                                    choice_idxs_slice[bi] = int(cidx)
+                except Exception:
+                    pass
+
             seq_lens = [min(self.max_length, len(c) + len(cont)) for _, c, cont in chunk]
             max_seq = max(seq_lens)
             inp_batch = torch.full((len(chunk), max_seq - 1), self.pad_token_id, device=self.device, dtype=torch.long)
@@ -2788,20 +3233,114 @@ class NativeCausalLM(TemplateLM):
 
             debug_rows: List[dict] = []
             for i, tgt in enumerate(tgt_batch):
-                tgt_tensor = torch.tensor(tgt, device=self.device, dtype=torch.long)
-                seq_logprobs = logprobs[i, -tgt_full_lens[i] :, :]
-                cont_len = cont_lens[i]
-                tail_logprobs = seq_logprobs[-cont_len:, :]
-                token_logprobs = tail_logprobs.gather(-1, tgt_tensor[-cont_len:].unsqueeze(-1)).squeeze(-1)
-                logprob = float(token_logprobs.sum().item())
-                greedy = bool((tail_logprobs.argmax(dim=-1) == tgt_tensor[-cont_len:]).all().item())
-                res.append((logprob, greedy))
+                cont_len = int(cont_lens[i])
+                verifier_stats: Optional[Dict[str, Any]] = None
+
+                if use_mcq_verifier:
+                    try:
+                        pair = chunk[i][0]
+                        cont_str = pair[1] if pair and len(pair) > 1 else ""
+                    except Exception:
+                        cont_str = ""
+                    candidate_tokens, candidate_meta = self._build_verifier_candidate_tokens(
+                        continuation_tokens=list(chunk[i][2]),
+                        continuation_str=str(cont_str),
+                        doc=docs_slice[i],
+                        choice_idx=choice_idxs_slice[i],
+                    )
+                    suffix_tokens = self._get_verifier_prompt_suffix_tokens()
+                    base_tokens = list(chunk[i][1]) + list(candidate_tokens) + list(suffix_tokens)
+                    max_verify_len = 1
+                    for _, toks in (self._verifier_yes_variants + self._verifier_no_variants):
+                        if len(toks) > max_verify_len:
+                            max_verify_len = len(toks)
+                    keep_base = max(1, int(self.max_length) - int(max_verify_len))
+                    truncated_for_budget = False
+                    if len(base_tokens) > keep_base:
+                        base_tokens = base_tokens[-keep_base:]
+                        truncated_for_budget = True
+
+                    if not base_tokens:
+                        logprob = float("-inf")
+                        greedy = False
+                        verifier_stats = {
+                            "metric": "verifier",
+                            "score": logprob,
+                            "raw_score": logprob,
+                            "tokens": int(max(1, len(candidate_tokens))),
+                            "candidate_source": candidate_meta.get("source"),
+                            "candidate_preview": candidate_meta.get("candidate_preview"),
+                            "candidate_tokens_len": int(len(candidate_tokens)),
+                            "prompt_suffix_tokens_len": int(len(suffix_tokens)),
+                            "truncated_for_budget": bool(truncated_for_budget),
+                            "greedy": greedy,
+                        }
+                    else:
+                        has_native_decoder_blocks = all(
+                            hasattr(self.model, attr) for attr in ("layers", "norm", "output")
+                        )
+                        if has_native_decoder_blocks:
+                            bt = torch.tensor(base_tokens, device=self.device, dtype=torch.long)
+                            with torch.autocast(device_type="cuda", dtype=self._dtype):
+                                base_embeds = _token_embed(self.model, bt).to(dtype=self._dtype)
+                            base_comp_mask = torch.zeros(int(bt.numel()), device=self.device, dtype=torch.bool)
+                            verifier_out = self._score_verifier_yes_no_from_base(
+                                base_embeds=base_embeds,
+                                base_comp_mask=base_comp_mask,
+                                decoder_budget=int(self.max_length),
+                                rows_per_chunk=rows_per_chunk,
+                            )
+                        else:
+                            verifier_out = self._score_verifier_yes_no_from_tokens(
+                                base_tokens=base_tokens,
+                                decoder_budget=int(self.max_length),
+                            )
+                        raw_score = float(verifier_out.get("score", float("-inf")))
+                        logprob = _apply_verifier_score_norm(
+                            raw_score,
+                            candidate_tokens=max(1, len(candidate_tokens)),
+                            mode=self._verifier_apply_norm,
+                        )
+                        greedy = bool(verifier_out.get("greedy", False))
+                        verifier_stats = {
+                            "metric": "verifier",
+                            "score": float(logprob),
+                            "raw_score": float(raw_score),
+                            "tokens": int(max(1, len(candidate_tokens))),
+                            "ll_yes": verifier_out.get("ll_yes"),
+                            "ll_no": verifier_out.get("ll_no"),
+                            "best_yes_variant": verifier_out.get("best_yes_variant"),
+                            "best_no_variant": verifier_out.get("best_no_variant"),
+                            "candidate_source": candidate_meta.get("source"),
+                            "candidate_preview": candidate_meta.get("candidate_preview"),
+                            "candidate_tokens_len": int(len(candidate_tokens)),
+                            "prompt_suffix_tokens_len": int(len(suffix_tokens)),
+                            "truncated_for_budget": bool(truncated_for_budget),
+                            "greedy": greedy,
+                        }
+                    res.append((float(logprob), greedy))
+                else:
+                    if cont_len <= 0:
+                        logprob = 0.0
+                        greedy = True
+                        res.append((logprob, greedy))
+                    else:
+                        tgt_tensor = torch.tensor(tgt, device=self.device, dtype=torch.long)
+                        seq_logprobs = logprobs[i, -tgt_full_lens[i] :, :]
+                        tail_logprobs = seq_logprobs[-cont_len:, :]
+                        token_logprobs = tail_logprobs.gather(-1, tgt_tensor[-cont_len:].unsqueeze(-1)).squeeze(-1)
+                        logprob = float(token_logprobs.sum().item())
+                        greedy = bool((tail_logprobs.argmax(dim=-1) == tgt_tensor[-cont_len:]).all().item())
+                        res.append((logprob, greedy))
 
                 if self._save_loglikelihood_debug and self._distributed_args.rank == 0:
+                    metric_tokens = int(cont_len)
+                    if verifier_stats is not None:
+                        metric_tokens = int(verifier_stats.get("tokens", metric_tokens))
                     loss = None
                     ppl = None
-                    if cont_len > 0 and math.isfinite(logprob):
-                        loss = -float(logprob) / float(cont_len)
+                    if metric_tokens > 0 and math.isfinite(float(logprob)):
+                        loss = -float(logprob) / float(metric_tokens)
                         try:
                             ppl = math.exp(loss)
                         except OverflowError:
@@ -2810,11 +3349,15 @@ class NativeCausalLM(TemplateLM):
                     row = {
                         "request_index": batch_start + i,
                         "mode": "decoder",
+                        "mcq_score_mode": self._mcq_score_mode,
                         "cont_len": int(cont_len),
-                        "logprob": logprob,
-                        "greedy": greedy,
+                        "logprob": float(logprob),
+                        "greedy": bool(greedy),
                         "ppl": ppl,
                     }
+                    if use_mcq_verifier:
+                        row["verifier_score_mode"] = self._active_verifier_score_mode()
+                        row["verifier_apply_norm"] = self._verifier_apply_norm
                     if loss is not None:
                         row["loss"] = loss
 
@@ -2828,6 +3371,10 @@ class NativeCausalLM(TemplateLM):
                             doc_id = self._active_loglikelihood_doc_ids[batch_start + i]
                             if doc_id is not None:
                                 row["doc_id"] = int(doc_id)
+                        if self._active_loglikelihood_choice_idxs:
+                            choice_idx = self._active_loglikelihood_choice_idxs[batch_start + i]
+                            if choice_idx is not None:
+                                row["choice_idx"] = int(choice_idx)
                     except Exception:
                         pass
 
@@ -2850,8 +3397,34 @@ class NativeCausalLM(TemplateLM):
                     if cont_len > 0:
                         row["cont_tokens_len"] = int(cont_len)
                         row["cont_tokens_preview"] = list(
-                            tgt_tensor[-cont_len:].detach().to("cpu").tolist()[:20]
+                            torch.tensor(tgt, device=self.device, dtype=torch.long)[-cont_len:]
+                            .detach()
+                            .to("cpu")
+                            .tolist()[:20]
                         )
+
+                    if verifier_stats is not None:
+                        row["verifier_score"] = float(verifier_stats.get("score", float(logprob)))
+                        row["verifier_raw_score"] = float(verifier_stats.get("raw_score", row["verifier_score"]))
+                        row["score_tokens"] = int(verifier_stats.get("tokens", 0))
+                        if verifier_stats.get("ll_yes") is not None:
+                            row["ll_yes"] = float(verifier_stats.get("ll_yes"))
+                        if verifier_stats.get("ll_no") is not None:
+                            row["ll_no"] = float(verifier_stats.get("ll_no"))
+                        if verifier_stats.get("best_yes_variant"):
+                            row["best_yes_variant"] = verifier_stats.get("best_yes_variant")
+                        if verifier_stats.get("best_no_variant"):
+                            row["best_no_variant"] = verifier_stats.get("best_no_variant")
+                        if verifier_stats.get("candidate_source"):
+                            row["candidate_source"] = verifier_stats.get("candidate_source")
+                        if verifier_stats.get("candidate_preview"):
+                            row["candidate_preview"] = verifier_stats.get("candidate_preview")
+                        if verifier_stats.get("candidate_tokens_len") is not None:
+                            row["candidate_tokens_len"] = int(verifier_stats.get("candidate_tokens_len"))
+                        if verifier_stats.get("prompt_suffix_tokens_len") is not None:
+                            row["prompt_suffix_tokens_len"] = int(verifier_stats.get("prompt_suffix_tokens_len"))
+                        if verifier_stats.get("truncated_for_budget") is not None:
+                            row["truncated_for_budget"] = bool(verifier_stats.get("truncated_for_budget"))
                     debug_rows.append(row)
 
             self._append_loglikelihood_debug_rows(debug_rows)
@@ -2872,6 +3445,7 @@ class NativeCausalLM(TemplateLM):
         self._active_loglikelihood_docs = [getattr(r, "doc", None) for r in requests]
         self._active_loglikelihood_task_names = [getattr(r, "task_name", None) for r in requests]
         self._active_loglikelihood_doc_ids = [getattr(r, "doc_id", None) for r in requests]
+        self._active_loglikelihood_choice_idxs = [getattr(r, "idx", None) for r in requests]
         try:
             new_reqs: List[Tuple[Tuple[str, str], List[int], List[int]]] = []
             for req in requests:
@@ -2902,6 +3476,7 @@ class NativeCausalLM(TemplateLM):
             self._active_loglikelihood_docs = None
             self._active_loglikelihood_task_names = None
             self._active_loglikelihood_doc_ids = None
+            self._active_loglikelihood_choice_idxs = None
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> List[float]:
         results: List[float] = []
@@ -3123,7 +3698,7 @@ class NativeCausalLM(TemplateLM):
                     else:
                         clip_notes.append(None)
                     tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
-                    embeds.append(self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype))
+                    embeds.append(_token_embed(self.model, tok_tensor).to(dtype=self._dtype))
                     gkwargs.append(gk)
                     
                 valid_indices = [i for i, e in enumerate(embeds) if e is not None]
@@ -4126,7 +4701,7 @@ class NativeCausalLM(TemplateLM):
             
 
             tok_tensor = torch.tensor(tokens, device=self.device, dtype=torch.long)
-            embeds = self.model.tok_embeddings(tok_tensor).to(self._dtype)
+            embeds = _token_embed(self.model, tok_tensor).to(self._dtype)
             if comp_blocks:
                 comp_concat = torch.cat(comp_blocks, dim=0)
                 comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
@@ -4354,7 +4929,7 @@ class NativeCausalLM(TemplateLM):
                         meta_prefix_lens.append(0)
                         continue
                     tok_tensor = torch.tensor(prefix_tokens, device=self.device, dtype=torch.long)
-                    embeds[i] = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
+                    embeds[i] = _token_embed(self.model, tok_tensor).to(dtype=self._dtype)
                     meta_n_spans.append(int(ret.get("n_spans", 0)))
                     meta_flat_lens.append(int(ret.get("total_encoder_tokens", 0)))
                     meta_slots.append(int(ret.get("total_comp_slots", 0)))
@@ -4386,7 +4961,7 @@ class NativeCausalLM(TemplateLM):
                 if not dec_tokens:
                     continue
                 tok_tensor = torch.tensor(dec_tokens, device=self.device, dtype=torch.long)
-                embeds[i] = self.model.tok_embeddings(tok_tensor).to(dtype=self._dtype)
+                embeds[i] = _token_embed(self.model, tok_tensor).to(dtype=self._dtype)
                 meta_comp_masks[i] = [False] * len(dec_tokens)
                 meta_prefix_lens[i] = len(dec_tokens)
             meta = {
@@ -4568,7 +5143,7 @@ class NativeCausalLM(TemplateLM):
                         f"({int(prefix_t.numel())}) for sample {i}."
                     )
 
-                pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+                pe = _token_embed(self.model, prefix_t).to(dtype=self._dtype)
                 if total_comp_slots > 0:
                     mask_slots = int(comp_mask_t.sum().item())
                     if mask_slots != total_comp_slots:
@@ -4776,7 +5351,7 @@ class NativeCausalLM(TemplateLM):
 
                 prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
                 comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
-                pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+                pe = _token_embed(self.model, prefix_t).to(dtype=self._dtype)
 
                 if slots > 0:
                     mask_slots = int(comp_mask_t.sum().item())
@@ -4963,7 +5538,7 @@ class NativeCausalLM(TemplateLM):
             prefix_t = torch.tensor(prefix, device=self.device, dtype=torch.long)
             comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
             
-            pe = self.model.tok_embeddings(prefix_t).to(dtype=self._dtype)
+            pe = _token_embed(self.model, prefix_t).to(dtype=self._dtype)
 
             if slots > 0:
                 mask_slots = int(comp_mask_t.sum().item())
@@ -5060,6 +5635,27 @@ class NativeCausalLM(TemplateLM):
         pbar = tqdm(iterator, disable=disable_tqdm or self.rank != 0, desc="native loglikelihood (compress)")
         for batch_start in pbar:
             chunk = requests[batch_start : batch_start + bs]
+            use_mcq_verifier = self._use_mcq_verifier()
+            docs_slice: List[Optional[dict]] = [None] * len(chunk)
+            choice_idxs_slice: List[Optional[int]] = [None] * len(chunk)
+            if use_mcq_verifier:
+                try:
+                    if self._active_loglikelihood_docs:
+                        for bi in range(len(chunk)):
+                            gi = batch_start + bi
+                            if gi < len(self._active_loglikelihood_docs):
+                                v = self._active_loglikelihood_docs[gi]
+                                docs_slice[bi] = v if isinstance(v, dict) else None
+                    if self._active_loglikelihood_choice_idxs:
+                        for bi in range(len(chunk)):
+                            gi = batch_start + bi
+                            if gi < len(self._active_loglikelihood_choice_idxs):
+                                cidx = self._active_loglikelihood_choice_idxs[gi]
+                                if cidx is not None:
+                                    choice_idxs_slice[bi] = int(cidx)
+                except Exception:
+                    # Keep verifier best-effort; fall back to continuation-only candidate building.
+                    pass
             # Build prefix prompt_embeds (memory blocks + optional BOQ) via the shared helper,
             # then score only the continuation tokens.
             prompt_tokens_override: List[List[int]] = [ctx for (_, ctx, _) in chunk]
@@ -5124,11 +5720,15 @@ class NativeCausalLM(TemplateLM):
                     row = {
                         "request_index": batch_start + i,
                         "mode": "compress_answer",
+                        "mcq_score_mode": self._mcq_score_mode,
                         "cont_len": cont_len,
                         "logprob": logprob,
                         "greedy": greedy,
                         "ppl": ppl,
                     }
+                    if use_mcq_verifier:
+                        row["verifier_score_mode"] = self._active_verifier_score_mode()
+                        row["verifier_apply_norm"] = self._verifier_apply_norm
                     try:
                         raw_cont = chunk[i][0][1] if chunk[i] and chunk[i][0] and len(chunk[i][0]) > 1 else ""
                     except Exception:
@@ -5150,6 +5750,28 @@ class NativeCausalLM(TemplateLM):
                     if loss is not None:
                         row["loss"] = loss
                     if score_info is not None:
+                        if score_info.get("metric") == "verifier":
+                            row["verifier_score"] = float(score_info.get("score", logprob))
+                            row["verifier_raw_score"] = float(score_info.get("raw_score", row["verifier_score"]))
+                            row["verifier_tokens"] = int(score_info.get("tokens", 0))
+                            if score_info.get("ll_yes") is not None:
+                                row["ll_yes"] = float(score_info.get("ll_yes"))
+                            if score_info.get("ll_no") is not None:
+                                row["ll_no"] = float(score_info.get("ll_no"))
+                            if score_info.get("best_yes_variant"):
+                                row["best_yes_variant"] = score_info.get("best_yes_variant")
+                            if score_info.get("best_no_variant"):
+                                row["best_no_variant"] = score_info.get("best_no_variant")
+                            if score_info.get("candidate_source"):
+                                row["candidate_source"] = score_info.get("candidate_source")
+                            if score_info.get("candidate_preview"):
+                                row["candidate_preview"] = score_info.get("candidate_preview")
+                            if score_info.get("candidate_tokens_len") is not None:
+                                row["candidate_tokens_len"] = int(score_info.get("candidate_tokens_len"))
+                            if score_info.get("prompt_suffix_tokens_len") is not None:
+                                row["prompt_suffix_tokens_len"] = int(score_info.get("prompt_suffix_tokens_len"))
+                            if score_info.get("truncated_for_budget") is not None:
+                                row["truncated_for_budget"] = bool(score_info.get("truncated_for_budget"))
                         row["score_tokens"] = int(score_info.get("tokens", 0))
                         if "windows" in score_info:
                             row["windows"] = int(score_info.get("windows") or 0)
@@ -5354,7 +5976,7 @@ class NativeCausalLM(TemplateLM):
                 if suffix:
                     st = torch.tensor(list(suffix), device=self.device, dtype=torch.long)
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
-                        se = self.model.tok_embeddings(st).to(dtype=self._dtype)
+                        se = _token_embed(self.model, st).to(dtype=self._dtype)
                     suffix_embeds_list.append(se)
                 else:
                     suffix_embeds_list.append(torch.empty((0, d_model), device=self.device, dtype=self._dtype))
@@ -5370,6 +5992,8 @@ class NativeCausalLM(TemplateLM):
             valid_map: List[int] = []
             skip_reasons: List[Optional[str]] = [None] * len(chunk)
             score_stats_by_idx: Dict[int, Dict[str, Any]] = {}
+            rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
+            rows_per_chunk = max(8, min(int(rows_per_chunk), 512))
 
             for i in nonempty_idxs:
                 cont = cont_tokens_list[i]
@@ -5386,10 +6010,6 @@ class NativeCausalLM(TemplateLM):
                 pe = torch.cat([pe0, suffix_e], dim=0) if suffix_e.numel() else pe0
                 prefix_len = int(pe.shape[0])
 
-                if prefix_len + cont_len > decoder_budget:
-                    skip_reasons[i] = "length_overflow"
-                    continue
-
                 # compression_token_mask: True for placeholder slots in memory blocks, False elsewhere.
                 if prefix_comp_masks_list is not None and prefix_comp_masks_list[i] is not None:
                     comp_mask_prefix = prefix_comp_masks_list[i]
@@ -5403,9 +6023,91 @@ class NativeCausalLM(TemplateLM):
                     skip_reasons[i] = "comp_mask_mismatch"
                     continue
 
+                if use_mcq_verifier:
+                    try:
+                        pair = chunk[i][0]
+                        cont_str = pair[1] if pair and len(pair) > 1 else ""
+                    except Exception:
+                        cont_str = ""
+                    candidate_tokens, candidate_meta = self._build_verifier_candidate_tokens(
+                        continuation_tokens=cont,
+                        continuation_str=str(cont_str),
+                        doc=docs_slice[i],
+                        choice_idx=choice_idxs_slice[i],
+                    )
+                    suffix_tokens = self._get_verifier_prompt_suffix_tokens()
+                    verify_prefix_tokens = list(candidate_tokens) + list(suffix_tokens)
+                    if not verify_prefix_tokens:
+                        verify_prefix_tokens = list(cont)
+                    vpt = torch.tensor(verify_prefix_tokens, device=self.device, dtype=torch.long)
+                    with torch.autocast(device_type="cuda", dtype=self._dtype):
+                        verify_prefix_embeds = _token_embed(self.model, vpt).to(dtype=self._dtype)
+                    base_embeds = torch.cat([pe, verify_prefix_embeds], dim=0)
+                    base_comp_mask = torch.cat(
+                        [
+                            base_mask_t,
+                            torch.zeros(
+                                int(vpt.numel()),
+                                device=self.device,
+                                dtype=torch.bool,
+                            ),
+                        ],
+                        dim=0,
+                    )
+
+                    max_verify_len = 1
+                    for _, toks in (self._verifier_yes_variants + self._verifier_no_variants):
+                        if len(toks) > max_verify_len:
+                            max_verify_len = len(toks)
+
+                    truncated_for_budget = False
+                    if int(base_embeds.shape[0]) + max_verify_len > decoder_budget:
+                        keep_base = max(1, int(decoder_budget) - int(max_verify_len))
+                        drop = int(base_embeds.shape[0]) - keep_base
+                        if drop > 0:
+                            base_embeds = base_embeds[drop:]
+                            base_comp_mask = base_comp_mask[drop:]
+                            truncated_for_budget = True
+
+                    verifier_out = self._score_verifier_yes_no_from_base(
+                        base_embeds=base_embeds,
+                        base_comp_mask=base_comp_mask,
+                        decoder_budget=decoder_budget,
+                        rows_per_chunk=rows_per_chunk,
+                    )
+                    raw_score = float(verifier_out.get("score", float("-inf")))
+                    score = _apply_verifier_score_norm(
+                        raw_score,
+                        candidate_tokens=len(candidate_tokens),
+                        mode=self._verifier_apply_norm,
+                    )
+                    greedy = bool(verifier_out.get("greedy", False))
+                    chunk_results[i] = (float(score), greedy)
+                    score_stats_by_idx[i] = {
+                        "metric": "verifier",
+                        "score": float(score),
+                        "raw_score": float(raw_score),
+                        "tokens": int(max(1, len(candidate_tokens))),
+                        "ll_yes": verifier_out.get("ll_yes"),
+                        "ll_no": verifier_out.get("ll_no"),
+                        "best_yes_variant": verifier_out.get("best_yes_variant"),
+                        "best_no_variant": verifier_out.get("best_no_variant"),
+                        "candidate_source": candidate_meta.get("source"),
+                        "candidate_preview": candidate_meta.get("candidate_preview"),
+                        "candidate_tokens_len": int(len(candidate_tokens)),
+                        "prompt_suffix_tokens_len": int(len(suffix_tokens)),
+                        "truncated_for_budget": bool(truncated_for_budget),
+                        "greedy": greedy,
+                    }
+                    continue
+
+                if prefix_len + cont_len > decoder_budget:
+                    skip_reasons[i] = "length_overflow"
+                    continue
+
                 cont_t = torch.tensor(cont, device=self.device, dtype=torch.long)
                 with torch.autocast(device_type="cuda", dtype=self._dtype):
-                    cont_e = self.model.tok_embeddings(cont_t).to(dtype=self._dtype)
+                    cont_e = _token_embed(self.model, cont_t).to(dtype=self._dtype)
 
                 full_embeds = torch.cat([pe, cont_e], dim=0)
                 total_len = int(full_embeds.shape[0])
@@ -5456,9 +6158,6 @@ class NativeCausalLM(TemplateLM):
                 _append_compress_debug_rows(prefix_embeds_list, meta_n_spans, score_stats_by_idx, skip_reasons)
                 res.extend(chunk_results)
                 continue
-
-            rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
-            rows_per_chunk = max(8, min(int(rows_per_chunk), 512))
 
             score_out = self._forward_score_continuations(
                 seq_embeds=seq_embeds,
@@ -5804,7 +6503,7 @@ class NativeCausalLM(TemplateLM):
                 if add_query and qtoks:
                     q = torch.tensor(qtoks, device=self.device, dtype=torch.long)
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
-                        qe = self.model.tok_embeddings(q).to(dtype=self._dtype)
+                        qe = _token_embed(self.model, q).to(dtype=self._dtype)
                     group_query_embeds.append(qe)
                 else:
                     group_query_embeds.append(torch.empty((0, d_model), device=self.device, dtype=self._dtype))
@@ -5820,7 +6519,7 @@ class NativeCausalLM(TemplateLM):
                 with torch.autocast(device_type="cuda", dtype=self._dtype):
                     if recon:
                         rt = torch.tensor(recon, device=self.device, dtype=torch.long)
-                        re = self.model.tok_embeddings(rt).to(dtype=self._dtype)
+                        re = _token_embed(self.model, rt).to(dtype=self._dtype)
                     else:
                         re = torch.empty((0, d_model), device=self.device, dtype=self._dtype)
                 qe = group_query_embeds[gi]
@@ -5835,7 +6534,7 @@ class NativeCausalLM(TemplateLM):
                     continue
                 group_base_masks[gi] = torch.zeros(int(group_base_lens[gi]), device=self.device, dtype=torch.bool)
 
-            rows_per_chunk = int(getattr(self.model.args, "cross_entropy_chunk", 8)) * 16
+            rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
             rows_per_chunk = max(8, min(int(rows_per_chunk), 512))
 
             option_stats: Dict[int, Dict[str, Any]] = {}
@@ -5884,7 +6583,7 @@ class NativeCausalLM(TemplateLM):
                         continue
                     cont_t = torch.tensor(cont, device=self.device, dtype=torch.long)
                     with torch.autocast(device_type="cuda", dtype=self._dtype):
-                        cont_e = self.model.tok_embeddings(cont_t).to(dtype=self._dtype)
+                        cont_e = _token_embed(self.model, cont_t).to(dtype=self._dtype)
                     seq = torch.cat([base, cont_e], dim=0)
                     seq_embeds.append(seq)
                     base_len = int(group_base_lens[gi])

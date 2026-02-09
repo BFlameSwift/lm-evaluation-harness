@@ -37,8 +37,56 @@ def postprocess_pred(prediction: list[str]) -> list[str]:
     return res
 
 
+def _normalize_babilong_config_name(max_seq_lengths) -> str:
+    """
+    Babilong dataset config expects a *single* split name like "0k"/"2k"/"128k".
+    The harness metadata may pass list/int/comma-separated forms; normalize robustly.
+    """
+    value = max_seq_lengths
+
+    if value is None:
+        return "0k"
+
+    # e.g. [2048, 4096, ...] -> use first length
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "0k"
+        value = value[0]
+
+    # e.g. "0k,1k,2k" -> use first token
+    if isinstance(value, str) and "," in value:
+        first = value.split(",")[0].strip()
+        value = first if first else "0k"
+
+    # e.g. 2048 -> "2k"
+    if isinstance(value, int):
+        if value <= 0:
+            return "0k"
+        if value % 1024 == 0:
+            return f"{value // 1024}k"
+        return str(value)
+
+    # e.g. "2048" -> "2k"
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return "0k"
+        if s.endswith("k"):
+            return s
+        if s.isdigit():
+            n = int(s)
+            if n <= 0:
+                return "0k"
+            if n % 1024 == 0:
+                return f"{n // 1024}k"
+            return s
+        return s
+
+    return str(value)
+
+
 def load_dataset(**kwargs):
-    config_name = kwargs.get("max_seq_lengths", "0k")
+    config_name = _normalize_babilong_config_name(kwargs.get("max_seq_lengths", "0k"))
 
     # Get specific qa split
     qa_split = kwargs.get("qa_split")
