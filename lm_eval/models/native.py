@@ -5983,6 +5983,9 @@ class NativeCausalLM(TemplateLM):
             if not ctx_tokens:
                 return [], []
             force_min_span = bool(getattr(self, "_compress_answer_force_min_span", True))
+            min_suffix_tokens = int(getattr(self, "_compress_answer_min_suffix_tokens", 128) or 0)
+            if min_suffix_tokens < 0:
+                min_suffix_tokens = 0
             max_len = int(self.max_length)
             span_cost = num_comp + 2  # decoder cost per span: BOM + slots + EOM
             saving = max_mem_span_len - span_cost
@@ -6010,8 +6013,11 @@ class NativeCausalLM(TemplateLM):
             # In compress_answer mode, keep behavior deterministic: if we have any context,
             # force at least one compressed span so the mode is semantically different from decoder.
             # This primarily affects short MCQ prompts (e.g., MMLU) where raw_len < max_mem_span_len.
+            # Keep a raw suffix to preserve near-answer semantics.
             if force_min_span and raw_len > 0 and raw_comp_len <= 0:
-                raw_comp_len = min(raw_len, max_mem_span_len)
+                # Preserve at least `min_suffix_tokens` raw tokens when possible.
+                max_head_len = max(1, raw_len - min_suffix_tokens)
+                raw_comp_len = min(max_mem_span_len, max_head_len)
             return ctx_tokens[:raw_comp_len], ctx_tokens[raw_comp_len:]
         
         
