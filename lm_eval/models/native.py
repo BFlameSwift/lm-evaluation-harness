@@ -5982,11 +5982,14 @@ class NativeCausalLM(TemplateLM):
         def _split_ctx_for_compression(ctx_tokens: List[int], cont_len: int) -> Tuple[List[int], List[int]]:
             if not ctx_tokens:
                 return [], []
+            force_min_span = bool(getattr(self, "_compress_answer_force_min_span", True))
             max_len = int(self.max_length)
             span_cost = num_comp + 2  # decoder cost per span: BOM + slots + EOM
             saving = max_mem_span_len - span_cost
             if saving <= 0:
                 # No compression benefit; let the span selector drop old spans.
+                if force_min_span:
+                    return ctx_tokens, []
                 return ctx_tokens, []
 
             raw_len = len(ctx_tokens)
@@ -6004,6 +6007,11 @@ class NativeCausalLM(TemplateLM):
                 k = int(math.ceil(need / float(saving)))
             k = max(0, min(k, raw_len // max_mem_span_len))
             raw_comp_len = k * max_mem_span_len
+            # In compress_answer mode, keep behavior deterministic: if we have any context,
+            # force at least one compressed span so the mode is semantically different from decoder.
+            # This primarily affects short MCQ prompts (e.g., MMLU) where raw_len < max_mem_span_len.
+            if force_min_span and raw_len > 0 and raw_comp_len <= 0:
+                raw_comp_len = min(raw_len, max_mem_span_len)
             return ctx_tokens[:raw_comp_len], ctx_tokens[raw_comp_len:]
         
         
@@ -6243,6 +6251,25 @@ class NativeCausalLM(TemplateLM):
                             file=sys.stderr,
                         )
                         self._warned_doc_split_fallback = True
+
+                if (
+                    split_context_list is not None
+                    and split_query_list is not None
+                    and len(split_context_list) == len(chunk)
+                    and len(split_query_list) == len(chunk)
+                ):
+                    # For MCQ tasks like MMLU, structured doc split can place almost all
+                    # prompt content into `query` with empty `context`. In compress_answer
+                    # mode this leads to n_spans=0 (no compression applied).
+                    # When enabled, fall back to prompt-token compression path so we always
+                    # compress at least one span for non-empty prompts.
+                    force_min_span = bool(getattr(self, "_compress_answer_force_min_span", True))
+                    if force_min_span:
+                        has_any_ctx = any(str(c or "").strip() for c in split_context_list)
+                        if not has_any_ctx:
+                            split_context_list = None
+                            split_query_list = None
+                            split_source_by_idx = ["doc_split_empty_context_fallback"] * len(chunk)
 
                 if (
                     split_context_list is not None
