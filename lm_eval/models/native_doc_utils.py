@@ -212,7 +212,23 @@ def split_doc_and_query(
             ret_assistant_prefix_list.append("")
 
         else:
-            raise ValueError(f"Unsupported task: {task_name}")
+            # Fallback for tasks without a dedicated split rule (e.g. standard
+            # MCQ tasks like MMLU/ARC/HellaSwag). In these cases, treating the
+            # whole rendered prompt as query and leaving context empty avoids
+            # compressing short question/options prompts into memory slots.
+            # This keeps `compress_answer` behavior stable for non-long-context
+            # tasks while preserving long-context task-specific branches above.
+            question_text = doc.get(question_key, "")
+            if not isinstance(question_text, str):
+                question_text = str(question_text)
+            query_text = (prompt or "").strip()
+            if not query_text:
+                query_text = question_text.strip()
+
+            ret_question_list.append(question_text.strip())
+            ret_query_list.append(query_text)
+            ret_context_list.append("")
+            ret_assistant_prefix_list.append("")
 
     return {
         "context_list": ret_context_list,
