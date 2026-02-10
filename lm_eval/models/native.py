@@ -207,6 +207,15 @@ def _parse_mcq_verifier_prompt_style(name: Optional[str]) -> str:
     return mode
 
 
+def _parse_mcq_verifier_candidate_style(name: Optional[str]) -> str:
+    if name is None:
+        return "auto"
+    mode = str(name).strip().lower()
+    if mode not in {"auto", "with_label", "text_only"}:
+        raise ValueError(f"Unsupported mcq_verifier_candidate_style: {name}")
+    return mode
+
+
 def _parse_mcq_verifier_tie_break(name: Optional[str]) -> str:
     if name is None:
         return "none"
@@ -339,7 +348,25 @@ def _build_verifier_variant_texts(seed: Optional[str], fallback: str) -> List[st
     return out
 
 
-def _build_choice_verifier_prompt_text(label: str, opt_text: str, prompt_style: str = "minimal") -> str:
+def _normalize_verifier_question_context(text: Optional[str], max_chars: int = 1200) -> str:
+    ctx = str(text or "").strip()
+    if not ctx:
+        return ""
+    # Keep spacing readable while preserving line structure when available.
+    ctx = re.sub(r"[ \t]+\n", "\n", ctx)
+    ctx = re.sub(r"\n{3,}", "\n\n", ctx)
+    if len(ctx) > max_chars:
+        ctx = ctx[-max_chars:]
+    return ctx
+
+
+def _build_choice_verifier_prompt_text(
+    label: str,
+    opt_text: str,
+    prompt_style: str = "minimal",
+    question_context: str = "",
+    options_context: str = "",
+) -> str:
     label_s = str(label or "").strip()
     opt_s = str(opt_text or "").strip()
     if label_s and opt_s:
@@ -349,12 +376,87 @@ def _build_choice_verifier_prompt_text(label: str, opt_text: str, prompt_style: 
     else:
         candidate = opt_s
     style = str(prompt_style or "minimal").strip().lower()
+    qctx = _normalize_verifier_question_context(question_context)
+    octx = _normalize_verifier_question_context(options_context)
     if style == "explicit_yesno":
+        if qctx:
+            if octx:
+                return (
+                    "Judge whether the following candidate answer is correct.\n"
+                    "Question Context:\n"
+                    f"{qctx}\n"
+                    "Options:\n"
+                    f"{octx}\n"
+                    f"Candidate: {candidate}\n"
+                    "Question: Is this candidate answer correct for the question context above?\n"
+                    "Reply with Yes or No.\n"
+                    "Answer:"
+                )
+            return (
+                "Judge whether the following candidate answer is correct.\n"
+                "Question Context:\n"
+                f"{qctx}\n"
+                f"Candidate: {candidate}\n"
+                "Question: Is this candidate answer correct for the question context above?\n"
+                "Reply with Yes or No.\n"
+                "Answer:"
+            )
         return (
             "Judge whether the following candidate answer is correct.\n"
-            f"Candidate: {candidate}\n"
+            + (f"Options:\n{octx}\n" if octx else "")
+            + f"Candidate: {candidate}\n"
+            + "Question: Is this candidate answer correct?\n"
+            + "Reply with Yes or No.\n"
+            "Answer:"
         )
-    return f"Candidate: {candidate}\n"
+    if qctx:
+        if octx:
+            return (
+                f"Question Context:\n{qctx}\n"
+                f"Options:\n{octx}\n"
+                f"Candidate: {candidate}\n"
+                "Is this candidate answer correct? Answer:"
+            )
+        return (
+            f"Question Context:\n{qctx}\n"
+            f"Candidate: {candidate}\n"
+            "Is this candidate answer correct? Answer:"
+        )
+    if octx:
+        return (
+            f"Options:\n{octx}\n"
+            f"Candidate: {candidate}\n"
+            "Is this candidate answer correct? Answer:"
+        )
+    return f"Candidate: {candidate}\nIs this candidate answer correct? Answer:"
+
+
+def _extract_options_block_from_prompt_text(prompt_text: Optional[str], max_lines: int = 12) -> str:
+    text = str(prompt_text or "")
+    if not text:
+        return ""
+    lines = text.splitlines()
+    out: List[str] = []
+    seen = set()
+    for line in lines:
+        s = str(line).strip()
+        if not s:
+            continue
+        m = re.match(r"^\(?\s*([A-Z])\s*\)?\s*[\.\):\-]\s*(.+)$", s)
+        if not m:
+            continue
+        label = m.group(1).upper().strip()
+        body = re.sub(r"\s+", " ", m.group(2)).strip()
+        if not body:
+            continue
+        norm = (label, body.lower())
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(f"({label}) {body}")
+        if len(out) >= int(max_lines):
+            break
+    return "\n".join(out)
 
 
 def _coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional[int]:
@@ -631,6 +733,7 @@ class NativeCausalLM(TemplateLM):
         verifier_apply_norm: str = "none",
         verifier_prompt_suffix: Optional[str] = None,
         mcq_verifier_prompt_style: str = "minimal",
+        mcq_verifier_candidate_style: str = "auto",
         mcq_verifier_tie_break: str = "none",
         # NIAH generate_until defaults
         niah_use_bor: bool = False,
@@ -706,6 +809,7 @@ class NativeCausalLM(TemplateLM):
         self._active_loglikelihood_task_names: Optional[List[Optional[str]]] = None
         self._active_loglikelihood_doc_ids: Optional[List[Optional[int]]] = None
         self._active_loglikelihood_choice_idxs: Optional[List[Optional[int]]] = None
+        self._warned_doc_split_fallback: bool = False
         
         self._active_context_key = "context"
         self._active_question_key = "question"
@@ -773,11 +877,17 @@ class NativeCausalLM(TemplateLM):
         self._verifier_apply_norm = _parse_verifier_apply_norm(resolved_verifier_apply_norm)
         self._verifier_yes_variant_texts = _build_verifier_variant_texts(verifier_yes_token, fallback="Yes")
         self._verifier_no_variant_texts = _build_verifier_variant_texts(verifier_no_token, fallback="No")
-        self._verifier_prompt_suffix = (
-            _normalize_optional_text(verifier_prompt_suffix)
-            or "\nIs this correct? Answer with Yes or No.\n"
-        )
         self._mcq_verifier_prompt_style = _parse_mcq_verifier_prompt_style(mcq_verifier_prompt_style)
+        # `explicit_yesno` prompts already end with a concrete "Answer:" slot.
+        # Appending the legacy suffix duplicates the question and hurts discrimination.
+        suffix_norm = _normalize_optional_text(verifier_prompt_suffix)
+        if suffix_norm is None:
+            if self._mcq_verifier_prompt_style == "explicit_yesno":
+                suffix_norm = ""
+            else:
+                suffix_norm = "\nIs this correct? Answer with Yes or No.\n"
+        self._verifier_prompt_suffix = suffix_norm
+        self._mcq_verifier_candidate_style = _parse_mcq_verifier_candidate_style(mcq_verifier_candidate_style)
         self._mcq_verifier_tie_break = _parse_mcq_verifier_tie_break(mcq_verifier_tie_break)
         self._verifier_prompt_suffix_tokens: Optional[List[int]] = None
         self._verifier_yes_variants: List[Tuple[str, List[int]]] = []
@@ -2057,6 +2167,50 @@ class NativeCausalLM(TemplateLM):
             return str(value) if value is not None else None
         return None
 
+    @staticmethod
+    def _choice_label_from_index(idx: int) -> str:
+        if idx < 26:
+            return chr(ord("A") + idx)
+        return str(idx + 1)
+
+    def _resolve_choice_options_from_doc(self, doc: Optional[dict]) -> str:
+        if not isinstance(doc, dict):
+            return ""
+
+        lines: List[str] = []
+
+        def _push(label: str, text: Any) -> None:
+            s = str(text) if text is not None else ""
+            s = re.sub(r"\s+", " ", s).strip()
+            if not s:
+                return
+            if len(s) > 240:
+                s = s[:240]
+            lines.append(f"({label}) {s}")
+
+        choices = doc.get("choices")
+        if isinstance(choices, list):
+            for i, v in enumerate(choices[:12]):
+                _push(self._choice_label_from_index(i), v)
+        elif isinstance(choices, dict):
+            text_list = choices.get("text")
+            label_list = choices.get("label")
+            if isinstance(text_list, list):
+                for i, v in enumerate(text_list[:12]):
+                    label = None
+                    if isinstance(label_list, list) and i < len(label_list):
+                        label = str(label_list[i]).strip()
+                    if not label:
+                        label = self._choice_label_from_index(i)
+                    _push(label, v)
+        else:
+            endings = doc.get("endings")
+            if isinstance(endings, list):
+                for i, v in enumerate(endings[:12]):
+                    _push(self._choice_label_from_index(i), v)
+
+        return "\n".join(lines)
+
     def _build_verifier_candidate_tokens(
         self,
         *,
@@ -2064,12 +2218,16 @@ class NativeCausalLM(TemplateLM):
         continuation_str: str,
         doc: Optional[dict],
         choice_idx: Optional[int],
+        context_tokens: Optional[List[int]] = None,
+        context_text: Optional[str] = None,
     ) -> Tuple[List[int], Dict[str, Any]]:
         choice_text = self._resolve_choice_text_from_doc(doc, choice_idx)
         label_text = str(continuation_str or "").strip()
+        candidate_style = str(getattr(self, "_mcq_verifier_candidate_style", "auto") or "auto").strip().lower()
         meta: Dict[str, Any] = {
             "choice_idx": int(choice_idx) if choice_idx is not None else None,
             "source": "continuation",
+            "candidate_style": candidate_style,
         }
         label_for_prompt = ""
         if label_text:
@@ -2078,6 +2236,15 @@ class NativeCausalLM(TemplateLM):
                 label_clean = label_clean[1:-1].strip()
             if len(label_clean) <= 8:
                 label_for_prompt = label_clean
+
+        if (not choice_text) and isinstance(doc, dict):
+            label_u = str(label_for_prompt or "").strip().upper()
+            if len(label_u) == 1 and ("A" <= label_u <= "Z"):
+                idx_from_label = ord(label_u) - ord("A")
+                choice_from_label = self._resolve_choice_text_from_doc(doc, idx_from_label)
+                if choice_from_label:
+                    choice_text = choice_from_label
+                    meta["choice_idx_from_label"] = int(idx_from_label)
 
         if choice_text:
             candidate_opt = str(choice_text).strip()
@@ -2088,6 +2255,13 @@ class NativeCausalLM(TemplateLM):
                     candidate_opt,
                     flags=re.IGNORECASE,
                 )
+            # For MCQ letter continuations (A/B/C/D), including the label in verifier prompts
+            # can introduce a strong positional prior. `auto` defaults to text-only in this case.
+            if candidate_style == "text_only":
+                label_for_prompt = ""
+            elif candidate_style == "auto":
+                if label_for_prompt and len(label_for_prompt) == 1 and label_for_prompt.isalpha():
+                    label_for_prompt = ""
             meta["source"] = "doc_choice"
         else:
             candidate_opt = label_text
@@ -2097,10 +2271,69 @@ class NativeCausalLM(TemplateLM):
             meta["source"] = "continuation_tokens"
             return list(continuation_tokens), meta
 
+        question_context = ""
+        if isinstance(doc, dict):
+            for key in ("question", "query", "prompt", "input"):
+                value = doc.get(key)
+                if isinstance(value, str) and value.strip():
+                    question_context = value.strip()
+                    break
+            if not question_context:
+                value = doc.get("context")
+                if isinstance(value, str) and value.strip():
+                    question_context = value.strip()
+        if not question_context and context_text:
+            question_context = str(context_text).strip()
+        if not question_context and context_tokens:
+            try:
+                tail_tokens = list(context_tokens)[-512:]
+                question_context = self.tok_decode_w_special_tokens(tail_tokens)
+            except Exception:
+                try:
+                    question_context = self._tokenizer.decode(list(context_tokens)[-512:])
+                except Exception:
+                    question_context = ""
+
+        # For MCQ verifier scoring, keep an excerpt from the original prompt so
+        # the verifier can inherit few-shot/task formatting cues from the
+        # baseline LL prompt, not only the structured question field.
+        prompt_tail = ""
+        if context_tokens:
+            try:
+                tail_tokens = list(context_tokens)[-512:]
+                prompt_tail = self.tok_decode_w_special_tokens(tail_tokens)
+            except Exception:
+                try:
+                    prompt_tail = self._tokenizer.decode(list(context_tokens)[-512:])
+                except Exception:
+                    prompt_tail = ""
+        prompt_tail = _normalize_verifier_question_context(prompt_tail, max_chars=480)
+        if question_context:
+            if prompt_tail and prompt_tail not in question_context:
+                question_context = _normalize_verifier_question_context(
+                    f"{question_context}\n\nPrompt Excerpt:\n{prompt_tail}",
+                    max_chars=1200,
+                )
+        else:
+            question_context = prompt_tail
+        question_context = _normalize_verifier_question_context(question_context)
+        options_context = self._resolve_choice_options_from_doc(doc)
+        if not options_context and context_text:
+            options_context = _extract_options_block_from_prompt_text(context_text)
+
+        # Safety fallback: when both question/options context are unavailable, a verifier
+        # prompt built from only "(A)/(B)/(C)/(D) option text" is often degenerate and can
+        # push yes/no scoring below random. Fall back to continuation tokens in this case.
+        if not question_context and not options_context:
+            meta["source"] = "continuation_tokens_no_context"
+            return list(continuation_tokens), meta
+
         prompt_text = "\n" + _build_choice_verifier_prompt_text(
             label_for_prompt,
             candidate_opt,
             prompt_style=getattr(self, "_mcq_verifier_prompt_style", "minimal"),
+            question_context=question_context,
+            options_context=options_context,
         )
         cand_tokens = self._tokenizer.encode(prompt_text, bos=False, eos=False)
         if not cand_tokens:
@@ -2108,6 +2341,8 @@ class NativeCausalLM(TemplateLM):
             return list(continuation_tokens), meta
         preview = prompt_text[:200]
         meta["candidate_preview"] = preview
+        if question_context:
+            meta["question_context_len"] = int(len(question_context))
         return cand_tokens, meta
 
     def _score_verifier_yes_no_from_base(
@@ -2176,16 +2411,63 @@ class NativeCausalLM(TemplateLM):
         if len(seq) <= 1:
             return {"ll": float("-inf"), "greedy": False}
 
-        inp = torch.tensor(seq[:-1], device=self.device, dtype=torch.long).unsqueeze(0)
-        tgt = torch.tensor(seq[1:], device=self.device, dtype=torch.long)
-        logprobs = self._model_logits(self._model_call(inp))
-        tail = int(len(cont))
-        tail_logprobs = logprobs[0, -tail:, :]
-        tail_tgt = tgt[-tail:]
-        token_logprobs = tail_logprobs.gather(-1, tail_tgt.unsqueeze(-1)).squeeze(-1)
-        ll = float(token_logprobs.sum().item())
-        greedy = bool((tail_logprobs.argmax(dim=-1) == tail_tgt).all().item())
-        return {"ll": ll, "greedy": greedy}
+        seq_tokens = torch.tensor(seq, device=self.device, dtype=torch.long)
+        cont_targets = torch.tensor(cont, device=self.device, dtype=torch.long)
+        prefix_len = int(len(base))
+        if prefix_len <= 0:
+            return {"ll": float("-inf"), "greedy": False}
+
+        # Native compressor-backed models expose fused layer stacks + norm and can
+        # use our chunked continuation scorer directly.
+        if hasattr(self.model, "layers") and hasattr(self.model, "norm"):
+            with torch.autocast(device_type="cuda", dtype=self._dtype):
+                seq_embeds = _token_embed(self.model, seq_tokens).to(dtype=self._dtype)
+            seq_comp_mask = torch.zeros(int(seq_tokens.numel()), device=self.device, dtype=torch.bool)
+
+            rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
+            rows_per_chunk = max(8, min(int(rows_per_chunk), 512))
+            out = self._forward_score_continuations(
+                seq_embeds=[seq_embeds],
+                cont_targets=[cont_targets],
+                prefix_lens=[prefix_len],
+                comp_mask_list=[seq_comp_mask],
+                rows_per_chunk=rows_per_chunk,
+            )
+            ps = (out.get("per_sample") or [{}])[0]
+            return {
+                "ll": float(ps.get("ll", float("-inf"))),
+                "greedy": bool(ps.get("greedy", False)),
+            }
+
+        # Generic HF-style fallback (e.g., Qwen3ForCausalLM):
+        # score continuation token-by-token using only the final-step logits to avoid
+        # full-sequence float32 log_softmax materialization.
+        total_ll = 0.0
+        greedy_ok = True
+        ctx = list(base)
+        for tok in cont:
+            if not ctx:
+                return {"ll": float("-inf"), "greedy": False}
+            inp = torch.tensor(ctx, device=self.device, dtype=torch.long).unsqueeze(0)
+            logits = self._model_call(inp)
+            if self._model_parallel_group is not None:
+                from distributed.tensor_parallel import gather_from_model_parallel_region
+
+                logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
+            last = logits[0, -1, :].float()
+            tok_i = int(tok)
+            if tok_i < 0 or tok_i >= int(last.shape[-1]):
+                total_ll = float("-inf")
+                greedy_ok = False
+            elif math.isfinite(total_ll):
+                lse = torch.logsumexp(last, dim=-1)
+                total_ll += float((last[tok_i] - lse).item())
+                if greedy_ok:
+                    greedy_ok = int(last.argmax(dim=-1).item()) == tok_i
+            ctx.append(tok_i)
+            del logits, last
+
+        return {"ll": float(total_ll), "greedy": bool(greedy_ok)}
 
     @torch.no_grad()
     def _score_verifier_yes_no_from_tokens(
@@ -3231,15 +3513,23 @@ class NativeCausalLM(TemplateLM):
         disable_tqdm: bool = False,
         override_bs: Optional[int] = None,
     ) -> List[Tuple[float, bool]]:
+        has_comp = hasattr(self.model, "compression_embeddings")
         # Optional mode: compress the context into memory first, then score the answer.
-        if self._mode == "compress_answer" and hasattr(self.model, "compression_embeddings"):
+        if self._mode == "compress_answer" and has_comp:
             out = self._loglikelihood_tokens_compress_answer(requests, disable_tqdm, override_bs)
 
             return out
-        if self._mode == "reconstruct_first" and hasattr(self.model, "compression_embeddings"):
+        if self._mode == "reconstruct_first" and has_comp:
             out = self._loglikelihood_tokens_reconstruct_first(requests, disable_tqdm)
 
             return out
+        if self._mode in {"compress_answer", "reconstruct_first"} and not has_comp:
+            if (self._distributed_args.rank == 0) and (not getattr(self, "_warned_mode_fallback_to_decoder", False)):
+                print(
+                    f"[native] WARNING: mode={self._mode} requested, but model has no compression embeddings; "
+                    "falling back to decoder LL scoring."
+                )
+                self._warned_mode_fallback_to_decoder = True
 
         res: List[Tuple[float, bool]] = []
         bs = override_bs or self.batch_size
@@ -3310,6 +3600,8 @@ class NativeCausalLM(TemplateLM):
                         continuation_str=str(cont_str),
                         doc=docs_slice[i],
                         choice_idx=choice_idxs_slice[i],
+                        context_tokens=list(chunk[i][1]),
+                        context_text=(chunk[i][0][0] if chunk[i] and chunk[i][0] and len(chunk[i][0]) > 0 else ""),
                     )
                     suffix_tokens = self._get_verifier_prompt_suffix_tokens()
                     base_tokens = list(chunk[i][1]) + list(candidate_tokens) + list(suffix_tokens)
@@ -3388,6 +3680,7 @@ class NativeCausalLM(TemplateLM):
                             "candidate_preview": candidate_meta.get("candidate_preview"),
                             "candidate_tokens_len": int(len(candidate_tokens)),
                             "prompt_suffix_tokens_len": int(len(suffix_tokens)),
+                            "choice_idx_from_label": candidate_meta.get("choice_idx_from_label"),
                             "truncated_for_budget": bool(truncated_for_budget),
                             "tie_break_mode": self._mcq_verifier_tie_break,
                             "greedy": greedy,
@@ -3423,20 +3716,21 @@ class NativeCausalLM(TemplateLM):
                     row = {
                         "request_index": batch_start + i,
                         "mode": "decoder",
+                        "configured_mode": str(self._mode),
                         "mcq_score_mode": self._mcq_score_mode,
                         "cont_len": int(cont_len),
                         "logprob": float(logprob),
                         "greedy": bool(greedy),
                         "ppl": ppl,
                     }
+                    if self._mode in {"compress_answer", "reconstruct_first"} and (not has_comp):
+                        row["compression_fallback"] = "no_compression_embeddings"
                     if use_mcq_verifier:
                         row["verifier_score_mode"] = self._active_verifier_score_mode()
                         row["verifier_apply_norm"] = self._verifier_apply_norm
                         row["mcq_verifier_prompt_style"] = self._mcq_verifier_prompt_style
+                        row["mcq_verifier_candidate_style"] = self._mcq_verifier_candidate_style
                         row["mcq_verifier_tie_break"] = self._mcq_verifier_tie_break
-                    if loss is not None:
-                        row["loss"] = loss
-
                     # Best-effort: include identifiers for easier debugging.
                     try:
                         if self._active_loglikelihood_task_names:
@@ -3453,6 +3747,8 @@ class NativeCausalLM(TemplateLM):
                                 row["choice_idx"] = int(choice_idx)
                     except Exception:
                         pass
+                    if loss is not None:
+                        row["loss"] = loss
 
                     try:
                         raw_cont = chunk[i][0][1] if chunk[i] and chunk[i][0] and len(chunk[i][0]) > 1 else ""
@@ -3503,6 +3799,8 @@ class NativeCausalLM(TemplateLM):
                             row["candidate_tokens_len"] = int(verifier_stats.get("candidate_tokens_len"))
                         if verifier_stats.get("prompt_suffix_tokens_len") is not None:
                             row["prompt_suffix_tokens_len"] = int(verifier_stats.get("prompt_suffix_tokens_len"))
+                        if verifier_stats.get("choice_idx_from_label") is not None:
+                            row["choice_idx_from_label"] = int(verifier_stats.get("choice_idx_from_label"))
                         if verifier_stats.get("truncated_for_budget") is not None:
                             row["truncated_for_budget"] = bool(verifier_stats.get("truncated_for_budget"))
                     debug_rows.append(row)
@@ -5751,17 +6049,21 @@ class NativeCausalLM(TemplateLM):
             if prefix_tokens:
                 cont_tokens_list = [prefix_tokens + list(cont) for cont in cont_tokens_list]
             suffix_tokens_list: List[List[int]] = [[] for _ in range(len(chunk))]
+            split_source_by_idx: List[str] = ["prompt_tokens_override"] * len(chunk)
 
-            
-            # fill decoder prefix embeds, only compress old context and keep new context uncompressed
-            # TODO temp close this feature
-            if self._fill_decoder_prefix_embeds and not getattr(self, "_chat_use_template", False):
+            # Always split non-chat prompts into:
+            # - compressed prefix (older spans),
+            # - raw suffix (latest short context near the answer).
+            #
+            # This avoids over-compressing short MCQ prompts (e.g., MMLU) into a single
+            # memory span, which can degrade both LL and verifier-style yes/no scoring.
+            if not getattr(self, "_chat_use_template", False):
                 prompt_tokens_list, suffix_tokens_list_t = zip(
                     *[_split_ctx_for_compression(p, len(c)) for p, c in zip(prompt_tokens_override, cont_tokens_list)]
                 )
                 prompt_tokens_override = list(prompt_tokens_list)
                 suffix_tokens_list = list(suffix_tokens_list_t)
-            elif getattr(self, "_chat_use_template", False):
+            else:
                 suffix_tokens_list = [[] for _ in range(len(chunk))]
 
 
@@ -5800,6 +6102,7 @@ class NativeCausalLM(TemplateLM):
                     row = {
                         "request_index": batch_start + i,
                         "mode": "compress_answer",
+                        "configured_mode": str(self._mode),
                         "mcq_score_mode": self._mcq_score_mode,
                         "cont_len": cont_len,
                         "logprob": logprob,
@@ -5809,6 +6112,25 @@ class NativeCausalLM(TemplateLM):
                     if use_mcq_verifier:
                         row["verifier_score_mode"] = self._active_verifier_score_mode()
                         row["verifier_apply_norm"] = self._verifier_apply_norm
+                        row["mcq_verifier_prompt_style"] = self._mcq_verifier_prompt_style
+                        row["mcq_verifier_candidate_style"] = self._mcq_verifier_candidate_style
+                        row["mcq_verifier_tie_break"] = self._mcq_verifier_tie_break
+                    # Best-effort: include identifiers for easier debugging.
+                    try:
+                        if self._active_loglikelihood_task_names:
+                            task_name = self._active_loglikelihood_task_names[batch_start + i]
+                            if task_name:
+                                row["task_name"] = task_name
+                        if self._active_loglikelihood_doc_ids:
+                            doc_id = self._active_loglikelihood_doc_ids[batch_start + i]
+                            if doc_id is not None:
+                                row["doc_id"] = int(doc_id)
+                        if self._active_loglikelihood_choice_idxs:
+                            choice_idx = self._active_loglikelihood_choice_idxs[batch_start + i]
+                            if choice_idx is not None:
+                                row["choice_idx"] = int(choice_idx)
+                    except Exception:
+                        pass
                     try:
                         raw_cont = chunk[i][0][1] if chunk[i] and chunk[i][0] and len(chunk[i][0]) > 1 else ""
                     except Exception:
@@ -5816,6 +6138,13 @@ class NativeCausalLM(TemplateLM):
                     if raw_cont:
                         row["cont_str_len"] = int(len(raw_cont))
                         row["cont_str_preview"] = raw_cont[:200]
+                    try:
+                        raw_ctx = chunk[i][0][0] if chunk[i] and chunk[i][0] else ""
+                    except Exception:
+                        raw_ctx = ""
+                    if raw_ctx:
+                        row["ctx_str_len"] = int(len(raw_ctx))
+                        row["ctx_str_preview"] = raw_ctx[:200]
                     row["cont_tokens_len"] = int(cont_len)
                     if cont_len > 0:
                         row["cont_tokens_preview"] = list(cont_tokens_list[i][:20])
@@ -5869,6 +6198,8 @@ class NativeCausalLM(TemplateLM):
                         row["total_comp_slots"] = n_spans * int(num_comp)
                     if suffix_tokens_list is not None:
                         row["suffix_len"] = len(suffix_tokens_list[i])
+                    if split_source_by_idx is not None and i < len(split_source_by_idx):
+                        row["split_source"] = split_source_by_idx[i]
                     if prefix_embeds_list is not None:
                         pe = prefix_embeds_list[i]
                         if pe is not None:
@@ -5896,9 +6227,22 @@ class NativeCausalLM(TemplateLM):
                     )
                     split_context_list = doc_and_context.get("context_list")
                     split_query_list = doc_and_context.get("query_list")
-                except Exception:
-                    split_context_list = None
-                    split_query_list = None
+                except Exception as e:
+                    # Never silently fall back to compressing the full rendered prompt.
+                    # For non-chat tasks, keep full prompt as query and leave context empty.
+                    split_context_list = [""] * len(chunk)
+                    split_query_list = [
+                        self._tokenizer.decode_w_special_tokens(ctx) if ctx else ""
+                        for ctx in ctx_tokens_full_list
+                    ]
+                    split_source_by_idx = [f"doc_split_fallback:{type(e).__name__}"] * len(chunk)
+                    if self._distributed_args.rank == 0 and not self._warned_doc_split_fallback:
+                        print(
+                            "[native][warn] _get_doc_and_context failed in compress_answer; "
+                            "falling back to context='' + query=full prompt tokens.",
+                            file=sys.stderr,
+                        )
+                        self._warned_doc_split_fallback = True
 
                 if (
                     split_context_list is not None
@@ -5906,6 +6250,20 @@ class NativeCausalLM(TemplateLM):
                     and len(split_context_list) == len(chunk)
                     and len(split_query_list) == len(chunk)
                 ):
+                    # When structured (context, query) split is available, the decoder
+                    # prefix is fully rebuilt from split fields. Keeping the previously
+                    # computed raw suffix (from full prompt token splitting) would append
+                    # duplicated query text and shift LL scores.
+                    suffix_tokens_list = [[] for _ in range(len(chunk))]
+                    # If split returned empty queries for all rows, preserve full prompt as query.
+                    if not any(str(q or "").strip() for q in split_query_list):
+                        split_context_list = [""] * len(chunk)
+                        split_query_list = [
+                            self._tokenizer.decode_w_special_tokens(ctx) if ctx else ""
+                            for ctx in ctx_tokens_full_list
+                        ]
+                        split_source_by_idx = ["doc_split_empty_query_fallback"] * len(chunk)
+
                     key_to_group: Dict[Tuple[str, str], int] = {}
                     group_contexts: List[str] = []
                     group_queries: List[str] = []
@@ -5934,7 +6292,9 @@ class NativeCausalLM(TemplateLM):
                         decoder_include_prompt_tokens=False,
                         decoder_memory_layout="per_span",
                         return_meta=True,
-                        not_add_boq_index=False,
+                        # Keep LL scoring aligned with decoder mode for no-memory rows (n_spans==0).
+                        # Adding BOQ in that case shifts the distribution and can depress MCQ scores.
+                        not_add_boq_index=True,
                         context_list=group_contexts,
                         query_list=group_queries,
                     )
@@ -5951,6 +6311,8 @@ class NativeCausalLM(TemplateLM):
                             meta_n_spans[i] = int(meta_group_n_spans[gidx]) if gidx < len(meta_group_n_spans) else 1
                             if meta_group_comp_masks is not None and gidx < len(meta_group_comp_masks):
                                 prefix_comp_masks_list[i] = list(meta_group_comp_masks[gidx])
+                            if split_source_by_idx[i] == "prompt_tokens_override":
+                                split_source_by_idx[i] = "doc_split"
                 else:
                     key_to_group: Dict[Tuple[int, ...], int] = {}
                     group_prompt_tokens: List[List[int]] = []
@@ -5999,6 +6361,7 @@ class NativeCausalLM(TemplateLM):
                             )
                             if meta_group_comp_masks is not None and gidx < len(meta_group_comp_masks):
                                 prefix_comp_masks_list[i] = list(meta_group_comp_masks[gidx])
+                            split_source_by_idx[i] = "prompt_tokens_override"
             else:
                 doc_and_context = self._get_doc_and_context(ctx_tokens_list=ctx_tokens_full_list, batch_start=batch_start)
                 context_list, question_list, query_list = (
@@ -6050,6 +6413,7 @@ class NativeCausalLM(TemplateLM):
                         meta_n_spans[i] = int(meta_group_n_spans[gidx]) if gidx < len(meta_group_n_spans) else 1
                         if meta_group_comp_masks is not None and gidx < len(meta_group_comp_masks):
                             prefix_comp_masks_list[i] = list(meta_group_comp_masks[gidx])
+                        split_source_by_idx[i] = "chat_split"
             # breakpoint()
             
             # Suffix tokens (uncompressed tail of the prompt) can be ragged across the batch.
@@ -6118,6 +6482,8 @@ class NativeCausalLM(TemplateLM):
                         continuation_str=str(cont_str),
                         doc=docs_slice[i],
                         choice_idx=choice_idxs_slice[i],
+                        context_tokens=list(ctx_tokens_full_list[i]) if i < len(ctx_tokens_full_list) else list(chunk[i][1]),
+                        context_text=(chunk[i][0][0] if chunk[i] and chunk[i][0] and len(chunk[i][0]) > 0 else ""),
                     )
                     suffix_tokens = self._get_verifier_prompt_suffix_tokens()
                     verify_prefix_tokens = list(candidate_tokens) + list(suffix_tokens)
@@ -6190,6 +6556,7 @@ class NativeCausalLM(TemplateLM):
                         "candidate_preview": candidate_meta.get("candidate_preview"),
                         "candidate_tokens_len": int(len(candidate_tokens)),
                         "prompt_suffix_tokens_len": int(len(suffix_tokens)),
+                        "choice_idx_from_label": candidate_meta.get("choice_idx_from_label"),
                         "truncated_for_budget": bool(truncated_for_budget),
                         "tie_break_mode": self._mcq_verifier_tie_break,
                         "greedy": greedy,
