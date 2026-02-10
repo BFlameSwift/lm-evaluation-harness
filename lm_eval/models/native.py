@@ -478,6 +478,24 @@ def _coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional
         return default
 
 
+def _coerce_bool(value: Optional[Any], default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"", "none"}:
+            return bool(default)
+        if raw in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
 def _token_embed(model: torch.nn.Module, token_ids: torch.Tensor) -> torch.Tensor:
     if hasattr(model, "tok_embeddings"):
         return model.tok_embeddings(token_ids)  # type: ignore[attr-defined]
@@ -711,6 +729,8 @@ class NativeCausalLM(TemplateLM):
         compress_chunk: int = 2048,
         max_cycles: int = 10,
         compress_start_tokens: Optional[str] = "<think>",
+        compress_answer_min_suffix_tokens: int = 128,
+        compress_answer_force_min_span: bool = True,
         temperature: float = 1.0,
         # chat template related， also load from yaml task
         use_chat_template: bool = False, 
@@ -819,6 +839,10 @@ class NativeCausalLM(TemplateLM):
         self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
+        self._compress_answer_min_suffix_tokens = max(
+            0, _coerce_int(compress_answer_min_suffix_tokens, 128) or 0
+        )
+        self._compress_answer_force_min_span = _coerce_bool(compress_answer_force_min_span, default=True)
         self._max_cycles = max(1, int(max_cycles))
         self._compress_start_tokens = []
         self._add_boq_index = bool(add_boq_index)
