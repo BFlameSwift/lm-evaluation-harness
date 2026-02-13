@@ -180,6 +180,10 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
             override_max_gen_toks=getattr(self, "_gen_max_gen_toks_override", None),
         )
 
+    # Preserve structured request metadata for debug output.
+    #
+    # lm-eval only requires returning strings, but debugging long-context tasks is
+    # much easier if we keep doc/task/doc_id attached to each request.
     packed: List[Tuple[Tuple[str, dict], Optional[dict], Optional[str], Any]] = [
         (req.args, getattr(req, "doc", None), getattr(req, "task_name", None), getattr(req, "doc_id", None))
         for req in requests
@@ -237,12 +241,20 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         gkwargs = [g for _, g in chunk]
         # A few tasks pass template flags via generation_kwargs; plumb them into
         # the model instance so downstream prompt formatting matches task intent.
+        #
+        # This is intentionally "batch-level": we assume all requests in the batch
+        # share the same task/config.
         if gkwargs[0].get("add_thinking_tokens", False):
             self._add_thinking_tokens = True
         if gkwargs[0].get("use_chat_template", False):
             self._chat_use_template = True
-        # breakpoint()
-        # Try batched vLLM paths first
+
+        # Try batched vLLM paths first.
+        #
+        # We prefer vLLM when enabled because:
+        # - generation throughput is higher
+        # - prompt length enforcement is clearer (hard max_model_len)
+        # - prompt_embeds is required for compression-aware generation
         if (
             self._mode == "decoder"
             and self._vllm_manager is not None
@@ -254,6 +266,9 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
             else:
                 prompts = [c for c, _ in chunk]
             # vLLM has a hard max prompt length; for safety, tail-truncate if needed.
+            #
+            # We reserve at least `max_gen_toks` tokens so vLLM doesn't reject the request
+            # after we truncate the prompt.
             vllm_max_len = int(getattr(self, "_vllm_max_model_len", 0) or 0)
             clip_notes: List[Optional[str]] = [None] * len(prompts)
             prompt_lens: List[int] = []
@@ -275,6 +290,8 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                         target = int(vllm_max_len) - 1
                     if target > 0 and len(toks) > target:
                         toks = toks[-target:]
+                        # Note: we record the post-truncation length. This is sufficient to
+                        # debug "why did vLLM accept this prompt".
                         clip_notes[i] = f"tail_truncated:{len(toks)}"
                         try:
                             prompt = self.tok_decode(toks)
@@ -295,6 +312,8 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
             )
             max_req_toks = max(_get_max_gen_tokens(g) for g in gkwargs)
             if vllm_max_len > 0 and prompt_caps:
+                # Cap by the smallest remaining budget across the batch. This avoids vLLM
+                # rejecting a shorter-cap row when a longer-cap row asked for more.
                 max_req_toks = min(max_req_toks, max(1, min(prompt_caps)))
             sampling_params = {
                 "max_tokens": max_req_toks,
@@ -336,6 +355,12 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
             and self._vllm_manager is not None
             and hasattr(self.model, "compression_embeddings")
         ):
+            # Decoder-mode generation for compression checkpoints.
+            #
+            # Even though `mode=decoder` does not *use* memory slots, some compression
+            # checkpoints still only work reliably via vLLM in our eval environment.
+            # We therefore support a vLLM prompt_embeds path where the prompt is simply
+            # the raw token embeddings (no compression).
             embeds: List[Optional[torch.Tensor]] = []
             prompts: List[str] = []
             gkwargs = []
@@ -355,6 +380,8 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                     clip_notes.append(None)
                     continue
                 if vllm_max_len > 0:
+                    # Same tail-truncation strategy as the vLLM text path, but applied to
+                    # tokens/embeds directly.
                     reserve = 1
                     try:
                         reserve = max(1, int(_get_max_gen_tokens(gk)))
@@ -428,6 +455,9 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
             and self._vllm_manager is not None
             and hasattr(self.model, "compression_embeddings")
         ):
+            # Compression-aware generation:
+            # - build prompt_embeds that contain memory slots (and raw query/suffix)
+            # - feed those embeddings into vLLM with enable_prompt_embeds=True
             include_bor = self._mode == "reconstruct_first"
             if self._mode == "niah_generate":
                 include_bor = bool(getattr(self, "_niah_use_bor", False))

@@ -445,10 +445,14 @@ def _loglikelihood_tokens_compress_answer(
     except Exception:
         bs = 1
 
+    # Compression checkpoint parameters:
+    # - num_comp: number of learned memory slots produced per encoder span
+    # - max_mem_span_len: how many *raw* tokens we feed to the encoder per span
+    # - decoder_budget: max number of decoder prompt tokens/embeds we allow (32k typical)
     num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
-    placeholder_id = 0
+    placeholder_id = 0  # must be a valid vocab id for placeholder positions in `token_ids`
     max_mem_span_len = int(getattr(self.model.args, "max_mem_span_len", self.max_length))
-    include_bor = False
+    include_bor = False  # compress_answer does not insert BOR by default
     decoder_budget = int(self.decoder_budget)
 
 
@@ -550,17 +554,21 @@ def _loglikelihood_tokens_compress_answer(
                 pass
         # Build prefix prompt_embeds (memory blocks + optional BOQ) via the shared helper,
         # then score only the continuation tokens.
+        #
+        # IMPORTANT: in compress_answer, we cannot simply concatenate (context+continuation)
+        # tokens and score suffix, because the decoder prefix is synthetic (memory slots).
+        # We must explicitly re-tokenize the continuation from the *raw continuation string*.
         prompt_tokens_override: List[List[int]] = [ctx for (_, ctx, _) in chunk]
         ctx_tokens_full_list: List[List[int]] = list(prompt_tokens_override)
-        # In compress_answer, the decoder prefix is synthetic (memory blocks / chat scaffold),
-        # so the continuation must be tokenized from the raw continuation string, not from
-        # the (context+continuation) split performed in TemplateLM._encode_pair().
+        # Continuation tokens: derived from the continuation string (pair[1]).
+        # This keeps scoring consistent even when the decoder prefix is not literally `context`.
         cont_tokens_list = [
             self._tokenizer.encode(pair[1], bos=False, eos=False) if pair and len(pair) > 1 else []
             for (pair, _, _) in chunk
         ]
         prefix_tokens = self._get_likelihood_prefix_tokens("compress_answer")
         if prefix_tokens:
+            # Optional "Answer:"-like prefix used in some configs to match formatting.
             cont_tokens_list = [prefix_tokens + list(cont) for cont in cont_tokens_list]
         suffix_tokens_list: List[List[int]] = [[] for _ in range(len(chunk))]
         split_source_by_idx: List[str] = ["prompt_tokens_override"] * len(chunk)
@@ -582,7 +590,9 @@ def _loglikelihood_tokens_compress_answer(
 
 
         # prompt_tokens, suffix_tokens = compute_needed_comp_slots(prompt_tokens_override[0])
-        # Fast path: empty continuations
+        # Fast path: empty continuations.
+        #
+        # lm-eval sometimes sends empty continuations (e.g., for prefix-only checks).
         chunk_results: List[Tuple[float, bool]] = [(float("-inf"), False)] * len(chunk)
         nonempty_idxs = [i for i, c in enumerate(cont_tokens_list) if len(c) > 0]
         for i in range(len(chunk)):
@@ -727,8 +737,14 @@ def _loglikelihood_tokens_compress_answer(
             res.extend(chunk_results)
             continue
 
+        # `_build_compress_prompt_embeds_batch` needs `gen_lens` to reserve "room" for
+        # the continuation inside the decoder budget. Here the "generation length" is
+        # simply the number of tokens we will score (continuation + kept suffix).
         dummy_prompts = [""] * len(chunk)
-        gen_lens = [len(c) + (len(suffix_tokens_list[i]) if suffix_tokens_list is not None else 0) for i, c in enumerate(cont_tokens_list)]
+        gen_lens = [
+            len(c) + (len(suffix_tokens_list[i]) if suffix_tokens_list is not None else 0)
+            for i, c in enumerate(cont_tokens_list)
+        ]
         if not getattr(self, "_chat_use_template", False):
             # Prefer structured (context, query) splitting when available so the query
             # (e.g. "Question: ...\nAnswer:") is not compressed away. This is critical
@@ -797,6 +813,11 @@ def _loglikelihood_tokens_compress_answer(
                     ]
                     split_source_by_idx = ["doc_split_empty_query_fallback"] * len(chunk)
 
+                # Group identical (context, query) pairs so we only run compression once.
+                #
+                # This is important for MCQ tasks where the *context/query prompt* is the same
+                # for every choice and only the continuation differs. Grouping avoids repeating
+                # expensive encoder compression for each option.
                 key_to_group: Dict[Tuple[str, str], int] = {}
                 group_contexts: List[str] = []
                 group_queries: List[str] = []
@@ -847,6 +868,10 @@ def _loglikelihood_tokens_compress_answer(
                         if split_source_by_idx[i] == "prompt_tokens_override":
                             split_source_by_idx[i] = "doc_split"
             else:
+                # Fallback grouping key: the tokenized prompt prefix.
+                #
+                # We still group because MMLU/ARC/HellaSwag create many requests that share
+                # the same context tokens (one per answer choice).
                 key_to_group: Dict[Tuple[int, ...], int] = {}
                 group_prompt_tokens: List[List[int]] = []
                 group_gen_lens: List[int] = []
@@ -903,6 +928,7 @@ def _loglikelihood_tokens_compress_answer(
                 doc_and_context["query_list"],
             )
 
+            # Chat-template path: group (context, query) so compression work is reused.
             key_to_group: Dict[Tuple[str, str], int] = {}
             group_contexts: List[str] = []
             group_queries: List[str] = []
@@ -1107,7 +1133,13 @@ def _loglikelihood_tokens_compress_answer(
             full_embeds = torch.cat([pe, cont_e], dim=0)
             total_len = int(full_embeds.shape[0])
 
-            # Decoder token ids (for shifting/targets). Memory placeholders use a valid vocab id.
+            # Decoder token ids (for shifting/targets).
+            #
+            # We need a `token_ids` vector aligned with `full_embeds` so we can build
+            # next-token targets. For memory slots there is no "real" token id, so we
+            # use a valid placeholder vocab id. This is safe because:
+            # - we never score the memory-slot positions (we only score continuation),
+            # - the placeholder ids only exist to keep tensor shapes aligned.
             prefix_mask = prefix_comp_masks_list[i] if prefix_comp_masks_list is not None else None
             if prefix_mask is not None:
                 prefix_ids = [placeholder_id] * len(prefix_mask)
@@ -1115,15 +1147,21 @@ def _loglikelihood_tokens_compress_answer(
                 n_spans = int(meta_n_spans[i]) if i < len(meta_n_spans) else 1
                 prefix_ids = ([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX]) * n_spans
             suffix_ids = list(suffix_tokens_list[i]) if suffix_tokens_list[i] else []
+            # token_ids layout:
+            #   [memory block token-ids] + [raw suffix token-ids] + [continuation token-ids]
             token_ids = prefix_ids + suffix_ids + list(cont)
             if len(token_ids) != total_len:
                 skip_reasons[i] = "token_len_mismatch"
                 continue
 
+            # Next-token prediction targets. We append EOS at the end to keep the vector length
+            # aligned with `full_embeds` even though EOS itself is not scored here.
             targets_ids = token_ids[1:] + [int(self.eos_token_id)]
             targets_t = torch.tensor(targets_ids, device=self.device, dtype=torch.long)
 
-            # Score only continuation: first continuation token is predicted at position prefix_len-1.
+            # Score only continuation:
+            # - continuation token 0 is predicted at position (prefix_len - 1)
+            # - continuation token j is predicted at position (prefix_len - 1 + j)
             score_start = prefix_len - 1
             score_end = score_start + cont_len
             if score_start < 0 or score_end > total_len:

@@ -537,8 +537,12 @@ class ScoringMixin:
             return 0.0, True
         chunk_size = max(1, int(chunk_size))
 
-        # When the full [N, vocab] projection is small, doing it in one shot
-        # avoids tiny numeric drift from per-chunk reductions (and is faster).
+        # When the full [N, vocab] projection is small, doing it in one shot:
+        # - is faster (fewer kernel launches)
+        # - avoids tiny numeric drift from per-chunk reductions
+        #
+        # When it's large, the [N, vocab] matrix can OOM (especially with fp32 logits),
+        # so we fall back to chunking over rows.
         try:
             vocab = int(self.model.output.weight.shape[0])  # type: ignore[attr-defined]
         except Exception:
@@ -570,6 +574,8 @@ class ScoringMixin:
             t = targets[s:e]
             logits = self.model.output(h).float()
             if self._model_parallel_group is not None:
+                # Tensor-parallel: each rank holds a shard of the vocab projection.
+                # Gather to get a full-vocab logits matrix before applying softmax.
                 from distributed.tensor_parallel import gather_from_model_parallel_region
 
                 logits = gather_from_model_parallel_region(logits, self._model_parallel_group)
@@ -669,11 +675,24 @@ class ScoringMixin:
                 "total": {"ll": 0.0, "tokens": 0, "loss": None, "ppl": None},
             }
 
-        dec_cu = torch.tensor([0] + list(torch.tensor(dec_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+        # Build "ragged batch" metadata for our attention blocks.
+        #
+        # We flatten all sequences into one long token stream and represent boundaries
+        # using cu_seqlens (prefix sums). Our `arch/` attention expects:
+        # - cu_seqlens_{q,k}: [B+1] prefix sums
+        # - positions: [sum(L_i)] positions per token (0..L_i-1 per sample)
+        dec_cu = torch.tensor(
+            [0] + list(torch.tensor(dec_lens).cumsum(0).tolist()),
+            device=self.device,
+            dtype=torch.int32,
+        )
         max_dec = max(dec_lens)
         dec_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens], dim=0)
 
         if comp_mask_list is not None:
+            # `compression_token_mask` flags placeholder/memory tokens. Most attention layers
+            # ignore it, but some compression-aware layers may use it (and we also keep it
+            # for debug parity).
             comp_mask_flat = torch.cat(comp_mask_list, dim=0)
         else:
             comp_mask_flat = torch.zeros(sum(dec_lens), device=self.device, dtype=torch.bool)
@@ -687,6 +706,10 @@ class ScoringMixin:
             "compression_token_mask": comp_mask_flat,
         }
 
+        # Forward pass over the flattened embeddings.
+        #
+        # Note: seq_embeds are already token embeddings / prompt_embeds. We do not run the
+        # input embedding layer here; the caller owns embeddings construction.
         embeds_flat = torch.cat(seq_embeds, dim=0)
         with torch.autocast(device_type="cuda", dtype=self._dtype):
             h = embeds_flat
@@ -695,6 +718,10 @@ class ScoringMixin:
             h = self.model.norm(h)
 
         # Build flattened score positions and targets.
+        #
+        # To score tokens token_ids[t0:t1], we need logits at positions (t0-1 .. t1-1).
+        # We materialize those indices in the flattened token stream, then gather the
+        # matching hidden states and project them to vocab.
         score_pos_chunks: List[torch.Tensor] = []
         score_tgt_chunks: List[torch.Tensor] = []
         score_ranges_flat: List[Tuple[int, int]] = []
@@ -723,6 +750,7 @@ class ScoringMixin:
             score_ranges_flat.append((running, running + length))
             running += length
 
+        # Flat buffers store per-scored-token stats. Later we reduce them back to per-sample.
         token_logprob = torch.empty(running, device=self.device, dtype=torch.float32)
         token_greedy_ok = torch.empty(running, device=self.device, dtype=torch.bool)
 
@@ -732,6 +760,8 @@ class ScoringMixin:
             h_score = h.index_select(0, score_pos)
 
             if rows_per_chunk is None:
+                # Chunking over rows is critical for large vocab models: the temporary
+                # logits matrix scales with `rows * vocab`. Keep the default conservative.
                 rows_per_chunk = int(getattr(getattr(self.model, "args", None), "cross_entropy_chunk", 8)) * 16
                 rows_per_chunk = max(16, min(rows_per_chunk, 512))
             rows_per_chunk = max(8, int(rows_per_chunk))
@@ -749,6 +779,9 @@ class ScoringMixin:
 
                     logits_chunk = gather_from_model_parallel_region(logits_chunk, self._model_parallel_group)
 
+                # Greedy-match is useful for lm-eval's "is_greedy" semantics.
+                # For MCQ tasks, greedy-match is not the metric, but it is still
+                # returned to match TemplateLM's contract.
                 token_greedy_ok[off:off2] = logits_chunk.argmax(dim=-1).to(torch.long).eq(tgt_chunk)
 
                 logits_f = logits_chunk.float()
@@ -756,6 +789,8 @@ class ScoringMixin:
                 vocab = int(logprobs.shape[-1])
                 invalid = (tgt_chunk < 0) | (tgt_chunk >= vocab)
                 if bool(invalid.any().item()):
+                    # If any targets are invalid (shouldn't happen for normal tokenizers),
+                    # make the LL contribution -inf so the overall score is unusable.
                     safe_tgt = tgt_chunk.clone()
                     safe_tgt[invalid] = 0
                     gathered = logprobs.gather(-1, safe_tgt.unsqueeze(-1)).squeeze(-1)
@@ -765,7 +800,7 @@ class ScoringMixin:
                     token_logprob[off:off2] = logprobs.gather(-1, tgt_chunk.unsqueeze(-1)).squeeze(-1)
                 del logits_f, logprobs, invalid
 
-        # Reduce to per-sample stats.
+        # Reduce flat per-token stats back into per-sample summaries.
         per_sample: List[Dict[str, Any]] = []
         total_ll = 0.0
         total_toks = 0
@@ -854,7 +889,12 @@ class ScoringMixin:
                 "total": {"ll": 0.0, "tokens": 0, "loss": None, "ppl": None},
             }
 
-        dec_cu = torch.tensor([0] + list(torch.tensor(dec_lens).cumsum(0).tolist()), device=self.device, dtype=torch.int32)
+        # Same ragged-batch flattening strategy as `_forward_score_token_ranges`.
+        dec_cu = torch.tensor(
+            [0] + list(torch.tensor(dec_lens).cumsum(0).tolist()),
+            device=self.device,
+            dtype=torch.int32,
+        )
         max_dec = max(dec_lens)
         dec_positions = torch.cat([torch.arange(l, device=self.device, dtype=torch.int32) for l in dec_lens], dim=0)
 
@@ -886,6 +926,9 @@ class ScoringMixin:
         for i in range(n):
             cont_len = int(cont_targets[i].numel())
             pref_len = int(prefix_lens[i])
+            # Score `cont_targets[i]` starting right after the prefix.
+            #
+            # To score token at index `pref_len`, we need logits from `pref_len-1`.
             rel_start = pref_len - 1
             rel_end = rel_start + cont_len
             if rel_start < 0 or rel_end > dec_lens[i] - 1 or cont_len <= 0:
@@ -1039,7 +1082,7 @@ class ScoringMixin:
             ps = (out.get("per_sample") or [{}])[0]
             return float(ps.get("ll", 0.0)), bool(ps.get("greedy", True))
 
-        # Fits in one window.
+        # Fits in one window: [base | cont] fits under decoder budget.
         if cont_len <= avail:
             ll, greedy = _score_window(base_embeds, base_comp_mask, cont_tokens, base_len)
             tokens = cont_len
@@ -1054,7 +1097,17 @@ class ScoringMixin:
                 ppl = float("inf")
             return {"ll": ll, "greedy": greedy, "tokens": tokens, "loss": loss, "ppl": ppl, "windows": 1, "rolled": False}
 
-        # Need rolling. Require >=2 available continuation positions so we can overlap by 1 token.
+        # Need rolling:
+        #
+        # If `base_len + cont_len > budget`, we cannot score the whole continuation in one forward.
+        # We instead use a sliding window where each window has the fixed base prefix plus a chunk
+        # of continuation tokens.
+        #
+        # IMPORTANT: We overlap windows by exactly 1 token. This preserves the standard next-token
+        # scoring alignment at window boundaries (logits at position t score token t+1).
+        #
+        # We require >=2 available continuation positions so the overlapped window can score at
+        # least 1 new token.
         if avail < 2:
             return {"ll": float("-inf"), "greedy": False, "tokens": 0, "loss": float("inf"), "ppl": float("inf"), "windows": 0, "rolled": True}
 
@@ -1068,7 +1121,7 @@ class ScoringMixin:
         greedy_all = greedy_all and g0
         windows += 1
 
-        # Subsequent windows: overlap by 1 token.
+        # Subsequent windows: overlap by 1 token (see comment above).
         step = avail - 1
         start = avail - 1
         while start < cont_len - 1:

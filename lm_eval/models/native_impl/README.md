@@ -10,6 +10,44 @@ The stable entrypoint is still:
 `native_impl.NativeCausalLM` so the `native` adapter can evolve without keeping
 everything in a single 7k-line file.
 
+## Call Flow (Where To Start Reading)
+
+The easiest way to understand the refactor is to follow the runtime call path
+from lm-eval into this folder.
+
+High-level entrypoints:
+
+1. lm-eval CLI constructs the model:
+   - `lm_eval/models/native.py` registers the public name `native`.
+   - It imports `lm_eval/models/native_impl/model.py:NativeCausalLM`.
+
+2. `loglikelihood()` (multiple-choice scoring, perplexity-style tasks):
+   - `NativeCausalLM.loglikelihood(...)` (in `model.py`) captures `Instance.doc`
+     and other per-request metadata into `_active_loglikelihood_*` fields so
+     downstream scoring can access structured dataset fields when needed.
+   - It delegates scoring into:
+     - `native_impl/likelihood.py:_loglikelihood_tokens(...)` for `mode=decoder`
+     - `native_impl/likelihood.py:_loglikelihood_tokens_compress_answer(...)`
+       for `mode=compress_answer` (compression checkpoints only)
+     - `native_impl/likelihood.py:_loglikelihood_tokens_reconstruct_first(...)`
+       for `mode=reconstruct_first` (compression checkpoints only)
+
+3. `generate_until()` (generation tasks like NIAH/RULER):
+   - `NativeCausalLM.generate_until(...)` delegates into
+     `native_impl/generate.py:generate_until(...)`.
+   - Some modes require vLLM prompt-embeds:
+     - prompt-embeds construction is in `native_impl/reconstruct.py`
+     - vLLM safemodel export + engine init is in `native_impl/vllm_backend.py`
+
+4. MCQ verifier scoring (`mcq_score_mode=yes_*`):
+   - Verifier prompt construction helpers live in `native_impl/mcq_scoring.py`.
+   - Low-level scoring helpers (token-range scoring, chunked projection) live in
+     `native_impl/scoring_mixin.py` and are mixed into `NativeCausalLM`.
+
+Notes:
+- Avoid absolute paths in docs/comments; always use repo-relative paths.
+- There should be exactly one canonical harness checkout under `llm/lm-evaluation-harness/`.
+
 ## Quickstart (lm-eval CLI)
 
 Typical pattern:
@@ -61,6 +99,30 @@ implementations:
 5. `mode=niah_generate`
    - NIAH-focused generation path (needle-in-a-haystack). Usually requires
      compression model + vLLM prompt-embeds backend for performance/stability.
+
+## Glossary (Tokens / Concepts)
+
+The native adapter uses a few "special token" concepts that show up in logs,
+debug JSONL, and code comments:
+
+- **BOM / EOM**: "begin/end of memory" markers.
+  - Implemented by token ids `BEGIN_OF_MEMORY_INDEX` / `END_OF_MEMORY_INDEX`.
+  - Surround the learned memory-slot embeddings in decoder prompt_embeds.
+- **BOQ**: "begin of query" marker.
+  - Token id: `BEGIN_OF_QUERY_INDEX`.
+  - Used in some prompt formats to delimit query text from context/memory.
+- **BOR / EOR**: "begin/end of reconstruction" markers.
+  - Token ids: `BEGIN_OF_RECONSTRUCTION_INDEX` / `END_OF_RECONSTRUCTION_INDEX`.
+  - Used by reconstruct-first and some NIAH variants.
+- **n_spans**: number of encoder spans compressed into memory slots.
+  - Each span consumes up to `max_mem_span_len` *raw* tokens on the encoder.
+  - Each span produces `num_comp` learned memory slots for the decoder.
+- **num_comp**: number of compression tokens per span (a.k.a. `num_compression_tokens`).
+- **max_mem_span_len**: raw tokens per encoder span (eval-time knob; important for long-context).
+- **decoder_budget**: max prompt length that the decoder backend can accept.
+  - For vLLM prompt_embeds, this is effectively `vllm_max_model_len` (hard limit).
+- **suffix_raw / min_suffix_tokens**: raw prompt tokens kept *uncompressed* near the answer.
+  - This mitigates degenerate MCQ scoring when short prompts are fully compressed.
 
 ## vLLM integration and safemodel export
 
@@ -145,4 +207,3 @@ JSONL rows alongside lm-eval outputs, which can be used to audit:
 - compression span metadata (n_spans/prefix/suffix lengths)
 
 These are derived from `--output_path` via `native_impl/utils.py:derive_lm_eval_output_dir()`.
-

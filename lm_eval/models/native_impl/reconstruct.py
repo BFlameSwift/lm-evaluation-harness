@@ -70,9 +70,17 @@ def _maybe_tail_truncate_prompt_embeds(
     target_max_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[str]]:
     """
-    vLLM rejects any request whose prompt length exceeds `max_model_len`. For compression-heavy
-    modes, the prompt is mostly made of repeated memory-span blocks; if we overshoot, we can
-    usually recover by dropping *earlier* spans (tail-span behavior) while keeping the query.
+    vLLM rejects any request whose prompt length exceeds `max_model_len`.
+
+    For compression-heavy modes, the prompt is mostly made of repeated memory-span blocks:
+
+      (<BOM> + [mem slots] + <EOM>) * n_spans  +  suffix_raw/query  +  continuation
+
+    If we overshoot the decoder budget, we can usually recover by dropping *earlier* spans
+    ("tail-span" behavior) while keeping the query and most recent context. This is a pragmatic
+    choice for long-context benchmarks where:
+    - the query is always at the tail, and
+    - the most relevant information often correlates with recency.
 
     This is a best-effort guard rail that avoids hard crashes and is especially important for
     NIAH/RULER where needles may appear late.
@@ -116,6 +124,10 @@ def _maybe_tail_truncate_prompt_embeds(
         return embeds, "tail_truncation_unavailable:no_memory_spans"
 
     # Determine how many spans to drop.
+    #
+    # We compute a crude "per-span token cost" in prompt_embeds space. This is not exact
+    # (chat templates and optional extra tokens add overhead), but it's good enough to
+    # decide a conservative number of spans to remove.
     overflow = int(prompt_len) - int(max_len)
     if overflow <= 0:
         return embeds, None
@@ -131,13 +143,19 @@ def _maybe_tail_truncate_prompt_embeds(
     if drop_spans <= 0:
         return embeds, None
 
-    chat_v3 = bool(getattr(self, "_chat_use_template", False)) and str(
-        getattr(self, "_chat_template_version", "")
-    ).lower() == "v3"
+    # Chat template v3 has a fixed prefix around the memory block:
+    #   "<|im_start|>memory\n" + <BOM> + slots... + <EOM> + "<|im_end|>\n"
+    #
+    # When this scaffold is present we must avoid truncating inside it.
+    chat_v3 = bool(getattr(self, "_chat_use_template", False)) and str(getattr(self, "_chat_template_version", "")).lower() == "v3"
 
     try:
         if decoder_memory_layout == "single":
             # Memory layout: [BOM] + slots + [EOM] (plus optional chat scaffold around it).
+            #
+            # In "single" layout, spans are concatenated into one long slots array:
+            #   slots = num_comp * n_spans
+            # So dropping `drop_spans` spans corresponds to dropping `drop_spans * num_comp` slots.
             mem_prefix = 0
             if chat_v3:
                 mem_prefix = len(self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False))
@@ -157,6 +175,9 @@ def _maybe_tail_truncate_prompt_embeds(
             )
         else:
             # Memory layout: ([BOM] + slots + [EOM]) * n_spans.
+            #
+            # In per-span layout, each span is self-delimited. Dropping spans is a pure
+            # prefix trim by `drop_spans * span_cost` tokens (plus optional chat scaffold).
             if chat_v3:
                 mem_start_len = len(self._tokenizer.encode("<|im_start|>memory\n", bos=False, eos=False))
                 start = int(mem_start_len) + int(drop_spans) * int(span_cost)
@@ -335,14 +356,16 @@ def _build_compress_prompt_embeds_batch(
     include_bor: bool,
     *,
     decoder_include_prompt_tokens: bool = False,
-    decoder_memory_layout: str = "per_span", #"single",
+    # Decoder memory layout determines how we serialize memory slots into prompt_embeds.
+    # - per_span (default): `<BOM> slots <EOM>` repeated for each compressed span
+    # - single: one `<BOM> ... <EOM>` containing slots for all spans
+    decoder_memory_layout: str = "per_span",
     return_meta: bool = False,
     prompt_tokens_override: Optional[List[List[int]]] = None,
     not_add_boq_index: bool = False,
     query_list: Optional[List[str]] = None,
     assistant_prefix_list: Optional[List[str]] = None,
     context_list: Optional[List[str]] = None,
-    
 ) -> Tuple[List[Optional[torch.Tensor]], Optional[Dict[str, List[Any]]]]:
     """
     Build per-sample `prompt_embeds` for compression-aware modes.
@@ -395,6 +418,9 @@ def _build_compress_prompt_embeds_batch(
     if decoder_memory_layout not in {"single", "per_span"}:
         raise ValueError(f"Unsupported decoder_memory_layout: {decoder_memory_layout}")
     chat_enabled = bool(getattr(self, "_chat_use_template", False))
+    # `context_list`/`query_list` split mode is the most robust way to build prompts for
+    # long-context tasks. It avoids parsing a single monolithic prompt string with regex,
+    # and lets us control what gets compressed (context) vs what must stay raw (query).
     use_chat = bool(chat_enabled and context_list is not None and query_list is not None)
     use_split_nonchat = bool((not chat_enabled) and context_list is not None and query_list is not None)
     if (context_list is None) != (query_list is None) and (context_list is not None or query_list is not None):
@@ -410,6 +436,10 @@ def _build_compress_prompt_embeds_batch(
             raise ValueError(
                 f"assistant_prefix_list must match prompts length; got {len(assistant_prefix_list)} vs {len(prompts)}"
             )
+    # `decoder_budget` is the max number of *prompt tokens/embeds* the decoder can see.
+    #
+    # For torch decoding, this is `max_seq_length` (or checkpoint config). For vLLM, the
+    # true hard limit is `vllm_max_model_len`, even if the checkpoint can represent more.
     decoder_budget = int(self.decoder_budget)
     # vLLM enforces a hard max prompt length (`max_model_len`). When we build
     # prompt_embeds for compression-heavy modes (generate_until uses vLLM
@@ -426,6 +456,9 @@ def _build_compress_prompt_embeds_batch(
     # --------------------------
     # Fast path: no compression
     # --------------------------
+    # Some models (HF baselines) do not expose compression slots. In that case we still
+    # support prompt_embeds for chat scaffolding and optional BOQ/BOR markers, but we do
+    # not build any memory blocks.
     if num_comp <= 0:
         if use_chat:
             meta_n_spans: List[int] = []
@@ -492,6 +525,12 @@ def _build_compress_prompt_embeds_batch(
     # --------------------------
     # Compression-aware path
     # --------------------------
+    # We split (potentially huge) contexts into encoder spans. Each span consumes:
+    # - `span_len` raw tokens, plus
+    # - `num_comp` placeholder ids that are later replaced by learned memory slots.
+    #
+    # The resulting decoder prompt is relatively small: it only contains memory slots
+    # (and optionally a short raw suffix/query), not the full raw context.
     # Prefer the eval-time span length knob we computed in __init__ (which
     # respects `--model_args max_mem_span_len=...`) over any checkpoint-default
     # value. This is important for NIAH/RULER: if `max_mem_span_len` is smaller
@@ -508,8 +547,9 @@ def _build_compress_prompt_embeds_batch(
         )
 
     # Each encoder micro-batch is: span_tokens + num_comp placeholders.
-    # Ensure positions never exceed model max len.
-    # Clamp span_len so `span_len + num_comp` never exceeds encoder max len.
+    #
+    # Positions in the encoder must never exceed the checkpoint's `max_seq_len`, so we
+    # clamp `span_len` such that `span_len + num_comp <= model_max_len`.
     span_len = min(int(max_mem_span_len), int(model_max_len) - int(num_comp))
     if span_len <= 0:
         span_len = 1

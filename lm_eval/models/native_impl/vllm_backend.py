@@ -36,9 +36,17 @@ def init_vllm_param(self) -> None:
     except Exception as e:  # pragma: no cover
         raise ImportError("vLLM safemodel export requires `eval_func.model2safetensors`.") from e
 
+    # If the user explicitly passed a `vllm_model_path`, treat it as authoritative.
+    #
+    # This typically points at a *transformers-style* directory (config + weights).
+    # For native checkpoints, this would be the generated `.../safemodel/` dir.
     model_path = self._vllm_model_path
     if model_path is None:
-        # HF checkpoints: vLLM can load directly from checkpoint_dir (already a transformers directory).
+        # Heuristic: a "native" checkpoint directory includes `metadata.json`.
+        # A plain HF checkpoint directory (or hub download) does not.
+        #
+        # HF checkpoints: vLLM can load directly from checkpoint_dir because it is already
+        # a transformers directory with a valid `config.json` and weight shards.
         is_native_ckpt = self._vllm_checkpoint_dir is not None and os.path.exists(
             os.path.join(self._vllm_checkpoint_dir, "metadata.json")
         )
@@ -52,6 +60,14 @@ def init_vllm_param(self) -> None:
                 )
 
             def _safemodel_ready(safedir: str) -> bool:
+                # "Ready" means:
+                # 1) the expected files exist, and
+                # 2) they match the current checkpoint/dtype/maxlen well enough that
+                #    we don't need to re-export.
+                #
+                # vLLM will fail in confusing ways if:
+                # - `config.json` is missing / invalid JSON (partially written)
+                # - `model.safetensors` is missing / mid-write
                 model_file = os.path.join(safedir, "model.safetensors")
                 cfg_file = os.path.join(safedir, "config.json")
                 if not (os.path.exists(model_file) and os.path.exists(cfg_file)):
@@ -66,6 +82,12 @@ def init_vllm_param(self) -> None:
                 "tokenizer_path": self._vllm_tokenizer_path,
                 "dtype": self._dtype,
                 "additional_kwargs": {
+                    # These values are written into `config.json` during export.
+                    #
+                    # We intentionally set max-position fields to the *decoder budget*
+                    # we plan to run with (typically 32k). This avoids vLLM refusing
+                    # long prompts because the exported config defaulted to a smaller
+                    # position embedding limit.
                     "max_position_embeddings": self._vllm_max_model_len,
                     "eos_token_id": self.eos_token_id,
                     "pad_token_id": self.pad_token_id,
@@ -78,6 +100,10 @@ def init_vllm_param(self) -> None:
             }
 
             def _resolve_local_safedir() -> str:
+                # We want a stable local directory so multiple runs on the same host
+                # can reuse the exported safemodel (export can be minutes for large ckpts).
+                #
+                # The digest includes all inputs that affect the exported weights/config.
                 local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
                 local_root = os.path.abspath(os.path.expanduser(str(local_root)))
                 key = "|".join(
@@ -99,6 +125,13 @@ def init_vllm_param(self) -> None:
                 "y",
             }
             if prefer_local:
+                # "Prefer local" means: always export (or copy) into /tmp-like storage,
+                # and point vLLM at that local directory.
+                #
+                # This is the most reliable option on blobfuse/NFS where atomic rename
+                # is not guaranteed; it prevents:
+                # - ".tmp -> final" rename failures
+                # - vLLM reading a partially written config.json
                 local_safedir = _resolve_local_safedir()
                 os.makedirs(local_safedir, exist_ok=True)
                 if not _safemodel_ready(local_safedir):
@@ -120,6 +153,9 @@ def init_vllm_param(self) -> None:
                 self._vllm_model_dir = remote_safedir
                 model_path = remote_safedir
             except Exception as e:
+                # The "remote" path typically lives on a mounted volume that is also
+                # used for output artifacts. If that filesystem is flaky for atomic
+                # writes, we retry with a deterministic local path.
                 local_safedir = _resolve_local_safedir()
                 print(
                     f"[native][warn] vLLM safemodel export to '{remote_safedir}' failed: {type(e).__name__}: {e}. "
@@ -140,6 +176,8 @@ def init_vllm_param(self) -> None:
                             fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
                         except Exception:
                             pass
+                    # After acquiring the lock, re-check readiness. Another process
+                    # may have already completed the export for this digest.
                     if not _safemodel_ready(local_safedir):
                         convert_checkpoint(output_dir=local_safedir, **convert_kwargs)
                     ensure_vllm_config(self, local_safedir)
@@ -164,6 +202,9 @@ def init_vllm(self) -> None:
         raise ImportError("vLLM initialization requires `eval_func.vllm_runner` (and vLLM).") from e
 
     # Remote vLLM server path (no local engine init).
+    #
+    # This is mainly kept for emergency/debug usage; the recommended default
+    # for our evaluation jobs is local init (see AGENTS.md).
     if getattr(self, "_use_remote_vllm", False):
         try:
             engine = VLLMRemoteEngineWrapper(
@@ -181,7 +222,10 @@ def init_vllm(self) -> None:
             self._vllm_manager = None
         return
 
-    # Prepare decoder-only safetensors if path not provided
+    # Prepare decoder-only safetensors if path not provided.
+    #
+    # For native checkpoints, this will default to `<output_root>/safemodel`.
+    # For HF checkpoints, this is typically just the checkpoint directory itself.
     model_path = self._vllm_model_path or getattr(self, "_vllm_model_dir", None)
     if model_path is None:
         base_dir = self._vllm_output_root or self._vllm_checkpoint_dir
@@ -195,6 +239,8 @@ def init_vllm(self) -> None:
             tensor_parallel_size=self._vllm_tensor_parallel,
             dtype=self._dtype,
             max_model_len=self._vllm_max_model_len or self._max_seq_length,
+            # prompt_embeds tends to be more robust in eager mode. On ROCm this also
+            # avoids some compilation/cudagraph flakiness.
             enforce_eager=bool(getattr(self, "_vllm_enforce_eager", False)),
             enable_prompt_embeds=True,
             tokenizer=self._vllm_tokenizer_path or self._vllm_checkpoint_dir,
@@ -447,4 +493,3 @@ def shutdown_vllm_manager(
                 )
             except Exception:
                 pass
-

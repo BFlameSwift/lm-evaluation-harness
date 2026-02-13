@@ -408,9 +408,19 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         self._compress_answer_min_suffix_tokens = max(
             0, _coerce_int(compress_answer_min_suffix_tokens, 128) or 0
         )
-        # `compress_answer` often needs to keep a small raw suffix so short MCQ prompts
-        # don't become "all memory slots". Set this to 0 for "fully compressed" behavior.
+        # `compress_answer_min_suffix_tokens`:
+        # Keep the last N *raw* prompt tokens uncompressed (suffix near the answer).
+        #
+        # This is critical for short MCQ prompts (MMLU/ARC/HellaSwag). If you compress
+        # the entire prompt into memory slots, the decoder loses direct access to the
+        # question/options text and scoring can collapse to a near-random prior.
+        #
+        # Set this to 0 for "fully compressed" behavior (more aggressive, less stable).
         self._compress_answer_force_min_span = _coerce_bool(compress_answer_force_min_span, default=True)
+        # `compress_answer_force_min_span`:
+        # If True and the prompt is non-empty, force at least one compressed span even if
+        # the context is shorter than `max_mem_span_len`. This ensures `mode=compress_answer`
+        # is semantically different from `mode=decoder` (n_spans will not be 0).
         self._max_cycles = max(1, int(max_cycles))
         self._compress_start_tokens = []
         self._add_boq_index = bool(add_boq_index)
