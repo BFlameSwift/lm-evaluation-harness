@@ -751,13 +751,17 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                 pass
         self._num_compression_tokens = self.model.args.num_compression_tokens if hasattr(self.model, "args") else None
 
-        # Optional vLLM init for reconstruction speedup or decoder fast path (decoder-only, prompt_embeds)
+        # -----------------------------
+        # vLLM configuration (lazy init)
+        # -----------------------------
+        # We only *require* vLLM for some compression-aware generation paths
+        # (prompt_embeds). For pure loglikelihood MCQ scoring, torch is usually
+        # sufficient and avoids extra moving pieces, so we keep vLLM init lazy.
         need_vllm = self._use_vllm_reconstruct or self._use_vllm_decoder or self._use_vllm_answer
-        
-        
+
         if self._mode in {"vllm_decoding_with_compress", "niah_generate"}:
             need_vllm = True
-            
+
         self._use_vllm = need_vllm
         self._vllm_model_path = vllm_model_path
         self._vllm_max_model_len = _coerce_int(vllm_max_model_len, None)
@@ -784,22 +788,31 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         # runs (e.g., multiple-choice scoring). Defer vLLM init until first use.
         
     def _init_vllm_param(self) -> None:
+        """Prepare/resolve the local vLLM model directory (safemodel export if needed)."""
         from .vllm_backend import init_vllm_param
 
         return init_vllm_param(self)
 
     def _init_vllm(self) -> None:
+        """Instantiate the vLLM engine wrapper (local or remote) and attach it to `self`."""
         from .vllm_backend import init_vllm
 
         return init_vllm(self)
 
     def _ensure_vllm_manager(self, *, caller: str) -> None:
+        """Best-effort lazy vLLM init.
+
+        We keep a single vLLM manager per `NativeCausalLM` instance and only
+        attempt initialization once. Callers provide `caller=...` so failures
+        can be attributed to a specific mode/path in logs.
+        """
         from .vllm_backend import ensure_vllm_manager
 
         return ensure_vllm_manager(self, caller=caller)
     
                 
     def _ensure_vllm_config(self, safedir: str) -> None:
+        """Patch vLLM config JSONs under `safedir/` to respect max model length."""
         from .vllm_backend import ensure_vllm_config
 
         return ensure_vllm_config(self, safedir)
@@ -860,6 +873,10 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
 
     @property
     def max_gen_toks(self) -> int:
+        # lm-eval uses this as the default `max_gen_toks` for generation when a
+        # task doesn't specify it. For native compression models, we historically
+        # re-used `compress_threshold` as a reasonable default cap (many tasks
+        # override this via `generation_kwargs` anyway).
         return self._compress_threshold or self._max_seq_length or self._vllm_max_model_len
 
     @property
@@ -893,6 +910,8 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
     
     @property
     def stop_ids(self) -> List[int]:
+        # vLLM can stop on token ids. We include common "end of turn" markers
+        # used by Qwen-style chat templates, plus EOS.
         tokens = ["<|im_end|>","</s>","<|eot_id|>"]
         ids = []
         for token in tokens:
@@ -1657,6 +1676,21 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         return _impl(self, requests, disable_tqdm=disable_tqdm, override_bs=override_bs)
 
     def _get_doc_and_context(self, ctx_tokens_list: List[List[int]], *, batch_start: int = 0) -> Dict[str, List[str]]:
+        """Split the current batch into structured (context, question/query) fields.
+
+        For long-context suites and compression-aware modes we prefer to operate
+        on structured doc fields rather than regex-splitting the raw prompt.
+
+        This helper reads `Instance.doc` + `Instance.task_name` values that were
+        captured by `NativeCausalLM.loglikelihood()` into `_active_loglikelihood_*`
+        fields, then calls `split_doc_and_query(...)` to produce:
+        - context_list: the "document" portion that should be compressed
+        - query_list: the question/instruction that should be kept near the answer
+        - assistant_prefix_list: any assistant prefill used by chat templates
+
+        `batch_start` is used because lm-eval calls loglikelihood in batches and
+        we need to slice the saved doc list consistently.
+        """
         if self._active_loglikelihood_docs is None or self._active_loglikelihood_task_names is None:
             raise RuntimeError("_active_loglikelihood_docs/task_names not set; call via NativeCausalLM.loglikelihood().")
 
@@ -1677,6 +1711,7 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         keys = get_doc_query_keys_by_task_name(task0)
         doc_key, question_key = keys["doc_key"], keys["question_key"]
 
+        # Use decode-with-special-tokens so any BOM/EOM/BOQ markers are preserved in debug.
         prompt_list = [self._tokenizer.decode_w_special_tokens(ctx) for ctx in ctx_tokens_list]
         split_doc_and_query_results = _split_doc_and_query(
             active_lg_docs=docs_slice,

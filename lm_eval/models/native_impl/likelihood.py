@@ -457,6 +457,23 @@ def _loglikelihood_tokens_compress_answer(
 
 
     def _split_ctx_for_compression(ctx_tokens: List[int], cont_len: int) -> Tuple[List[int], List[int]]:
+        """Split raw prompt tokens into (head_to_compress, suffix_raw_to_keep).
+
+        Goal:
+        - Keep the *decoder* prompt within `max_length`/`decoder_budget`
+        - While ensuring `mode=compress_answer` actually performs compression
+          (at least one compressed span when `force_min_span=True`).
+
+        Intuition:
+        - Each compressed span replaces ~`max_mem_span_len` raw tokens with a fixed
+          decoder-cost block: `<BOM> + num_comp slots + <EOM>`, i.e. `span_cost`.
+        - This yields a savings of roughly: `saving = max_mem_span_len - span_cost`
+          decoder tokens per compressed span.
+
+        The returned `suffix_raw` is kept verbatim near the answer. For short MCQ
+        prompts (MMLU/ARC/HellaSwag), this suffix often contains the question +
+        options and is crucial for stable scoring.
+        """
         if not ctx_tokens:
             return [], []
         force_min_span = bool(getattr(self, "_compress_answer_force_min_span", True))
@@ -478,8 +495,10 @@ def _loglikelihood_tokens_compress_answer(
         if total_spans * span_cost + cont_len > max_len:
             return ctx_tokens, []
 
-        # Need k spans compressed so that:
-        #   raw_len + cont_len - k*(max_mem_span_len - (num_comp+2)) <= max_len
+        # Need k spans compressed so that the *effective* decoder prompt fits:
+        #   raw_len + cont_len - k * saving <= max_len
+        #
+        # where `saving = max_mem_span_len - (num_comp + 2)` for per-span memory blocks.
         need = raw_len + cont_len - max_len
         if need <= 0:
             k = raw_len // max_mem_span_len  # compress all full spans; keep remainder as suffix
@@ -489,8 +508,12 @@ def _loglikelihood_tokens_compress_answer(
         raw_comp_len = k * max_mem_span_len
         # In compress_answer mode, keep behavior deterministic: if we have any context,
         # force at least one compressed span so the mode is semantically different from decoder.
-        # This primarily affects short MCQ prompts (e.g., MMLU) where raw_len < max_mem_span_len.
-        # Keep a raw suffix to preserve near-answer semantics.
+        #
+        # This primarily affects short prompts where `raw_len < max_mem_span_len`; without this,
+        # we'd compress nothing (n_spans=0) and become equivalent to decoder mode.
+        #
+        # `min_suffix_tokens` controls how many raw tokens we try to keep uncompressed.
+        # Set it to 0 for "fully compressed" behavior (riskier for MCQ).
         if force_min_span and raw_len > 0 and raw_comp_len <= 0:
             # Preserve at least `min_suffix_tokens` raw tokens when possible.
             max_head_len = max(1, raw_len - min_suffix_tokens)
