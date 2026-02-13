@@ -38,6 +38,22 @@ def _loglikelihood_tokens(
     disable_tqdm: bool = False,
     override_bs: Optional[int] = None,
 ) -> List[Tuple[float, bool]]:
+    """Main loglikelihood entrypoint for the native adapter (token-based API).
+
+    lm-evaluation-harness provides `requests` in the common TemplateLM format:
+      [
+        ((context_str, continuation_str), context_token_ids, continuation_token_ids),
+        ...
+      ]
+
+    Return value is a list of `(logprob_sum, greedy_match)` per request.
+
+    Notes on MCQ scoring:
+    - For standard MCQ tasks, lm-eval constructs one request per candidate option.
+    - When `mcq_score_mode=ll`, we just compute LL over the continuation tokens.
+    - When `mcq_score_mode` is verifier-based, we build a yes/no verifier prompt
+      per candidate and score "Yes" vs "No" continuations instead.
+    """
     has_comp = hasattr(self.model, "compression_embeddings")
     # Optional mode: compress the context into memory first, then score the answer.
     if self._mode == "compress_answer" and has_comp:
@@ -72,6 +88,13 @@ def _loglikelihood_tokens(
         docs_slice: List[Optional[dict]] = [None] * len(chunk)
         choice_idxs_slice: List[Optional[int]] = [None] * len(chunk)
         if use_mcq_verifier:
+            # In verifier mode we need additional context to build the verifier prompt:
+            # - the original `doc` (contains question/options)
+            # - the candidate index (which option is this request scoring?)
+            #
+            # These are stored on the model instance by `NativeCausalLM.loglikelihood`
+            # right before calling into this helper (so we don't have to thread
+            # them through lm-eval's request tuple format).
             try:
                 if self._active_loglikelihood_docs:
                     for bi in range(len(chunk)):

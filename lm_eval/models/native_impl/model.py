@@ -1,3 +1,24 @@
+"""Native harness model implementation (`--model native`).
+
+This module defines `NativeCausalLM`, the lm-evaluation-harness model adapter
+used by this monorepo's *native-rag* evaluation jobs.
+
+High-level responsibilities:
+- Parse `--model_args` coming from the lm-eval CLI (native checkpoints vs HF).
+- Initialize tokenizer + torch model, and optionally a vLLM backend.
+- Route scoring/generation calls into mode-specific helpers implemented in
+  sibling modules (`likelihood.py`, `generate.py`, `reconstruct.py`, ...).
+- Provide debug artifacts colocated with lm-eval output directories.
+
+This file intentionally keeps GPU-heavy optional imports *lazy* (wrapped in
+try/except and validated at runtime) so `import lm_eval` does not hard-fail in
+minimal environments.
+
+See also:
+- `lm_eval/models/native.py` (stable entrypoint / registry hook)
+- `lm_eval/models/native_impl/README.md` (usage + module map)
+"""
+
 import os
 import sys
 from pathlib import Path
@@ -51,6 +72,9 @@ def _maybe_add_native_rag_root_to_syspath() -> None:
             return
 
 
+# This must run before we import any in-tree modules (`arch/`, `eval_func/`, ...)
+# so that `python -m lm_eval ...` works even when executed from within
+# `lm-evaluation-harness/`.
 _maybe_add_native_rag_root_to_syspath()
 
 import json
@@ -73,6 +97,8 @@ try:
     # from arch.comp_mem import CompressedMemoryModel as Model
     from arch.comp_mem import MassiveCompressedMemoryModel as Model  # type: ignore
 except Exception as _e:  # pragma: no cover
+    # Stash the import error so we can re-raise it with a clearer message when
+    # a user actually tries to instantiate the model.
     ModelArgs = None  # type: ignore[assignment]
     create_kv_cache = None  # type: ignore[assignment]
     Model = None  # type: ignore[assignment]
@@ -158,18 +184,34 @@ from .utils import (
 
 from .scoring_mixin import ScoringMixin
 
+
 def _default_distributed_args() -> DistributedArgs:
+    """Build a minimal `DistributedArgs` from torchrun-style env vars.
+
+    We don't require `accelerate` for evaluation, but many of our jobs are
+    launched under torchrun (or AMLT/azure wrappers that set RANK/WORLD_SIZE).
+    This helper provides consistent defaults when those env vars are absent.
+    """
     rank = int(os.environ.get("RANK", 0))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     return DistributedArgs(rank=rank, local_rank=local_rank, world_size=world_size)
 
+
 class NativeCausalLM(ScoringMixin, TemplateLM):
     """
     Minimal lm-evaluation-harness adapter for the native arch.Model checkpoints.
 
-    Usage example:
-    --model native --model_args checkpoint_dir=/path/to/ckpt,batch_size=4,max_seq_length=8192,mode=decoder
+    This adapter supports two "weight sources":
+    - Native checkpoints (`checkpoint_dir=...`): expects a `metadata.json`.
+    - HF/transformers checkpoints (`pretrain_model_dir=...`): loaded via HF
+      model classes, and can be used to sanity-check harness behavior.
+
+    Usage examples:
+    - Native checkpoint (decoder):
+      `--model native --model_args checkpoint_dir=/path/to/ckpt,tokenizer_path=/path/to/tok,mode=decoder`
+    - HF checkpoint (decoder):
+      `--model native --model_args pretrain_model_dir=Qwen/Qwen3-4B-Base,mode=decoder`
 
     mode:
       - decoder (default): vanilla causal scoring on decoder tokens only.
@@ -177,6 +219,8 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
       - reconstruct_first: reconstruct the context (optionally with vLLM prompt_embeds), then score continuation PPL.
       - vllm_decoding_with_compress: use vLLM to decode the context, then compress the context conditioned on memory.
       - niah_generate: NIAH-focused generate-only path (no likelihood); uses compressed-memory decoding and optional BOR.
+
+    For more details, see `lm_eval/models/native_impl/README.md`.
     """
 
     backend = "causal"
@@ -280,6 +324,12 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         
     ) -> None:
         super().__init__()
+
+        # -----------------------------
+        # Basic runtime configuration
+        # -----------------------------
+        # The native checkpoints are trained/evaluated primarily on CUDA. We still accept
+        # `--device` from lm-eval for compatibility, but will prefer CUDA when available.
         self._dtype = _str_to_dtype(dtype)
         resolved_device = None
         if device:
@@ -299,6 +349,9 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                 resolved_device = torch.device("cuda")
         self._device = resolved_device
 
+        # -----------------------------
+        # Dependency validation (monorepo-only)
+        # -----------------------------
         # Fail fast with a clear error if the optional `arch/` dependency chain
         # (e.g. flash-attn) is not available in the current environment.
         if ModelArgs is None or Model is None or DistributedArgs is None or load_checkpoint_harness is None:
@@ -309,6 +362,9 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                 "provided GPU container."
             ) from cause
 
+        # -----------------------------
+        # High-level mode / backend selection
+        # -----------------------------
         self._batch_size = int(batch_size) if isinstance(batch_size, (int, float)) or str(batch_size).isdigit() else 1
         self._mode = _parse_mode(mode)
         self._max_mem_span_len_override = max_mem_span_len
@@ -319,12 +375,14 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         self._vllm_output_root = vllm_output_root
         self._vllm_model_dir = None
         self._last_generate_debug: List[dict] = []
+
         # vLLM init/runtime knobs
         if vllm_enforce_eager is None:
             # prompt_embeds path is sensitive to vLLM compilation/cudagraph; prefer eager.
             self._vllm_enforce_eager = True
         else:
             self._vllm_enforce_eager = bool(vllm_enforce_eager)
+
         # Populated by our overridden `loglikelihood()` so `_loglikelihood_tokens_*` can
         # access structured dataset fields via `Instance.doc` when needed.
         self._active_loglikelihood_docs: Optional[List[Optional[dict]]] = None
@@ -336,14 +394,22 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         self._active_context_key = "context"
         self._active_question_key = "question"
         
+        # NOTE: historically we supported a separate vLLM reconstruction batch size; in practice
+        # we keep it tied to `batch_size` to avoid surprising OOMs.
         # self._vllm_reconstruct_batch_size = max(1, int(vllm_reconstruct_batch_size))
         self._vllm_reconstruct_batch_size = self._batch_size
         self._ppl_batch_size = max(1, int(ppl_batch_size)) if ppl_batch_size is not None else self._batch_size
+
+        # -----------------------------
+        # Compression model knobs
+        # -----------------------------
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
         self._compress_answer_min_suffix_tokens = max(
             0, _coerce_int(compress_answer_min_suffix_tokens, 128) or 0
         )
+        # `compress_answer` often needs to keep a small raw suffix so short MCQ prompts
+        # don't become "all memory slots". Set this to 0 for "fully compressed" behavior.
         self._compress_answer_force_min_span = _coerce_bool(compress_answer_force_min_span, default=True)
         self._max_cycles = max(1, int(max_cycles))
         self._compress_start_tokens = []
@@ -357,6 +423,10 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                 t = t.strip()
                 if t:
                     self._compress_start_tokens.append(t)
+
+        # -----------------------------
+        # Prompt formatting / generation knobs
+        # -----------------------------
         self._chat_use_template = bool(use_chat_template)
         self._chat_template_version = chat_template_version
         self._chat_add_generation_prompt = bool(chat_add_generation_prompt)

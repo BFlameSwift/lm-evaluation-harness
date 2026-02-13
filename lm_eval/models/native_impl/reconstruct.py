@@ -31,6 +31,20 @@ from .utils import token_embed as _token_embed
 
 
 def _split_contexts_to_spans(self, contexts: Optional[List[str]], span_len: int) -> List[List[int]]:
+    """Tokenize and split raw context strings into fixed-length spans.
+
+    Compression models consume the context as many "encoder micro-batches"
+    (spans). Each span is later turned into `num_compression_tokens` memory
+    slots for the decoder.
+
+    Args:
+        contexts: list of raw context strings (or a single string).
+        span_len: max number of *raw tokens* per span (placeholders are added
+          separately by the compression code).
+
+    Returns:
+        A list of token-id lists, one per span.
+    """
     if contexts is None:
         return []
     if isinstance(contexts, str):
@@ -242,7 +256,11 @@ def _compress_plain_sequence(self, tokens: torch.Tensor, num_comp: Optional[int]
     """
     if num_comp is None:
         num_comp = getattr(self.model.args, "num_compression_tokens", 0)
-    d_model = int(getattr(getattr(self, "model", None), "args", None).d_model) if hasattr(getattr(self, "model", None), "args") else 0
+    # `d_model` is only needed to construct empty tensors when inputs are empty.
+    # Keep this extremely defensive: some HF models do not expose `model.args`.
+    model_obj = getattr(self, "model", None)
+    model_args = getattr(model_obj, "args", None) if model_obj is not None else None
+    d_model = int(getattr(model_args, "d_model", 0) or 0)
     span_limit = getattr(self.model.args, "max_mem_span_len", None)
     if span_limit is None or span_limit <= 0:
         max_len = self._max_seq_length
@@ -257,7 +275,9 @@ def _compress_plain_sequence(self, tokens: torch.Tensor, num_comp: Optional[int]
             else torch.empty(0, device=self.device, dtype=self._dtype)
         )
 
-    # we always append placeholders for compression tokens
+    # We always append placeholder token IDs for compression tokens.
+    # The *values* of these placeholder IDs are irrelevant because the encoder
+    # uses `encoder_mem_mask` to mark them; we use 0 for simplicity.
     if num_comp <= 0:
         return (
             torch.empty((0, d_model), device=self.device, dtype=self._dtype)
@@ -325,7 +345,47 @@ def _build_compress_prompt_embeds_batch(
     
 ) -> Tuple[List[Optional[torch.Tensor]], Optional[Dict[str, List[Any]]]]:
     """
-    Batch build prompt embeddings for compress_answer/reconstruct_first with optional BOR.
+    Build per-sample `prompt_embeds` for compression-aware modes.
+
+    This is the core "prompt_embeds builder" used by:
+    - `mode=compress_answer`
+    - `mode=reconstruct_first`
+    - some long-context generation modes (e.g. NIAH) that rely on vLLM
+
+    The prompt layout is roughly:
+
+      [optional chat scaffold]
+      (<BOM> + [mem slots] + <EOM>) repeated for each compressed span
+      + [optional BOQ token]
+      + raw query/suffix tokens
+      + [optional BOR token]
+      + [optional assistant prefix]
+
+    Important budgets:
+    - `decoder_budget` is the max prompt length that *the decoder/vLLM* can accept.
+      When vLLM is used, we clamp this budget to `vllm_max_model_len` because vLLM
+      rejects overlong prompt_embeds requests.
+    - `span_len` is the length of each *raw* encoder span before placeholder
+      compression tokens are appended (`span_len + num_comp <= encoder max len`).
+
+    Args:
+      prompts: raw full prompt strings (used when `context_list/query_list` not provided).
+      gen_lens: max generation length for each prompt (used to reserve space).
+      include_bor: whether to insert BOR token(s) after the query (reconstruct-first style).
+      decoder_include_prompt_tokens: whether to embed the original raw prompt tokens
+        in addition to memory slots (mostly for debugging).
+      decoder_memory_layout:
+        - "per_span": each span is represented as `<BOM> slots <EOM>` (default).
+        - "single": all slots are placed in one `<BOM> ... <EOM>` block.
+      prompt_tokens_override: optional pre-tokenized prompts to avoid re-tokenization
+        and to enforce exact tokenization parity with upstream callers.
+      context_list/query_list: when provided, treat context and query separately; this
+        is preferred for long-context suites because it avoids fragile regex splits.
+
+    Returns:
+      embeds: list of `[prompt_len, d_model]` tensors (or None for skipped samples).
+      meta (optional): lists aligned with `prompts` containing:
+        - n_spans, flat_ctx_len, slots, comp_mask_list, prefix_lens
     """
     if len(prompts) != len(gen_lens):
         raise ValueError(f"prompts and gen_lens must have same length; got {len(prompts)} vs {len(gen_lens)}")

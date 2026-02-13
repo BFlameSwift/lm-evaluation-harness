@@ -7,9 +7,10 @@ Why this exists:
 - The actual implementation lives under `native_impl/` so we can split large
   subsystems (likelihood / generation / reconstruction backends) into multiple
   modules without fighting `native.py`'s historical size.
+
+See `native_impl/README.md` for usage and a module map.
 """
 
 from .model import NativeCausalLM
 
 __all__ = ["NativeCausalLM"]
-

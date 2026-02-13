@@ -18,7 +18,9 @@ import torch.nn.functional as F
 
 from .mcq_scoring import (
     _build_choice_verifier_prompt_text,
+    _extract_options_block_from_prompt_text,
     _is_mcq_verifier_mode,
+    _normalize_verifier_question_context,
     _resolve_verifier_score_mode,
     _verifier_score_from_ll,
 )
@@ -28,6 +30,12 @@ class ScoringMixin:
     """Mixin that provides verifier + logprob scoring helpers."""
 
     def _get_likelihood_prefix_tokens(self, mode: str) -> List[int]:
+        """Return cached prefix tokens inserted before likelihood scoring.
+
+        Some configs want to prepend a short marker before scoring (e.g. "Answer:")
+        to match few-shot formatting. Prefixes are cached per mode to avoid
+        repeated tokenization.
+        """
         if mode == "reconstruct_first":
             cached = getattr(self, "_likelihood_prefix_tokens_reconstruct", None)
             if cached is None:
@@ -45,6 +53,7 @@ class ScoringMixin:
         return []
 
     def _get_verifier_prompt_suffix_tokens(self) -> List[int]:
+        """Return cached token ids appended to MCQ verifier prompts."""
         cached = getattr(self, "_verifier_prompt_suffix_tokens", None)
         if cached is None:
             text = getattr(self, "_verifier_prompt_suffix", "")
@@ -53,15 +62,24 @@ class ScoringMixin:
         return cached
 
     def _use_mcq_verifier(self) -> bool:
+        """Whether the current run uses the yes/no verifier scoring path."""
         return _is_mcq_verifier_mode(getattr(self, "_mcq_score_mode", "ll"))
 
     def _active_verifier_score_mode(self) -> str:
+        """Resolve the effective yes/no conversion mode (`yes_*`)."""
         return _resolve_verifier_score_mode(
             getattr(self, "_mcq_score_mode", "ll"),
             getattr(self, "_verifier_score_mode", "yes_prob"),
         )
 
     def _resolve_choice_text_from_doc(self, doc: Optional[dict], choice_idx: Optional[int]) -> Optional[str]:
+        """Best-effort lookup of option text for a given MCQ choice index.
+
+        Supported doc formats (common across harness tasks):
+        - MMLU: `{"choices": [str, ...]}`
+        - ARC: `{"choices": {"text": [...], "label": [...]}}`
+        - HellaSwag: `{"endings": [str, ...]}` (after `process_docs`)
+        """
         if not isinstance(doc, dict):
             return None
         if choice_idx is None:
@@ -92,11 +110,16 @@ class ScoringMixin:
 
     @staticmethod
     def _choice_label_from_index(idx: int) -> str:
+        """Convert `0 -> A`, `1 -> B`, ... for verifier-friendly labeling."""
         if idx < 26:
             return chr(ord("A") + idx)
         return str(idx + 1)
 
     def _resolve_choice_options_from_doc(self, doc: Optional[dict]) -> str:
+        """Build a short `(A) ...` options block from the doc for verifier prompts.
+
+        This is intentionally truncated to keep verifier prompts bounded.
+        """
         if not isinstance(doc, dict):
             return ""
 
@@ -144,6 +167,30 @@ class ScoringMixin:
         context_tokens: Optional[List[int]] = None,
         context_text: Optional[str] = None,
     ) -> Tuple[List[int], Dict[str, Any]]:
+        """Build the *verifier prompt* tokens appended to a base LL prompt.
+
+        In MCQ verifier modes (`mcq_score_mode in {verifier, yes_*}`), we do not
+        directly compare option continuations via plain loglikelihood.
+
+        Instead, for each MCQ option we:
+        1) build a *single* base prompt (usually the task's LL prompt),
+        2) append a structured "Candidate + Question/Options" block,
+        3) score the loglikelihood of "Yes" vs "No" continuations.
+
+        This helper returns the tokens for step (2) plus metadata for debugging.
+
+        Candidate selection preference order:
+        - If `doc` contains explicit option text for `choice_idx`, use that.
+        - If the raw continuation is a label like "A"/"B"/"C"/"D", try mapping
+          label -> doc option text.
+        - Otherwise, fall back to the original continuation tokens.
+
+        Notes on bias:
+        - When the continuation is only a label, including the label again in
+          the verifier prompt can introduce a strong positional prior. The
+          default `candidate_style=auto` attempts to reduce this by using
+          text-only candidates when possible.
+        """
         choice_text = self._resolve_choice_text_from_doc(doc, choice_idx)
         label_text = str(continuation_str or "").strip()
         candidate_style = str(getattr(self, "_mcq_verifier_candidate_style", "auto") or "auto").strip().lower()
@@ -161,6 +208,8 @@ class ScoringMixin:
                 label_for_prompt = label_clean
 
         if (not choice_text) and isinstance(doc, dict):
+            # Some harness tasks return label-only continuations (e.g. "(C)" or "C").
+            # If we can map that label back to a choice text from the doc, do so.
             label_u = str(label_for_prompt or "").strip().upper()
             if len(label_u) == 1 and ("A" <= label_u <= "Z"):
                 idx_from_label = ord(label_u) - ord("A")
@@ -194,6 +243,13 @@ class ScoringMixin:
             meta["source"] = "continuation_tokens"
             return list(continuation_tokens), meta
 
+        # ------------------------------
+        # Build question/options context
+        # ------------------------------
+        # The verifier prompt needs *some* grounding context. We try to extract:
+        # - question text (preferred): doc["question"]/["query"]/["prompt"]/["input"]
+        # - options block (preferred): doc["choices"]/["endings"] rendered as "(A) ..."
+        # - and keep an excerpt from the original LL prompt tail as a formatting hint.
         question_context = ""
         if isinstance(doc, dict):
             for key in ("question", "query", "prompt", "input"):
@@ -276,6 +332,18 @@ class ScoringMixin:
         decoder_budget: int,
         rows_per_chunk: int,
     ) -> Dict[str, Any]:
+        """Score the verifier's Yes/No continuations given a *fixed* base prefix.
+
+        Why variants exist:
+        - Tokenizers can treat `"Yes"` vs `" Yes"` very differently.
+        - Some tasks/chat templates may bias toward specific casing/spacing.
+
+        We therefore score multiple Yes variants and multiple No variants, pick
+        the best loglikelihood within each group, and then convert the two best
+        scores into a scalar according to `yes_only|yes_minus_no|yes_prob`.
+
+        Returns a dict with the winning variants and per-variant diagnostics.
+        """
         yes_scores: List[Dict[str, Any]] = []
         for variant, toks in self._verifier_yes_variants:
             out = self._score_continuation_fixed_base(
@@ -322,6 +390,15 @@ class ScoringMixin:
         continuation_tokens: List[int],
         decoder_budget: int,
     ) -> Dict[str, Any]:
+        """Score a continuation on top of `base_tokens` using token IDs only.
+
+        This is a *fallback* scorer used when we can't use the native fused
+        decoder stack (`model.layers/norm/output`) and have to rely on generic
+        HF-style `self._model_call`.
+
+        To ensure we don't exceed `decoder_budget`, we tail-truncate the base
+        (keep the suffix) so that `len(base)+len(cont)` fits.
+        """
         cont = list(continuation_tokens or [])
         if not cont:
             return {"ll": 0.0, "greedy": True}
@@ -399,6 +476,12 @@ class ScoringMixin:
         base_tokens: List[int],
         decoder_budget: int,
     ) -> Dict[str, Any]:
+        """Token-based verifier scoring (no prompt_embeds / no fixed-base embeds).
+
+        This path is slower than `_score_verifier_yes_no_from_base` because it
+        re-runs the forward pass for each yes/no variant using token IDs.
+        It's used as a compatibility fallback for HF models.
+        """
         yes_scores: List[Dict[str, Any]] = []
         for variant, toks in self._verifier_yes_variants:
             out = self._score_continuation_on_tokens(
@@ -733,8 +816,15 @@ class ScoringMixin:
         rows_per_chunk: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Forward a ragged batch and score the continuation tokens that start at
-        `prefix_lens[i]` for each sample.
+        Forward a ragged batch and score continuation tokens starting at `prefix_lens[i]`.
+
+        This function is the "common case" wrapper around `_forward_score_token_ranges`:
+        - each sample has a single continuation segment (cont_targets[i])
+        - the continuation starts immediately after a shared prefix of length `prefix_lens[i]`
+
+        Alignment reminder:
+        - to score target token at index `t`, we use logits from position `t-1`.
+          Therefore `prefix_lens` must be >= 1.
         """
         n = len(seq_embeds)
         if len(cont_targets) != n or len(prefix_lens) != n:

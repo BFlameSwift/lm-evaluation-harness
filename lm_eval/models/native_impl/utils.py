@@ -24,7 +24,16 @@ T = TypeVar("T")
 
 
 def filter_kwargs_for(cls: Type[T], raw_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-    """Filter kwargs for a class __init__ method."""
+    """Filter a kwargs mapping so it is safe to pass to ``cls(...)``.
+
+    This is primarily used for "optional" kwargs that depend on the target
+    function signature (e.g., some checkpoints accept `show_progress=True`,
+    others do not). We inspect the signature and keep only keyword parameters.
+
+    Notes:
+    - If the class accepts `**kwargs`, this function still filters explicitly
+      so call sites can be deterministic.
+    """
     sig = inspect.signature(cls)
     valid_names = {
         name
@@ -40,7 +49,11 @@ def filter_kwargs_for(cls: Type[T], raw_kwargs: Mapping[str, Any]) -> Dict[str, 
 
 
 def filter_kwargs_for_callable(fn: Any, raw_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-    """Filter kwargs for an arbitrary callable (bound method/function)."""
+    """Filter a kwargs mapping so it is safe to call ``fn(**filtered)``.
+
+    If ``fn`` has a `**kwargs` parameter, we return the raw mapping unchanged.
+    Otherwise, we only keep recognized keyword arguments.
+    """
     try:
         sig = inspect.signature(fn)
     except Exception:
@@ -60,6 +73,15 @@ def filter_kwargs_for_callable(fn: Any, raw_kwargs: Mapping[str, Any]) -> Dict[s
 
 
 def str_to_dtype(name: Optional[str]) -> torch.dtype:
+    """Parse a user-facing dtype string into a ``torch.dtype``.
+
+    Accepted aliases:
+    - bf16/bfloat16
+    - fp16/float16/half
+    - fp32/float32
+
+    `None`/`"auto"` defaults to bf16 (matches most of our evaluation configs).
+    """
     if name is None or name == "auto":
         return torch.bfloat16
     if isinstance(name, torch.dtype):
@@ -75,6 +97,10 @@ def str_to_dtype(name: Optional[str]) -> torch.dtype:
 
 
 def parse_mode(name: Optional[str]) -> str:
+    """Validate/normalize the `native` execution mode string.
+
+    This is used to parse `--model_args mode=...` from lm-eval CLI.
+    """
     if name is None:
         return "decoder"
     name = name.lower()
@@ -90,6 +116,13 @@ def parse_mode(name: Optional[str]) -> str:
 
 
 def coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional[int]:
+    """Best-effort convert a value into an int, with common string conventions.
+
+    Examples:
+    - `"123"` -> 123
+    - `"none"` / `""` -> default
+    - `True` -> 1
+    """
     if value is None:
         return default
     if isinstance(value, bool):
@@ -109,6 +142,13 @@ def coerce_int(value: Optional[Any], default: Optional[int] = None) -> Optional[
 
 
 def coerce_bool(value: Optional[Any], default: bool = False) -> bool:
+    """Best-effort convert a value into a bool, with common string conventions.
+
+    Examples:
+    - `"1"`, `"true"`, `"yes"` -> True
+    - `"0"`, `"false"`, `"no"` -> False
+    - `""` / `"none"` -> default
+    """
     if value is None:
         return bool(default)
     if isinstance(value, bool):
@@ -127,6 +167,16 @@ def coerce_bool(value: Optional[Any], default: bool = False) -> bool:
 
 
 def normalize_optional_text(value: Optional[Any]) -> str:
+    """Normalize "optional string" style arguments.
+
+    Convention:
+    - `None`, `""`, `"none"` => `""`
+    - otherwise return a string.
+
+    Important: for backward compatibility, we return the original string (not
+    the stripped one) when it is non-empty. Callers that need stripping should
+    apply `str(...).strip()` themselves.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -169,6 +219,19 @@ def derive_lm_eval_output_dir(
 
 
 def token_embed(model: torch.nn.Module, token_ids: torch.Tensor) -> torch.Tensor:
+    """Lookup token embeddings for ``token_ids``.
+
+    Our `arch` checkpoints expose a LLaMA/Qwen-style attribute `tok_embeddings`.
+    For maximum compatibility we also support HF-style `get_input_embeddings()`.
+
+    Args:
+        model: The loaded model module.
+        token_ids: 1D/2D tensor of token ids (dtype long) on the target device.
+
+    Returns:
+        The embedding tensor. Shape matches the input token shape with an extra
+        hidden dimension (e.g., `[T, D]` for a 1D token list).
+    """
     if hasattr(model, "tok_embeddings"):
         return model.tok_embeddings(token_ids)  # type: ignore[attr-defined]
     if hasattr(model, "get_input_embeddings"):
@@ -176,4 +239,3 @@ def token_embed(model: torch.nn.Module, token_ids: torch.Tensor) -> torch.Tensor
         if emb_layer is not None:
             return emb_layer(token_ids)
     raise AttributeError("Model does not expose token embedding layer (tok_embeddings/get_input_embeddings)")
-

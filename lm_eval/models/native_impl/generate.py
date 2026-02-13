@@ -149,6 +149,24 @@ def resolve_max_gen_toks(
 
 
 def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
+    """lm-eval `generate_until` implementation for the `native` adapter.
+
+    lm-evaluation-harness calls `generate_until` with a list of request objects.
+    Each request typically contains:
+    - `req.args`: a tuple like `(prompt_text, generation_kwargs_dict)`
+    - optional `req.doc`, `req.task_name`, `req.doc_id` for richer debugging
+
+    This function supports multiple backend/mode combinations:
+    - torch decoder-only generation (`mode=decoder`, no vLLM)
+    - vLLM-based decoder generation (when `use_vllm_*` is enabled)
+    - compression-aware prompt_embeds generation (e.g. `compress_answer`, `niah_generate`)
+
+    The heavy-lifting is delegated to helper methods on `NativeCausalLM`; this
+    wrapper mainly:
+    - batches requests
+    - initializes vLLM lazily when needed
+    - enforces prompt length caps to avoid vLLM hard failures
+    """
     results: List[str] = []
 
     def _get_max_gen_tokens(gen_kwargs: dict) -> int:
@@ -192,6 +210,8 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
             )
 
     def _infer_doc_id(doc: Optional[dict], doc_id: Any) -> Any:
+        # Some tasks don't populate `doc_id`, but store an identifier inside `doc`.
+        # This helps make debug JSONL easier to join with dataset rows.
         if doc_id is not None:
             return doc_id
         if not isinstance(doc, dict):
@@ -215,6 +235,8 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         debug_rows: List[dict] = []
 
         gkwargs = [g for _, g in chunk]
+        # A few tasks pass template flags via generation_kwargs; plumb them into
+        # the model instance so downstream prompt formatting matches task intent.
         if gkwargs[0].get("add_thinking_tokens", False):
             self._add_thinking_tokens = True
         if gkwargs[0].get("use_chat_template", False):
