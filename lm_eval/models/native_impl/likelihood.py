@@ -26,9 +26,12 @@ from data.ae_loader import (
 from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
 from lm_eval.models.native_doc_utils import get_doc_query_keys_by_task_name, split_doc_and_query
 
-from .model import _apply_mcq_verifier_tie_break, _apply_verifier_score_norm, _token_embed
+from .mcq_scoring import _apply_mcq_verifier_tie_break, _apply_verifier_score_norm
+from .utils import token_embed as _token_embed
 
 _split_doc_and_query = split_doc_and_query
+
+
 def _loglikelihood_tokens(
     self,
     requests: List[Tuple[Tuple[str, str], List[int], List[int]]],

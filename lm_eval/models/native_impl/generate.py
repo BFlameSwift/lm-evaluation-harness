@@ -10,6 +10,8 @@ delegate to them.
 
 from __future__ import annotations
 
+import re
+from typing import Mapping
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -24,15 +26,126 @@ from data.ae_loader import (
 from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
 from lm_eval.models.native_doc_utils import get_doc_query_keys_by_task_name, split_doc_and_query
 
-from .model import (
-    _extract_niah_needles,
-    _infer_niah_needle_type,
-    _token_embed,
-    resolve_generation_kwargs,
-    resolve_max_gen_toks,
-)
+from .utils import token_embed as _token_embed
 
 _split_doc_and_query = split_doc_and_query
+
+
+_NIAH_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}\b"
+)
+_NIAH_MAGIC_NUMBER_RE = re.compile(r"\b\d{7}\b")
+
+
+def _infer_niah_needle_type(outputs: Any) -> str:
+    """Infer needle type from references (numbers vs uuids)."""
+    if not outputs:
+        return ""
+    if isinstance(outputs, (list, tuple)):
+        sample = str(outputs[0]) if outputs else ""
+    else:
+        sample = str(outputs)
+    if _NIAH_UUID_RE.search(sample):
+        return "uuids"
+    if _NIAH_MAGIC_NUMBER_RE.search(sample):
+        return "numbers"
+    return ""
+
+
+def _extract_niah_needles(text: str, needle_type: str) -> List[str]:
+    if not text:
+        return []
+    if needle_type == "uuids":
+        return _NIAH_UUID_RE.findall(text)
+    if needle_type == "numbers":
+        return _NIAH_MAGIC_NUMBER_RE.findall(text)
+    return []
+
+
+def resolve_generation_kwargs(
+    gen_kwargs: Mapping[str, Any],
+    *,
+    default_temperature: float,
+    default_top_p: float = 1.0,
+    override_do_sample: Optional[bool] = None,
+    override_temperature: Optional[float] = None,
+    override_top_p: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve per-request generation kwargs into a normalized set for vLLM/torch decoding.
+
+    Precedence (highest -> lowest):
+      1) explicit overrides passed via `--model_args gen_*`
+      2) task-provided `generation_kwargs` on the request
+      3) model defaults (`default_temperature`, `default_top_p`)
+
+    Note:
+      - `do_sample=False` forces greedy decoding (`temperature=0.0`).
+      - We keep `top_p` at 1.0 for greedy mode (top_p is irrelevant when temperature=0).
+    """
+    # Task defaults
+    try:
+        temperature = float(gen_kwargs.get("temperature", default_temperature))
+    except Exception:
+        temperature = float(default_temperature)
+    try:
+        top_p = float(gen_kwargs.get("top_p", default_top_p))
+    except Exception:
+        top_p = float(default_top_p)
+
+    # Infer do_sample if not explicitly provided.
+    do_sample_val = gen_kwargs.get("do_sample", None)
+    do_sample = bool(do_sample_val) if do_sample_val is not None else (temperature > 0.0)
+
+    # Apply overrides.
+    if override_do_sample is not None:
+        do_sample = bool(override_do_sample)
+    if override_temperature is not None:
+        try:
+            temperature = float(override_temperature)
+        except Exception:
+            pass
+    if override_top_p is not None:
+        try:
+            top_p = float(override_top_p)
+        except Exception:
+            pass
+
+    # Enforce greedy behavior when not sampling.
+    if not do_sample:
+        temperature = 0.0
+        top_p = 1.0
+
+    return {
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
+
+
+def resolve_max_gen_toks(
+    gen_kwargs: Mapping[str, Any],
+    *,
+    default_max_gen_toks: int,
+    override_max_gen_toks: Optional[int] = None,
+) -> int:
+    """Resolve `max_gen_toks` with an optional override."""
+    if override_max_gen_toks is not None:
+        try:
+            return int(override_max_gen_toks)
+        except Exception:
+            pass
+    for key in ("max_gen_toks", "max_generation_length"):
+        if key in gen_kwargs and gen_kwargs.get(key) is not None:
+            try:
+                return int(gen_kwargs[key])
+            except Exception:
+                continue
+    return int(default_max_gen_toks)
 
 
 def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:

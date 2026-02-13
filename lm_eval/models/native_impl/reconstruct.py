@@ -25,7 +25,9 @@ from data.ae_loader import (
 )
 from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
 
-from .model import _coerce_int, _token_embed, filter_kwargs_for_callable
+from .utils import coerce_int as _coerce_int
+from .utils import filter_kwargs_for_callable
+from .utils import token_embed as _token_embed
 
 
 def _split_contexts_to_spans(self, contexts: Optional[List[str]], span_len: int) -> List[List[int]]:
