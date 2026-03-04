@@ -740,6 +740,11 @@ class NativeCausalLM(TemplateLM):
         vllm_max_model_len: Optional[int] = None,
         vllm_tensor_parallel: int = 1,
         vllm_gpu_memory_utilization: float = 0.4,
+        vllm_allow_long_max_model_len: bool = False,
+        vllm_rope_type: Optional[str] = None,
+        vllm_rope_factor: Optional[float] = None,
+        vllm_rope_original_max_position_embeddings: Optional[int] = None,
+        vllm_rope_attention_factor: Optional[float] = None,
         # vLLM stability knob: disable compilation/cudagraph (recommended for prompt_embeds).
         # If unset, defaults to True when prompt_embeds are enabled.
         vllm_enforce_eager: Optional[bool] = None,
@@ -1236,6 +1241,25 @@ class NativeCausalLM(TemplateLM):
         self._vllm_tokenizer_path = tokenizer_path
         self._vllm_checkpoint_dir = checkpoint_dir
         self._vllm_dtype = dtype
+        self._vllm_allow_long_max_model_len = _coerce_bool(vllm_allow_long_max_model_len, default=False)
+        self._vllm_rope_scaling: Optional[Dict[str, Any]] = None
+        rope_type = str(vllm_rope_type or "").strip().lower()
+        if rope_type:
+            rope_cfg: Dict[str, Any] = {"type": rope_type}
+            try:
+                if vllm_rope_factor is not None:
+                    rope_cfg["factor"] = float(vllm_rope_factor)
+            except Exception:
+                pass
+            rope_orig = _coerce_int(vllm_rope_original_max_position_embeddings, None)
+            if rope_orig is not None and rope_orig > 0:
+                rope_cfg["original_max_position_embeddings"] = int(rope_orig)
+            try:
+                if vllm_rope_attention_factor is not None:
+                    rope_cfg["attention_factor"] = float(vllm_rope_attention_factor)
+            except Exception:
+                pass
+            self._vllm_rope_scaling = rope_cfg
         self._vllm_server_host = _normalize_optional_text(vllm_server_host)
         self._vllm_server_port = _coerce_int(vllm_server_port, None)
         auth_override = _normalize_optional_text(vllm_server_auth)

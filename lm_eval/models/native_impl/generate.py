@@ -368,7 +368,7 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                     task0 = str(t)
                     break
             task0_lower = task0.lower()
-            is_niah_task = (self._mode == "niah_generate") and ("niah" in task0_lower)
+            is_niah_task = "niah" in task0_lower
             is_longbench2_task = "longbench2" in task0_lower
             is_infinitebench_task = "infinitebench" in task0_lower
             is_longbench1_task = task0_lower.startswith("longbench_") and ("longbench2" not in task0_lower)
@@ -499,6 +499,9 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                     include_bor,
                     # Best-effort: include prompt tokens so the decoder sees the question.
                     decoder_include_prompt_tokens=True,
+                    # Raw prompt already includes the query; appending BOQ here can
+                    # shift generation into "start a new query" behavior.
+                    not_add_boq_index=True,
                 )
             # vLLM enforces a hard prompt length limit (`max_model_len`). Filter/clip
             # requests so a single over-long prompt does not crash the whole run.
@@ -681,6 +684,11 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                                 compress_meta[key] = val
                         except Exception:
                             continue
+                # Convenience mirrors for quick inspection without digging into compress_meta.
+                n_spans_dbg = compress_meta.get("n_spans")
+                span_len_dbg = compress_meta.get("span_len")
+                decoder_budget_dbg = compress_meta.get("decoder_budget")
+                vllm_max_model_len_dbg = compress_meta.get("vllm_max_model_len")
 
                 gen_debug_rows.append(
                     {
@@ -700,6 +708,11 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                         "sampling_params": sampling_params_by_idx.get(i),
                         "skip_reason": skip_reason[i] if i < len(skip_reason) else None,
                         "clip_note": clip_note[i] if i < len(clip_note) else None,
+                        "max_mem_span_len": int(getattr(self, "_max_mem_span_len", 0) or 0),
+                        "n_spans": n_spans_dbg,
+                        "span_len": span_len_dbg,
+                        "decoder_budget": decoder_budget_dbg,
+                        "vllm_max_model_len": vllm_max_model_len_dbg,
                         "compress_meta": compress_meta or None,
                         "response": outs_text[i] if i < len(outs_text) else "",
                     }

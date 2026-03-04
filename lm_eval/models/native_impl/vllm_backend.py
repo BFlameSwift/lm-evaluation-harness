@@ -76,6 +76,9 @@ def init_vllm_param(self) -> None:
                     "max_seq_len": self._max_seq_length,
                 },
             }
+            rope_cfg = getattr(self, "_vllm_rope_scaling", None)
+            if isinstance(rope_cfg, dict) and rope_cfg:
+                convert_kwargs["additional_kwargs"]["rope_scaling"] = rope_cfg
 
             def _resolve_local_safedir() -> str:
                 local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
@@ -190,6 +193,8 @@ def init_vllm(self) -> None:
         model_path = os.path.join(base_dir, "safemodel")
 
     try:
+        if bool(getattr(self, "_vllm_allow_long_max_model_len", False)):
+            os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
         cfg = VLLMEngineConfig(
             model_path=model_path,
             tensor_parallel_size=self._vllm_tensor_parallel,
@@ -244,6 +249,11 @@ def ensure_vllm_config(self, safedir: str) -> None:
         val = cfg.get(key)
         if not isinstance(val, int) or val <= 0:
             cfg[key] = target_len
+            updated = True
+    rope_cfg = getattr(self, "_vllm_rope_scaling", None)
+    if isinstance(rope_cfg, dict) and rope_cfg:
+        if cfg.get("rope_scaling") != rope_cfg:
+            cfg["rope_scaling"] = rope_cfg
             updated = True
 
     if updated:
@@ -447,4 +457,3 @@ def shutdown_vllm_manager(
                 )
             except Exception:
                 pass
-
