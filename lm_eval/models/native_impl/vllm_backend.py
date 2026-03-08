@@ -29,6 +29,9 @@ def _resolve_desired_vllm_rope_scaling(self) -> Any:
     desired = getattr(self, "_vllm_rope_scaling_override", None)
     if isinstance(desired, dict) and desired:
         return dict(desired)
+    legacy = getattr(self, "_vllm_rope_scaling", None)
+    if isinstance(legacy, dict) and legacy:
+        return dict(legacy)
     model_args = getattr(getattr(self, "model", None), "args", None)
     inherited = getattr(model_args, "rope_scaling", None)
     if isinstance(inherited, dict) and inherited:
@@ -281,6 +284,8 @@ def init_vllm(self) -> None:
         model_path = os.path.join(base_dir, "safemodel")
 
     try:
+        if bool(getattr(self, "_vllm_allow_long_max_model_len", False)):
+            os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
         cfg = VLLMEngineConfig(
             model_path=model_path,
             tensor_parallel_size=self._vllm_tensor_parallel,

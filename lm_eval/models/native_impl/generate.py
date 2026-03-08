@@ -24,7 +24,7 @@ from data.ae_loader import (
     END_OF_RECONSTRUCTION_INDEX,
 )
 from data.retrieval_loader import BEGIN_OF_QUERY_INDEX
-from lm_eval.models.native_doc_utils import get_doc_query_keys_by_task_name, split_doc_and_query
+from lm_eval.models.native_doc_utils import _split_niah_input, get_doc_query_keys_by_task_name, split_doc_and_query
 
 from .utils import token_embed as _token_embed
 
@@ -533,7 +533,7 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                     task0 = str(t)
                     break
             task0_lower = task0.lower()
-            is_niah_task = (self._mode == "niah_generate") and ("niah" in task0_lower)
+            is_niah_task = "niah" in task0_lower
             is_longbench2_task = "longbench2" in task0_lower
             is_infinitebench_task = "infinitebench" in task0_lower
             is_longbench1_task = task0_lower.startswith("longbench_") and ("longbench2" not in task0_lower)
@@ -657,14 +657,77 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                     prompts = [c for c, _ in chunk]
                     embeds = [None] * len(chunk)
             else:
-                prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
-                embeds = self._build_compress_prompt_embeds_batch(
-                    prompts,
-                    gen_lens,
-                    include_bor,
-                    # Best-effort: include prompt tokens so the decoder sees the question.
-                    decoder_include_prompt_tokens=True,
-                )
+                # For NIAH-like long-context prompts, never silently fall back to raw-prompt
+                # embedding without split: that can exceed vLLM max_model_len and violate the
+                # "compress first, then truncate head spans" budget policy.
+                niah_split_recovered = False
+                if is_niah_task:
+                    heuristic_context_list: List[str] = []
+                    heuristic_query_list: List[str] = []
+                    for c, _ in chunk:
+                        raw_prompt = (
+                            self._format_chat(c, add_generation_prompt=True)["decoder_prefix"]
+                            if self._chat_use_template
+                            else c
+                        )
+                        ctx_text, query_text = _split_niah_input(str(raw_prompt))
+                        if not ctx_text or not query_text:
+                            heuristic_context_list = []
+                            heuristic_query_list = []
+                            break
+                        heuristic_context_list.append(ctx_text)
+                        heuristic_query_list.append(query_text)
+
+                    if heuristic_context_list and len(heuristic_context_list) == len(chunk):
+                        split_data = {
+                            "context_list": heuristic_context_list,
+                            "query_list": heuristic_query_list,
+                            "question_list": heuristic_query_list,
+                        }
+                        prompts = [""] * len(chunk)
+                        build_ret = self._build_compress_prompt_embeds_batch(
+                            prompts,
+                            gen_lens,
+                            include_bor,
+                            decoder_include_prompt_tokens=False,
+                            context_list=split_data["context_list"],
+                            query_list=split_data["query_list"],
+                            return_meta=True,
+                        )
+                        if isinstance(build_ret, tuple):
+                            embeds, embeds_meta = build_ret
+                        else:
+                            embeds = build_ret
+                        niah_split_recovered = True
+
+                if not niah_split_recovered:
+                    if is_niah_task:
+                        # Do not fall back to raw-prompt embedding for NIAH; that defeats
+                        # compression semantics and can turn long samples into prompt-too-long skips.
+                        prompts = [c for c, _ in chunk]
+                        embeds = [None] * len(chunk)
+                        for i in range(len(chunk)):
+                            if not force_skip_split[i]:
+                                force_skip_split[i] = True
+                                force_skip_reasons[i] = "niah_split_recovery_failed"
+                    else:
+                        prompts = [self._format_chat(c, add_generation_prompt=True)["decoder_prefix"] for c, _ in chunk]
+                        build_ret = self._build_compress_prompt_embeds_batch(
+                            prompts,
+                            gen_lens,
+                            include_bor,
+                            # Best-effort: include prompt tokens so the decoder sees the question.
+                            decoder_include_prompt_tokens=True,
+                            # Raw prompt already includes the query; appending BOQ here can
+                            # shift generation into "start a new query" behavior.
+                            not_add_boq_index=True,
+                            # Always return meta so overflow handling can drop head spans.
+                            return_meta=True,
+                        )
+                        if isinstance(build_ret, tuple):
+                            embeds, embeds_meta = build_ret
+                        else:
+                            embeds = build_ret
             # vLLM enforces a hard prompt length limit (`max_model_len`). Filter/clip
             # requests so a single over-long prompt does not crash the whole run.
             vllm_max_len = int(getattr(self, "_vllm_max_model_len", 0) or 0)
@@ -846,6 +909,11 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                                 compress_meta[key] = val
                         except Exception:
                             continue
+                # Convenience mirrors for quick inspection without digging into compress_meta.
+                n_spans_dbg = compress_meta.get("n_spans")
+                span_len_dbg = compress_meta.get("span_len")
+                decoder_budget_dbg = compress_meta.get("decoder_budget")
+                vllm_max_model_len_dbg = compress_meta.get("vllm_max_model_len")
 
                 gen_debug_rows.append(
                     {
@@ -865,6 +933,11 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                         "sampling_params": sampling_params_by_idx.get(i),
                         "skip_reason": skip_reason[i] if i < len(skip_reason) else None,
                         "clip_note": clip_note[i] if i < len(clip_note) else None,
+                        "max_mem_span_len": int(getattr(self, "_max_mem_span_len", 0) or 0),
+                        "n_spans": n_spans_dbg,
+                        "span_len": span_len_dbg,
+                        "decoder_budget": decoder_budget_dbg,
+                        "vllm_max_model_len": vllm_max_model_len_dbg,
                         "compress_meta": compress_meta or None,
                         "response": outs_text[i] if i < len(outs_text) else "",
                     }
