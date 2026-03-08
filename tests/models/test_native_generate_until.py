@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 
 from lm_eval.models.native import NativeCausalLM
+from lm_eval.models.native_impl import generate as native_generate
 
 
 class _DummyTokenizer:
@@ -93,3 +94,72 @@ def test_generate_until_uses_generated_tokens_only():
     )
     out = NativeCausalLM.generate_until(lm, [req], disable_tqdm=True)
     assert out == ["10 11"]
+
+
+def test_generate_until_niah_torch_fallback_uses_split_compress(monkeypatch):
+    """NIAH torch fallback should route through split-compress, not monolithic prompt."""
+
+    lm = NativeCausalLM.__new__(NativeCausalLM)
+
+    lm._mode = "niah_generate"
+    lm._batch_size = 1
+    lm._device = torch.device("cpu")
+    lm._dtype = torch.float32
+    lm._temperature = 0.0
+    lm._decoder_budget = 128
+    lm._max_seq_length = 128
+    lm._tokenizer = _DummyTokenizer()
+    lm._chat_use_template = False
+    lm._chat_template_version = "v3"
+    lm._chat_add_generation_prompt = True
+    lm._vllm_manager = None
+    lm._use_vllm_decoder = False
+    lm._use_vllm_answer = False
+    lm._use_vllm_reconstruct = False
+    lm._distributed_args = SimpleNamespace(rank=0)
+    lm._gen_do_sample_override = None
+    lm._gen_temperature_override = None
+    lm._gen_top_p_override = None
+    lm._gen_max_gen_toks_override = None
+    lm._niah_use_bor = False
+    lm._add_boq_index = True
+    lm._generate_debug_max_prompt_chars = 0
+    lm.model = SimpleNamespace(
+        compression_embeddings=True,
+        args=SimpleNamespace(num_compression_tokens=24, max_mem_span_len=32, max_seq_len=128),
+    )
+
+    lm.tok_encode = NativeCausalLM.tok_encode.__get__(lm, NativeCausalLM)
+    lm.tok_batch_encode = NativeCausalLM.tok_batch_encode.__get__(lm, NativeCausalLM)
+    lm.tok_decode = NativeCausalLM.tok_decode.__get__(lm, NativeCausalLM)
+    lm._format_chat = NativeCausalLM._format_chat.__get__(lm, NativeCausalLM)
+    lm._append_generate_debug_rows = lambda rows: None
+
+    seen = {}
+
+    def _fake_split(self, **kwargs):
+        seen.update(kwargs)
+        return "split-ok"
+
+    def _fail_monolithic(*args, **kwargs):
+        raise AssertionError("monolithic compress path should not be used for NIAH torch fallback")
+
+    monkeypatch.setattr(native_generate, "_generate_compress_answer_split_nonchat", _fake_split)
+    monkeypatch.setattr(native_generate, "_generate_compress_answer", _fail_monolithic)
+
+    req = SimpleNamespace(
+        args=("ctx words\nWhat is the special magic number?", {"max_gen_toks": 2, "temperature": 0.0, "top_p": 1.0, "until": []}),
+        doc={
+            "input": "Alpha context.\nWhat is the special magic number?",
+            "gen_prefix": "The special magic number is",
+            "outputs": ["1234567"],
+        },
+        task_name="niah_single_1",
+        doc_id=0,
+    )
+
+    out = NativeCausalLM.generate_until(lm, [req], disable_tqdm=True)
+    assert out == ["split-ok"]
+    assert seen["context"] == "Alpha context."
+    assert seen["query"] == "What is the special magic number?"
+    assert seen["assistant_prefix"] == "The special magic number is"

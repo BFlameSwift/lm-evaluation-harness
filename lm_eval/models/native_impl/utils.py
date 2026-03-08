@@ -14,6 +14,7 @@ Design goals:
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import re
 from typing import Any, Dict, Mapping, Optional, Type, TypeVar
@@ -185,6 +186,60 @@ def normalize_optional_text(value: Optional[Any]) -> str:
             return ""
         return value
     return str(value)
+
+
+def parse_json_dict_arg(value: Optional[Any]) -> Optional[Dict[str, Any]]:
+    """Best-effort parse a JSON object string into a dict.
+
+    Returns `None` for empty values. Raises `ValueError` for invalid/non-dict JSON
+    so callers fail loudly instead of silently ignoring a malformed long-context config.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str):
+        raise ValueError(f"Expected JSON object string or dict, got {type(value).__name__}")
+    raw = value.strip()
+    if not raw or raw.lower() == "none":
+        return None
+    try:
+        loaded = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"Failed to parse JSON object: {e}") from e
+    if loaded is None:
+        return None
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Expected JSON object, got {type(loaded).__name__}")
+    return dict(loaded)
+
+
+def build_rope_scaling_config(
+    *,
+    rope_scaling_json: Optional[Any] = None,
+    rope_scaling_type: Optional[Any] = None,
+    rope_scaling_factor: Optional[Any] = None,
+    rope_scaling_original_max_position_embeddings: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a rope_scaling dict from either JSON or scalar CLI-friendly fields."""
+    rope = parse_json_dict_arg(rope_scaling_json)
+    rope_type = normalize_optional_text(rope_scaling_type).strip().lower()
+    factor = rope_scaling_factor
+    orig_max = coerce_int(rope_scaling_original_max_position_embeddings, None)
+    if rope is None and not rope_type and factor is None and orig_max is None:
+        return None
+    rope = dict(rope or {})
+    if rope_type:
+        rope["rope_type"] = rope_type
+        rope.setdefault("type", rope_type)
+    if factor is not None:
+        try:
+            rope["factor"] = float(factor)
+        except Exception as e:
+            raise ValueError(f"Invalid rope_scaling_factor={factor!r}: {e}") from e
+    if orig_max is not None and orig_max > 0:
+        rope["original_max_position_embeddings"] = int(orig_max)
+    return rope or None
 
 
 def derive_lm_eval_output_dir(

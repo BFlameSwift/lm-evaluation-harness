@@ -24,6 +24,11 @@ DEFAULT_SEQ_LENGTHS = [
     65536,
     131072,
     262144,
+    524288,
+    1048576,
+    2097152,
+    4194304,
+    8388608,
 ]
 
 
@@ -72,7 +77,15 @@ def _get_tokenizer_cached(
     pretrained: str,
 ) -> Union["transformers.PreTrainedTokenizer", "transformers.PreTrainedTokenizerFast"]:
     eval_logger.info(f"Using tokenizer {pretrained} for synthetic tasks.")
-    return AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+    # Synthetic long-context tasks (RULER/NIAH) intentionally build prompts far
+    # beyond the base model's default tokenizer.model_max_length. Keep generation
+    # bounded by task metadata, not by HF's warning-oriented default.
+    try:
+        tokenizer.model_max_length = int(1e30)
+    except Exception:
+        pass
+    return tokenizer
 
 
 def get_tokenizer(

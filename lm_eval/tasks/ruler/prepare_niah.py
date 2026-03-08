@@ -247,12 +247,14 @@ def generate_samples(
     if type_haystack != "essay" and max_seq_length < 4096:
         incremental = 5
 
-    num_haystack = incremental
+    token_count_cache: dict[int, int] = {}
 
-    total_tokens = 0  # Track the total tokens generated for the first example
-    while total_tokens + tokens_to_generate < max_seq_length:
-        input_text, answer, query, _meta = generate_input_output(
-            num_haystack,
+    def _measure_total_tokens(cur_num_haystack: int) -> int:
+        cached = token_count_cache.get(cur_num_haystack)
+        if cached is not None:
+            return cached
+        input_text, answer, _query, _meta = generate_input_output(
+            cur_num_haystack,
             haystack,
             type_haystack=type_haystack,
             num_needle_k=num_needle_k,
@@ -263,17 +265,42 @@ def generate_samples(
             num_needle_q=num_needle_q,
             random_seed=random_seed,
         )
-        # Calculate the number of tokens in the example
-        total_tokens = len(TOKENIZER(input_text + " ".join(answer)).input_ids)
+        total = len(TOKENIZER(input_text + " ".join(answer)).input_ids)
+        token_count_cache[cur_num_haystack] = total
+        return total
+
+    max_haystack_bound = len(haystack) if type_haystack == "essay" else None
+    lo = 0
+    hi = max(1, int(incremental))
+    while True:
+        if max_haystack_bound is not None and hi > max_haystack_bound:
+            hi = max_haystack_bound
+        total_tokens = _measure_total_tokens(hi)
         if total_tokens + tokens_to_generate > max_seq_length:
-            num_haystack -= incremental
             break
-
-        if type_haystack == "essay" and num_haystack > len(haystack):
-            num_haystack = len(haystack)
+        lo = hi
+        if max_haystack_bound is not None and hi >= max_haystack_bound:
             break
+        next_hi = hi * 2
+        if max_haystack_bound is not None:
+            next_hi = min(next_hi, max_haystack_bound)
+        if next_hi == hi:
+            break
+        hi = next_hi
 
-        num_haystack += incremental
+    if _measure_total_tokens(hi) + tokens_to_generate <= max_seq_length:
+        num_haystack = hi
+    else:
+        left = lo
+        right = hi
+        while left + 1 < right:
+            mid = (left + right) // 2
+            total_tokens = _measure_total_tokens(mid)
+            if total_tokens + tokens_to_generate <= max_seq_length:
+                left = mid
+            else:
+                right = mid
+        num_haystack = left
 
     # print("Num haystack:", num_haystack)
 

@@ -171,6 +171,7 @@ from .mcq_scoring import (
     _verifier_score_from_ll,
 )
 from .utils import (
+    build_rope_scaling_config as _build_rope_scaling_config,
     coerce_bool as _coerce_bool,
     coerce_int as _coerce_int,
     derive_lm_eval_output_dir as _derive_lm_eval_output_dir,
@@ -246,6 +247,7 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         vllm_max_model_len: Optional[int] = None,
         vllm_tensor_parallel: int = 1,
         vllm_gpu_memory_utilization: float = 0.4,
+        vllm_allow_long_max_model_len: bool = False,
         # vLLM stability knob: disable compilation/cudagraph (recommended for prompt_embeds).
         # If unset, defaults to True when prompt_embeds are enabled.
         vllm_enforce_eager: Optional[bool] = None,
@@ -263,6 +265,14 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         compress_threshold: int = 8192,
         compress_chunk: int = 2048,
         max_cycles: int = 10,
+        rope_scaling_json: Optional[str] = None,
+        rope_scaling_type: Optional[str] = None,
+        rope_scaling_factor: Optional[float] = None,
+        rope_scaling_original_max_position_embeddings: Optional[int] = None,
+        vllm_rope_scaling_json: Optional[str] = None,
+        vllm_rope_scaling_type: Optional[str] = None,
+        vllm_rope_scaling_factor: Optional[float] = None,
+        vllm_rope_scaling_original_max_position_embeddings: Optional[int] = None,
         compress_start_tokens: Optional[str] = "<think>",
         compress_answer_min_suffix_tokens: int = 128,
         compress_answer_force_min_span: bool = True,
@@ -405,6 +415,24 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         # -----------------------------
         self._compress_threshold = max(1, int(compress_threshold))
         self._compress_chunk = max(1, int(compress_chunk))
+        env_rope_scaling_json = os.environ.get("NATIVE_ROPE_SCALING_JSON")
+        env_vllm_rope_scaling_json = os.environ.get("NATIVE_VLLM_ROPE_SCALING_JSON")
+        self._rope_scaling_override = _build_rope_scaling_config(
+            rope_scaling_json=rope_scaling_json if rope_scaling_json is not None else env_rope_scaling_json,
+            rope_scaling_type=rope_scaling_type,
+            rope_scaling_factor=rope_scaling_factor,
+            rope_scaling_original_max_position_embeddings=rope_scaling_original_max_position_embeddings,
+        )
+        self._vllm_rope_scaling_override = _build_rope_scaling_config(
+            rope_scaling_json=(
+                vllm_rope_scaling_json
+                if vllm_rope_scaling_json is not None
+                else (env_vllm_rope_scaling_json if env_vllm_rope_scaling_json is not None else env_rope_scaling_json)
+            ),
+            rope_scaling_type=vllm_rope_scaling_type,
+            rope_scaling_factor=vllm_rope_scaling_factor,
+            rope_scaling_original_max_position_embeddings=vllm_rope_scaling_original_max_position_embeddings,
+        )
         self._compress_answer_min_suffix_tokens = max(
             0, _coerce_int(compress_answer_min_suffix_tokens, 128) or 0
         )
@@ -632,6 +660,7 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                 distributed_args,
                 tokenizer_path,
                 max_seq_len_override=max_seq_len_override,
+                rope_scaling_override=self._rope_scaling_override,
             )
 
         self._is_hf_model = hasattr(model, "config") and not hasattr(model, "args")
@@ -792,6 +821,12 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                 self._vllm_server_timeout = float(vllm_server_timeout)
             except Exception:
                 self._vllm_server_timeout = None
+        self._vllm_allow_long_max_model_len = bool(vllm_allow_long_max_model_len) or (
+            str(os.environ.get("NATIVE_VLLM_ALLOW_LONG_MAX_MODEL_LEN", "")).strip().lower()
+            in {"1", "true", "yes", "y", "on"}
+        )
+        if self._vllm_allow_long_max_model_len:
+            os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
         self._use_remote_vllm = bool(self._vllm_server_host and self._vllm_server_port)
         
         # NOTE: vLLM initialization is expensive and not needed for pure torch loglikelihood

@@ -18,10 +18,46 @@ import gc
 import hashlib
 import json
 import os
+import shutil
 import sys
 from typing import Any, List
 
 import torch
+
+
+def _resolve_desired_vllm_rope_scaling(self) -> Any:
+    desired = getattr(self, "_vllm_rope_scaling_override", None)
+    if isinstance(desired, dict) and desired:
+        return dict(desired)
+    model_args = getattr(getattr(self, "model", None), "args", None)
+    inherited = getattr(model_args, "rope_scaling", None)
+    if isinstance(inherited, dict) and inherited:
+        return dict(inherited)
+    return None
+
+
+def _copy_existing_safemodel_tree(src_dir: str, dst_dir: str) -> None:
+    """Copy an existing transformers/vLLM safemodel directory into local storage."""
+    os.makedirs(dst_dir, exist_ok=True)
+    for name in (
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "merges.txt",
+        "vocab.json",
+    ):
+        src = os.path.join(src_dir, name)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(dst_dir, name)
+        tmp = f"{dst}.tmp.{os.getpid()}"
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
 
 
 def init_vllm_param(self) -> None:
@@ -98,6 +134,9 @@ def init_vllm_param(self) -> None:
                     "max_seq_len": self._max_seq_length,
                 },
             }
+            desired_rope_scaling = _resolve_desired_vllm_rope_scaling(self)
+            if isinstance(desired_rope_scaling, dict) and desired_rope_scaling:
+                convert_kwargs["additional_kwargs"]["rope_scaling"] = desired_rope_scaling
 
             def _resolve_local_safedir() -> str:
                 # We want a stable local directory so multiple runs on the same host
@@ -106,12 +145,16 @@ def init_vllm_param(self) -> None:
                 # The digest includes all inputs that affect the exported weights/config.
                 local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
                 local_root = os.path.abspath(os.path.expanduser(str(local_root)))
+                rope_key = ""
+                if isinstance(desired_rope_scaling, dict) and desired_rope_scaling:
+                    rope_key = json.dumps(desired_rope_scaling, sort_keys=True, separators=(",", ":"))
                 key = "|".join(
                     [
                         f"ckpt={os.path.abspath(str(self._vllm_checkpoint_dir))}",
                         f"tok={os.path.abspath(str(self._vllm_tokenizer_path)) if self._vllm_tokenizer_path else ''}",
                         f"dtype={str(self._dtype)}",
                         f"maxlen={int(self._vllm_max_model_len or 0)}",
+                        f"rope={rope_key}",
                     ]
                 )
                 digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
@@ -135,7 +178,11 @@ def init_vllm_param(self) -> None:
                 local_safedir = _resolve_local_safedir()
                 os.makedirs(local_safedir, exist_ok=True)
                 if not _safemodel_ready(local_safedir):
-                    convert_checkpoint(output_dir=local_safedir, **convert_kwargs)
+                    existing_safedir = os.path.join(str(self._vllm_checkpoint_dir), "safemodel")
+                    if _safemodel_ready(existing_safedir):
+                        _copy_existing_safemodel_tree(existing_safedir, local_safedir)
+                    else:
+                        convert_checkpoint(output_dir=local_safedir, **convert_kwargs)
                 ensure_vllm_config(self, local_safedir)
                 self._vllm_model_dir = local_safedir
                 model_path = local_safedir
@@ -288,9 +335,17 @@ def ensure_vllm_config(self, safedir: str) -> None:
     target_len = int(self._vllm_max_model_len or self._max_seq_length or 2048)
     for key in ("max_position_embeddings", "max_seq_len", "model_max_length"):
         val = cfg.get(key)
-        if not isinstance(val, int) or val <= 0:
+        if not isinstance(val, int) or val <= 0 or val < target_len:
             cfg[key] = target_len
             updated = True
+    desired_rope_scaling = _resolve_desired_vllm_rope_scaling(self)
+    if isinstance(desired_rope_scaling, dict) and desired_rope_scaling:
+        if cfg.get("rope_scaling") != desired_rope_scaling:
+            cfg["rope_scaling"] = desired_rope_scaling
+            updated = True
+    elif "rope_scaling" in cfg:
+        del cfg["rope_scaling"]
+        updated = True
 
     if updated:
         try:

@@ -198,10 +198,10 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
     ):
         self._ensure_vllm_manager(caller=f"generate_until(mode={self._mode})")
         if self._vllm_manager is None:
-            raise RuntimeError(
-                f"generate_until(mode={self._mode}) requires vLLM prompt_embeds backend for compression models. "
-                "Set vllm_max_model_len (and optionally vllm_gpu_memory_utilization) or provide a working "
-                "vllm_server_host/vllm_server_port."
+            print(
+                f"WARNING: Failed to init vLLM for generate_until(mode={self._mode}); "
+                "falling back to torch backend. This can be slower and may OOM for long prompts.",
+                flush=True,
             )
 
     # If caller explicitly asked for vLLM in decoder path, require it here.
@@ -1102,17 +1102,68 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
                 include_bor = self._mode == "reconstruct_first"
                 if self._mode == "niah_generate":
                     include_bor = bool(getattr(self, "_niah_use_bor", False))
-                text = self._generate_compress_answer(
-                    prompt=context_str,
-                    max_gen_len=max_gen_len,
-                    temperature=temperature,
-                    top_p=top_p,
-                    until=until,
-                    include_bor=include_bor,
-                )
+                doc = chunk_docs[i] if i < len(chunk_docs) else None
+                split_backend = False
+                if isinstance(doc, dict) and task_name:
+                    task_name_lower = str(task_name).lower()
+                    split_supported = bool(
+                        ("niah" in task_name_lower)
+                        or ("infinitebench" in task_name_lower)
+                        or (task_name_lower.startswith("longbench_") and ("longbench2" not in task_name_lower))
+                        or ("longbench2" in task_name_lower)
+                        or task_name_lower.startswith("babilong")
+                        or task_name_lower.startswith("ruler_custom")
+                        or task_name_lower.startswith("ruler_qa_")
+                    )
+                    if split_supported:
+                        try:
+                            keys = get_doc_query_keys_by_task_name(task_name)
+                            split = _split_doc_and_query(
+                                active_lg_docs=[doc],
+                                active_tasks_names=[str(task_name)],
+                                prompt_list=[context_str],
+                                doc_key=keys["doc_key"],
+                                question_key=keys["question_key"],
+                                niah_use_bor=bool(getattr(self, "_niah_use_bor", False)),
+                            )
+                            if split.get("context_list") and split.get("query_list"):
+                                assistant_prefix = ""
+                                if split.get("assistant_prefix_list"):
+                                    assistant_prefix = split["assistant_prefix_list"][0] or ""
+                                text = _generate_compress_answer_split_nonchat(
+                                    self,
+                                    context=split["context_list"][0] or "",
+                                    query=split["query_list"][0] or "",
+                                    assistant_prefix=assistant_prefix,
+                                    max_gen_len=max_gen_len,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    until=until,
+                                    include_bor=include_bor,
+                                )
+                                prompt_dbg_src = (split["query_list"][0] or "") + (
+                                    (assistant_prefix if assistant_prefix[:1].isspace() else (" " + assistant_prefix))
+                                    if assistant_prefix
+                                    else ""
+                                )
+                                backend = "torch_compress_split"
+                                split_backend = True
+                        except Exception:
+                            split_backend = False
+
+                if not split_backend:
+                    text = self._generate_compress_answer(
+                        prompt=context_str,
+                        max_gen_len=max_gen_len,
+                        temperature=temperature,
+                        top_p=top_p,
+                        until=until,
+                        include_bor=include_bor,
+                    )
+                    prompt_dbg_src = context_str
+                    backend = "torch_compress"
+
                 results.append(text)
-                prompt_dbg_src = context_str
-                backend = "torch_compress"
             else:
                 prompt_dbg_src = self._format_chat(context_str, add_generation_prompt=True)["decoder_prefix"]
                 backend = "torch_generate"
@@ -1331,6 +1382,157 @@ def _generate_compress_answer(
 
     text = self.tok_decode(generated)
     return self._truncate_until(text, until)
+
+
+def _generate_compress_answer_split_nonchat(
+    self,
+    *,
+    context: str,
+    query: str,
+    assistant_prefix: Optional[str],
+    max_gen_len: int,
+    temperature: float,
+    top_p: float,
+    until: Optional[List[str]],
+    include_bor: bool = False,
+) -> str:
+    """Torch fallback for split non-chat compression tasks such as NIAH."""
+    num_comp = int(getattr(self.model.args, "num_compression_tokens", 0))
+    if num_comp <= 0:
+        prefix = str(query or "")
+        ap = str(assistant_prefix or "")
+        if ap:
+            prefix += (" " if prefix and not ap[:1].isspace() else "") + ap
+        ctx_tokens, _ = self.tok_batch_encode([prefix])
+        max_len = min(self.max_length, ctx_tokens.size(1) + max_gen_len)
+        gen_only = self._model_generate(
+            ctx_tokens.to(self.device),
+            max_len,
+            temperature=temperature,
+            top_p=top_p,
+        )[0].tolist()
+        pad_id = self.pad_token_id if self.pad_token_id is not None else self.eot_token_id
+        if pad_id in gen_only:
+            gen_only = gen_only[: gen_only.index(pad_id)]
+        return self._truncate_until(self.tok_decode(gen_only), until)
+
+    model_max_len = int(getattr(self.model.args, "max_seq_len", self._max_seq_length))
+    max_mem_span_len = int(getattr(self, "_max_mem_span_len", 0) or getattr(self.model.args, "max_mem_span_len", model_max_len))
+    span_len = min(int(max_mem_span_len), int(model_max_len) - int(num_comp))
+    if span_len <= 0:
+        span_len = 1
+
+    spans = self._split_contexts_to_spans(context, span_len)
+    add_boq = bool(getattr(self, "_add_boq_index", False))
+    boq_extra = 1 if add_boq else 0
+    bor_extra = 1 if include_bor else 0
+
+    query_tokens = self._tokenizer.encode(str(query or ""), bos=False, eos=False)
+    assistant_prefix_text = str(assistant_prefix or "")
+    if assistant_prefix_text and not assistant_prefix_text[:1].isspace():
+        assistant_prefix_text = " " + assistant_prefix_text
+    assistant_prefix_tokens = (
+        self._tokenizer.encode(assistant_prefix_text, bos=False, eos=False)
+        if assistant_prefix_text
+        else []
+    )
+
+    decoder_budget = int(getattr(self, "decoder_budget", self.max_length))
+    fixed_len = boq_extra + len(query_tokens) + len(assistant_prefix_tokens) + bor_extra
+    max_spans = (decoder_budget - fixed_len - int(max_gen_len)) // max(1, num_comp + 2)
+    if max_spans < 0:
+        max_spans = 0
+    if max_spans == 0:
+        spans = []
+    elif max_spans < len(spans):
+        spans = spans[-max_spans:]
+
+    placeholder_id = 0
+    enc_tokens_mb: List[torch.Tensor] = []
+    enc_ctx_mb: List[Dict[str, torch.Tensor]] = []
+    for sp in spans:
+        enc_seq = torch.tensor(list(sp) + ([placeholder_id] * num_comp), device=self.device, dtype=torch.long)
+        clen = int(enc_seq.numel())
+        mem_mask = torch.zeros(clen, device=self.device, dtype=torch.bool)
+        mem_mask[-num_comp:] = True
+        cu = torch.tensor([0, clen], device=self.device, dtype=torch.int32)
+        enc_tokens_mb.append(enc_seq)
+        enc_ctx_mb.append(
+            {
+                "cu_seqlens_q": cu,
+                "cu_seqlens_k": cu,
+                "max_seqlen_q": clen,
+                "max_seqlen_k": clen,
+                "positions": torch.arange(clen, device=self.device, dtype=torch.int32),
+                "encoder_mem_mask": mem_mask,
+            }
+        )
+
+    prefix: List[int] = []
+    comp_mask: List[bool] = []
+    for _ in range(len(spans)):
+        prefix.extend([BEGIN_OF_MEMORY_INDEX] + ([placeholder_id] * num_comp) + [END_OF_MEMORY_INDEX])
+        comp_mask.extend([False] + ([True] * num_comp) + [False])
+    if add_boq:
+        prefix.append(BEGIN_OF_QUERY_INDEX)
+        comp_mask.append(False)
+    prefix.extend(query_tokens)
+    comp_mask.extend([False] * len(query_tokens))
+    prefix.extend(assistant_prefix_tokens)
+    comp_mask.extend([False] * len(assistant_prefix_tokens))
+    if include_bor:
+        prefix.append(BEGIN_OF_RECONSTRUCTION_INDEX)
+        comp_mask.append(False)
+
+    if not prefix:
+        return ""
+
+    max_new = max(0, min(int(max_gen_len), int(decoder_budget) - len(prefix)))
+    if max_new <= 0:
+        return ""
+
+    dec_tokens = torch.tensor(prefix, device=self.device, dtype=torch.long)
+    comp_mask_t = torch.tensor(comp_mask, device=self.device, dtype=torch.bool)
+    generated: List[int] = []
+
+    for _ in range(max_new):
+        dec_cu = torch.tensor([0, dec_tokens.numel()], device=self.device, dtype=torch.int32)
+        dec_ctx = {
+            "cu_seqlens_q": dec_cu,
+            "cu_seqlens_k": dec_cu,
+            "max_seqlen_q": dec_tokens.numel(),
+            "max_seqlen_k": dec_tokens.numel(),
+            "positions": torch.arange(dec_tokens.numel(), device=self.device, dtype=torch.int32),
+            "compression_token_mask": comp_mask_t,
+        }
+        with torch.autocast(device_type="cuda", dtype=self._dtype):
+            logits = self.model(
+                encoder_tokens_micro_batches=enc_tokens_mb,
+                encoder_context_micro_batches=enc_ctx_mb,
+                decoder_tokens=dec_tokens,
+                decoder_context=dec_ctx,
+                last_hidden_only=False,
+            )
+        last_logits = logits[-1]
+        if temperature and temperature > 0:
+            probs = torch.softmax(last_logits / temperature, dim=-1)
+            probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+            probs_sort[probs_sum - probs_sort > top_p] = 0.0
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            next_token = torch.multinomial(probs_sort, num_samples=1)
+            next_token = torch.gather(probs_idx, -1, next_token).reshape(-1)[0]
+        else:
+            next_token = torch.argmax(last_logits)
+
+        next_id = int(next_token.item())
+        if next_id in {self.eos_token_id, END_OF_RECONSTRUCTION_INDEX}:
+            break
+        generated.append(next_id)
+        dec_tokens = torch.cat([dec_tokens, torch.tensor([next_id], device=self.device, dtype=torch.long)], dim=0)
+        comp_mask_t = torch.cat([comp_mask_t, torch.tensor([False], device=self.device, dtype=torch.bool)], dim=0)
+
+    return self._truncate_until(self.tok_decode(generated), until)
 
 def _generate_vllm_with_compress(
     self,
