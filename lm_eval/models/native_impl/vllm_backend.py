@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from typing import Any, List
 
 import torch
@@ -63,6 +64,116 @@ def _copy_existing_safemodel_tree(src_dir: str, dst_dir: str) -> None:
         os.replace(tmp, dst)
 
 
+def _prepare_hf_vllm_model_dir(
+    base_dir: str,
+    *,
+    target_len: int,
+    desired_rope_scaling: Any,
+    local_root: str,
+) -> str:
+    """
+    Create a lightweight local model directory for vLLM from a HF checkpoint by
+    symlinking the original files and patching config/tokenizer metadata in the
+    local copy.
+
+    This mirrors the baseline evaluator strategy and is required for long YaRN
+    runs: otherwise vLLM still reads the original HF config/tokenizer metadata
+    (e.g. 32K / 131072 limits) and later crashes when prompts exceed that soft
+    limit.
+    """
+    if not base_dir or not os.path.isdir(base_dir):
+        return base_dir
+    cfg_path = os.path.join(base_dir, "config.json")
+    if not os.path.exists(cfg_path):
+        return base_dir
+
+    rope_key = ""
+    if isinstance(desired_rope_scaling, dict) and desired_rope_scaling:
+        rope_key = json.dumps(desired_rope_scaling, sort_keys=True, separators=(",", ":"))
+    key = "|".join(
+        [
+            f"hfckpt={os.path.abspath(str(base_dir))}",
+            f"maxlen={int(target_len)}",
+            f"rope={rope_key}",
+        ]
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    tmp_root = os.path.join(os.path.abspath(os.path.expanduser(local_root)), "native_vllm_hfmodel")
+    os.makedirs(tmp_root, exist_ok=True)
+    tmp_dir = os.path.join(tmp_root, digest)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    # Populate symlinks / copies once.
+    for name in os.listdir(base_dir):
+        src = os.path.join(base_dir, name)
+        dst = os.path.join(tmp_dir, name)
+        if name in {"config.json", "tokenizer_config.json", "generation_config.json"}:
+            continue
+        if os.path.lexists(dst):
+            continue
+        try:
+            os.symlink(src, dst)
+        except Exception:
+            try:
+                if os.path.isdir(src):
+                    os.symlink(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+            except Exception:
+                pass
+
+    def _patch_json(src_name: str, patch_fn) -> None:
+        src = os.path.join(base_dir, src_name)
+        if not os.path.exists(src):
+            return
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            return
+        if not isinstance(cfg, dict):
+            return
+        changed = bool(patch_fn(cfg))
+        dst = os.path.join(tmp_dir, src_name)
+        if changed or not os.path.exists(dst):
+            with open(dst, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+
+    def _patch_config(cfg: dict) -> bool:
+        changed = False
+        for key in ("max_position_embeddings", "max_seq_len", "model_max_length"):
+            val = cfg.get(key)
+            if not isinstance(val, int) or val <= 0 or val < int(target_len):
+                cfg[key] = int(target_len)
+                changed = True
+        if isinstance(desired_rope_scaling, dict) and desired_rope_scaling:
+            if cfg.get("rope_scaling") != desired_rope_scaling:
+                cfg["rope_scaling"] = desired_rope_scaling
+                changed = True
+        return changed
+
+    def _patch_tokenizer(cfg: dict) -> bool:
+        changed = False
+        val = cfg.get("model_max_length")
+        if not isinstance(val, int) or val <= 0 or val < int(target_len):
+            cfg["model_max_length"] = int(target_len)
+            changed = True
+        return changed
+
+    def _patch_generation(cfg: dict) -> bool:
+        changed = False
+        val = cfg.get("max_length")
+        if not isinstance(val, int) or val <= 0 or val < int(target_len):
+            cfg["max_length"] = int(target_len)
+            changed = True
+        return changed
+
+    _patch_json("config.json", _patch_config)
+    _patch_json("tokenizer_config.json", _patch_tokenizer)
+    _patch_json("generation_config.json", _patch_generation)
+    return tmp_dir
+
+
 def init_vllm_param(self) -> None:
     """Resolve/prepare a vLLM model directory (including safetensors export when needed)."""
     if getattr(self, "_use_remote_vllm", False):
@@ -90,7 +201,23 @@ def init_vllm_param(self) -> None:
             os.path.join(self._vllm_checkpoint_dir, "metadata.json")
         )
         if not is_native_ckpt:
-            model_path = self._vllm_checkpoint_dir
+            # HF checkpoints can also need local config/tokenizer patching for
+            # long-context YaRN runs. Reuse a local, symlink-based temp model
+            # directory so vLLM reads patched config/tokenizer metadata instead
+            # of the original 32K/131072 limits.
+            target_len = int(self._vllm_max_model_len or self._max_seq_length or 2048)
+            desired_rope_scaling = _resolve_desired_vllm_rope_scaling(self)
+            local_root = os.environ.get("NATIVE_VLLM_LOCAL_SAFEMODEL_ROOT") or "/tmp"
+            model_path = _prepare_hf_vllm_model_dir(
+                str(self._vllm_checkpoint_dir),
+                target_len=target_len,
+                desired_rope_scaling=desired_rope_scaling,
+                local_root=local_root,
+            )
+            self._vllm_model_dir = model_path
+            # When we patch tokenizer_config locally, make vLLM read tokenizer
+            # metadata from that same prepared directory.
+            self._vllm_tokenizer_path = model_path
         else:
             base_dir = self._vllm_output_root or self._vllm_checkpoint_dir
             if base_dir is None:

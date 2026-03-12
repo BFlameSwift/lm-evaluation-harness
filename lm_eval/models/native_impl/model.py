@@ -754,8 +754,8 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
                     self._max_seq_length = _coerce_int(
                         getattr(getattr(self.model, "config", None), "model_max_length", None), None
                     )
-            if self._max_seq_length is None or self._max_seq_length <= 0:
-                self._max_seq_length = 2048
+        if self._max_seq_length is None or self._max_seq_length <= 0:
+            self._max_seq_length = 2048
         # Respect explicit eval-time budgets (`max_seq_length` or `vllm_max_model_len`) instead of
         # always inheriting the checkpoint's `max_seq_len`. Some checkpoints set a very large
         # `max_seq_len` (e.g., encoder-side span capacity), while evaluation may intentionally
@@ -766,6 +766,21 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         )
         if not user_budget_specified:
             self._decoder_budget = max(self._decoder_budget, self._max_seq_length)
+        # HF tokenizers often keep a conservative `model_max_length` (e.g. 131072
+        # for Qwen3). For YaRN long-context eval we intentionally exceed that soft
+        # limit. Keep the underlying tokenizer aligned with the effective decoder
+        # budget so prompt tokenization does not warn or accidentally clamp.
+        try:
+            desired_tok_limit = max(
+                int(self._decoder_budget or 0),
+                int(self._max_seq_length or 0),
+                int(self._vllm_max_model_len or 0) if hasattr(self, "_vllm_max_model_len") else 0,
+                int(10**9),
+            )
+            if hasattr(self._tokenizer, "tok") and hasattr(self._tokenizer.tok, "model_max_length"):
+                self._tokenizer.tok.model_max_length = int(desired_tok_limit)
+        except Exception:
+            pass
         if self._max_mem_span_len_override is not None and hasattr(self.model, "args"):
             # `max_mem_span_len` is an eval-time knob; older checkpoints/configs may
             # not declare it on `ModelArgs`, so we attach it dynamically.
