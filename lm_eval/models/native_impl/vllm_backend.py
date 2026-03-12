@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import tempfile
+import traceback
 from typing import Any, List
 
 import torch
@@ -428,7 +429,15 @@ def init_vllm(self) -> None:
         engine = VLLMEngineWrapper(cfg)
         self._vllm_manager = VLLMDecoderManager(engine_wrapper=engine)
     except Exception as e:
-        print(f"WARNING: Failed to init vLLM, falling back to torch backend. Error: {e}", file=sys.stderr)
+        self._last_vllm_init_error = traceback.format_exc()
+        print(
+            "WARNING: Failed to init vLLM, falling back to torch backend.\n"
+            f"Caller state: model_path={model_path!r} tp={self._vllm_tensor_parallel} "
+            f"max_model_len={self._vllm_max_model_len or self._max_seq_length} "
+            f"tokenizer={self._vllm_tokenizer_path or self._vllm_checkpoint_dir!r}\n"
+            f"{self._last_vllm_init_error}",
+            file=sys.stderr,
+        )
         self._vllm_manager = None
 
 
@@ -449,7 +458,12 @@ def ensure_vllm_manager(self, *, caller: str) -> None:
         init_vllm(self)
     except Exception as e:
         self._vllm_manager = None
-        print(f"WARNING: Failed to init vLLM ({caller}). Error: {e}", file=sys.stderr)
+        if not getattr(self, "_last_vllm_init_error", None):
+            self._last_vllm_init_error = traceback.format_exc()
+        print(
+            f"WARNING: Failed to init vLLM ({caller}).\n{self._last_vllm_init_error}",
+            file=sys.stderr,
+        )
 
 
 def ensure_vllm_config(self, safedir: str) -> None:

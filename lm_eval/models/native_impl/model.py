@@ -81,6 +81,7 @@ import json
 import re
 import hashlib
 from typing import Any, Dict, List, Optional, Tuple
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -604,12 +605,20 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         else:
             self._decoder_budget = 8192
         
+        self._pure_vllm_decoder_only = bool(
+            self._mode == "decoder"
+            and self._use_vllm_decoder
+            and not self._use_vllm_answer
+            and not self._use_vllm_reconstruct
+            and checkpoint_dir is not None
+            and not os.path.exists(os.path.join(checkpoint_dir, "metadata.json"))
+        )
         
 
         distributed_args = _default_distributed_args()
         # Native supports tensor-parallel only; data-parallel (world_size > model_parallel_size) will duplicate work.
         self._distributed_args = distributed_args
-        if self._device.type == "cuda" and torch.cuda.is_available():
+        if (not self._pure_vllm_decoder_only) and self._device.type == "cuda" and torch.cuda.is_available():
             try:
                 torch.cuda.set_device(distributed_args.local_rank)
             except Exception as e:
@@ -642,7 +651,12 @@ class NativeCausalLM(ScoringMixin, TemplateLM):
         if checkpoint_dir is None and pretrain_model_dir is None:
             raise ValueError("Provide either checkpoint_dir or pretrain_model_dir for native model.")
 
-        if checkpoint_dir is None:
+        if self._pure_vllm_decoder_only:
+            tokenizer = Tokenizer(tokenizer_path or checkpoint_dir)
+            model = torch.nn.Module()
+            model.config = SimpleNamespace()
+            device_mesh = None
+        elif checkpoint_dir is None:
             model_args = ModelArgs(pretrain_model_dir=pretrain_model_dir, model_parallel_size=1)
             device_mesh = _build_device_mesh(distributed_args.world_size, model_args.model_parallel_size)
             model = Model.from_pretrained(model_args).cuda()

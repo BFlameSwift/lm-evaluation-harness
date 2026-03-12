@@ -208,9 +208,12 @@ def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
     if self._mode == "decoder" and (self._use_vllm_decoder or self._use_vllm_answer or self._use_vllm_reconstruct):
         self._ensure_vllm_manager(caller="generate_until(mode=decoder)")
         if self._vllm_manager is None:
+            detail = getattr(self, "_last_vllm_init_error", None)
+            extra = f"\nLast vLLM init error:\n{detail}" if detail else ""
             raise RuntimeError(
                 "generate_until(mode=decoder) requested vLLM (use_vllm_*), but vLLM initialization failed. "
                 "Check vLLM install/config or set vllm_max_model_len and vllm_gpu_memory_utilization."
+                f"{extra}"
             )
 
     def _infer_doc_id(doc: Optional[dict], doc_id: Any) -> Any:
