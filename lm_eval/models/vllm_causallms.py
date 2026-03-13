@@ -4,6 +4,7 @@ import copy
 import gc
 import logging
 import os
+import socket
 from importlib.metadata import version
 from importlib.util import find_spec
 from multiprocessing import Process, Queue
@@ -43,11 +44,20 @@ try:
     if parse_version(version("vllm")) >= parse_version("0.8.3"):
         from vllm.entrypoints.chat_utils import resolve_hf_chat_template
 
+    def _local_get_open_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            sock.listen(1)
+            return sock.getsockname()[1]
+
     try:
         # Moved since vllm-project/vllm#27164
         from vllm.utils.network_utils import get_open_port
-    except ModuleNotFoundError:
-        from vllm.utils import get_open_port
+    except (ModuleNotFoundError, ImportError):
+        try:
+            from vllm.utils import get_open_port
+        except (ModuleNotFoundError, ImportError):
+            get_open_port = _local_get_open_port
 except ModuleNotFoundError:
     pass
 

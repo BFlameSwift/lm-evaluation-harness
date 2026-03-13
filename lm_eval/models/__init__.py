@@ -1,40 +1,37 @@
-from . import (
-    anthropic_llms,
-    api_models,
-    dummy,
-    gguf,
-    hf_audiolm,
-    hf_steered,
-    hf_vlms,
-    huggingface,
-    ibm_watsonx_ai,
-    mamba_lm,
-    nemo_lm,
-    neuron_optimum,
-    openai_completions,
-    optimum_ipex,
-    optimum_lm,
-    sglang_causallms,
-    sglang_generate_API,
-    native,
-    textsynth,
+from importlib import import_module
+
+# Keep the core local backends eager so the common hf path is always registered.
+from . import dummy, huggingface  # noqa: F401
+
+
+_OPTIONAL_MODEL_MODULES = (
+    "anthropic_llms",
+    "api_models",
+    "gguf",
+    "hf_audiolm",
+    "hf_steered",
+    "hf_vlms",
+    "ibm_watsonx_ai",
+    "mamba_lm",
+    "nemo_lm",
+    "native",
+    "neuron_optimum",
+    "openai_completions",
+    "optimum_ipex",
+    "optimum_lm",
+    "sglang_causallms",
+    "sglang_generate_API",
+    "textsynth",
+    "vllm_causallms",
+    "vllm_vlms",
 )
 
-# The `native` backend is a local extension in some downstream forks and may
-# depend on extra modules (e.g. custom model code) not present in a vanilla
-# lm-evaluation-harness install. Keep it optional so the package can still be
-# imported in minimal environments (including CI).
-try:
-    from . import native  # noqa: F401
-except Exception:
-    pass
 
-# vLLM is an optional dependency. Importing it unconditionally can break
-# environments where CUDA runtime libs are unavailable or mismatched.
-try:
-    from . import vllm_causallms, vllm_vlms  # noqa: F401
-except Exception:
-    pass
+for _module_name in _OPTIONAL_MODEL_MODULES:
+    try:
+        import_module(f"{__name__}.{_module_name}")
+    except Exception:
+        pass
 
 
 # TODO: implement __all__
