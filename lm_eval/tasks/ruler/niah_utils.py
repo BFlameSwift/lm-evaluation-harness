@@ -23,6 +23,11 @@ def download_dataset(df: Generator) -> dict[str, datasets.Dataset]:
 def niah_single_1(**kwargs):
     seq_lengths = kwargs.pop("max_seq_lengths", DEFAULT_SEQ_LENGTHS)
     num_samples = kwargs.pop("num_samples", 500)
+    # Allow metadata-driven multi-needle sweeps while preserving the original
+    # single-needle behavior when these fields are omitted.
+    num_needle_k = kwargs.pop("num_needle_k", 1)
+    num_needle_q = kwargs.pop("num_needle_q", 1)
+    num_needle_v = kwargs.pop("num_needle_v", 1)
     return download_dataset(
         generate_samples(
             get_haystack(type_haystack="repeat"),
@@ -31,6 +36,9 @@ def niah_single_1(**kwargs):
             type_haystack="repeat",
             type_needle_k="words",
             type_needle_v="numbers",
+            num_needle_k=num_needle_k,
+            num_needle_q=num_needle_q,
+            num_needle_v=num_needle_v,
             num_samples=num_samples,
             TOKENIZER=get_tokenizer(**kwargs),
         )
