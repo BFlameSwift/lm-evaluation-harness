@@ -24,6 +24,7 @@ from .mcq_scoring import (
     _resolve_verifier_score_mode,
     _verifier_score_from_ll,
 )
+from .utils import token_embed as _token_embed
 
 
 class ScoringMixin:

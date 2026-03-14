@@ -11,6 +11,7 @@ delegate to them.
 from __future__ import annotations
 
 import math
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -766,13 +767,14 @@ def _loglikelihood_tokens_compress_answer(
                     for ctx in ctx_tokens_full_list
                 ]
                 split_source_by_idx = [f"doc_split_fallback:{type(e).__name__}"] * len(chunk)
-                if self._distributed_args.rank == 0 and not self._warned_doc_split_fallback:
+                warned_doc_split_fallback = bool(getattr(self, "_warned_doc_split_fallback", False))
+                if self._distributed_args.rank == 0 and not warned_doc_split_fallback:
                     print(
                         "[native][warn] _get_doc_and_context failed in compress_answer; "
                         "falling back to context='' + query=full prompt tokens.",
                         file=sys.stderr,
                     )
-                    self._warned_doc_split_fallback = True
+                    setattr(self, "_warned_doc_split_fallback", True)
 
             if (
                 split_context_list is not None
